@@ -1,0 +1,27 @@
+# Bağımlılıklar
+node_modules/
+
+# Ortam değişkenleri - API anahtarları ve hassas veriler
+.env
+.env.local
+.env.*.local
+
+# Frontend (ayrı repo'da GitHub Pages için - backend push'unda dahil edilmez)
+risego_frontend/
+
+# Oluşturulan dosyalar
+sürücüler.txt
+
+# Log dosyaları
+*.log
+npm-debug.log*
+
+# İşletim sistemi
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
