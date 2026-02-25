@@ -47,7 +47,7 @@ class YandexFleetApi {
     async getDriverProfiles() {
         const allDrivers = [];
         let offset = 0;
-        const limit = 300;
+        const limit = 1000;
         let hasMore = true;
 
         while (hasMore) {
@@ -184,8 +184,8 @@ class YandexFleetApi {
         } catch (error) {
             const errorMsg = error.response?.data?.message || error.response?.data || error.message;
             if (error.response?.status === 429 || String(errorMsg).includes('Limit exceeded')) {
-                console.log(`[YandexFleetApi] Rate limit - 2 saniye bekleniyor...`);
-                await new Promise(resolve => setTimeout(resolve, 2000));
+                console.log(`[YandexFleetApi] Rate limit - 1 saniye bekleniyor...`);
+                await new Promise(resolve => setTimeout(resolve, 1000));
                 try {
                     const retryBody = {
                         query: {
@@ -228,6 +228,7 @@ class YandexFleetApi {
                 {
                     params: { contractor_id: driverId },
                     headers: {
+                        'X-Client-ID': config.yandexFleet.clientId,
                         'X-API-Key': config.yandexFleet.apiKey,
                         'X-Park-ID': this.parkId,
                         'Accept-Language': 'tr'
@@ -395,13 +396,6 @@ class YandexFleetApi {
                 pageNum++;
                 totalOrders += orders.length;
 
-                if (pageNum === 1 && orders.length > 0) {
-                    const sample = orders[0];
-                    console.log(`[YandexFleetApi] Order yapısı: ${JSON.stringify(Object.keys(sample))}`);
-                    if (sample.driver) console.log(`[YandexFleetApi] driver keys: ${JSON.stringify(Object.keys(sample.driver))}`);
-                    if (sample.driver_profile) console.log(`[YandexFleetApi] driver_profile keys: ${JSON.stringify(Object.keys(sample.driver_profile))}`);
-                }
-
                 orders.forEach(order => {
                     const driverId = order.driver?.id || order.driver_profile?.id;
                     if (driverId && driverMap[driverId]) {
@@ -420,8 +414,8 @@ class YandexFleetApi {
                 cursor = nextCursor;
             } catch (error) {
                 if (error.response?.status === 429) {
-                    console.log('[YandexFleetApi] Rate limit - 3 saniye bekleniyor...');
-                    await new Promise(r => setTimeout(r, 3000));
+                    console.log('[YandexFleetApi] Rate limit - 1 saniye bekleniyor...');
+                    await new Promise(r => setTimeout(r, 1000));
                     continue;
                 }
                 console.error('[YandexFleetApi] Sipariş çekilirken hata:', error.response?.data || error.message);
@@ -464,38 +458,85 @@ class YandexFleetApi {
     }
 
     /**
-     * Tüm sürücülerin bilgilerini (telefon, araç, yolculuk sayısı) toplar
-     * Yolculuk sayıları paralel olarak çekilir (hızlandırma için)
+     * Park genelinde tüm siparişleri çekip sürücü başına sayar (bulk - tek seferde)
+     * @param {string} period - 'daily' | 'weekly' | 'monthly' | 'all'
+     * @returns {Object} { driverId: count }
      */
-    async getAllDriversInfo() {
-        console.log('[YandexFleetApi] Sürücü profilleri çekiliyor...');
-        const driverProfiles = await this.getDriverProfiles();
-        console.log(`[YandexFleetApi] Toplam ${driverProfiles.length} sürücü bulundu.`);
+    async _fetchOrderCountsByDriver(period = 'all') {
+        const from = this._getPeriodStartDate(period);
+        const to = new Date().toISOString();
+        const pageLimit = 500;
+        const countMap = {};
+        let cursor = undefined;
 
-        // Profilleri formatla
-        const driversInfo = driverProfiles.map(p => this.formatDriverProfile(p));
+        while (true) {
+            try {
+                const requestBody = {
+                    query: {
+                        park: {
+                            id: this.parkId,
+                            order: {
+                                booked_at: { from, to },
+                                statuses: ['complete']
+                            }
+                        }
+                    },
+                    limit: pageLimit
+                };
+                if (cursor) requestBody.cursor = cursor;
 
-        // Yolculuk sayılarını batch halinde çek (paralel, 5'er 5'er - rate limit koruması)
-        const batchSize = 5;
-        for (let i = 0; i < driversInfo.length; i += batchSize) {
-            const batch = driversInfo.slice(i, i + batchSize);
-            const promises = batch.map(driver =>
-                this.getDriverOrderCount(driver.id)
-            );
+                const response = await axios.post(
+                    `${this.baseUrl}/v1/parks/orders/list`,
+                    requestBody,
+                    { headers: this.headers }
+                );
 
-            const tripCounts = await Promise.all(promises);
+                const orders = response.data.orders || [];
+                orders.forEach(order => {
+                    const driverId = order.driver?.id || order.driver_profile?.id;
+                    if (driverId) {
+                        countMap[driverId] = (countMap[driverId] || 0) + 1;
+                    }
+                });
 
-            batch.forEach((driver, idx) => {
-                driver.tripCount = tripCounts[idx];
-            });
-
-            console.log(`[YandexFleetApi] Yolculuk sayıları: ${Math.min(i + batchSize, driversInfo.length)} / ${driversInfo.length} sürücü tamamlandı`);
-
-            // Rate limiting için bekleme (500ms)
-            if (i + batchSize < driversInfo.length) {
-                await new Promise(resolve => setTimeout(resolve, 500));
+                const nextCursor = response.data.cursor;
+                if (orders.length < pageLimit || !nextCursor || nextCursor === '') {
+                    break;
+                }
+                cursor = nextCursor;
+            } catch (error) {
+                if (error.response?.status === 429) {
+                    console.log('[YandexFleetApi] Rate limit - 1 saniye bekleniyor...');
+                    await new Promise(r => setTimeout(r, 1000));
+                    continue;
+                }
+                console.error('[YandexFleetApi] Sipariş çekilirken hata:', error.response?.data?.message || error.message);
+                break;
             }
         }
+
+        return countMap;
+    }
+
+    /**
+     * Tüm sürücülerin bilgilerini (telefon, araç, yolculuk sayısı) toplar
+     * Leaderboard mantığı: tüm siparişler tek seferde çekilir, sürücü başına sayılır
+     */
+    async getAllDriversInfo() {
+        console.log('[YandexFleetApi] Sürücü profilleri ve yolculuk sayıları çekiliyor (bulk)...');
+
+        const [driverProfiles, tripCountMap] = await Promise.all([
+            this.getDriverProfiles(),
+            this._fetchOrderCountsByDriver('all')
+        ]);
+
+        console.log(`[YandexFleetApi] Toplam ${driverProfiles.length} sürücü, ${Object.keys(tripCountMap).length} aktif sürücü (yolculuk yapan)`);
+
+        const driversInfo = driverProfiles.map(p => {
+            const info = this.formatDriverProfile(p);
+            info.tripCount = tripCountMap[info.id] || 0;
+            return info;
+        });
 
         return driversInfo;
     }
