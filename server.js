@@ -234,8 +234,141 @@ app.get('/api/leaderboard', async (req, res) => {
 });
 
 /**
+ * POST /api/drivers/check-plate
+ * Plakanın sistemde kayıtlı olup olmadığını kontrol eder
+ */
+app.post('/api/drivers/check-plate', async (req, res) => {
+    try {
+        const { plate } = req.body;
+
+        if (!plate || typeof plate !== 'string') {
+            return res.status(400).json({
+                success: false,
+                message: 'Plaka numarası gereklidir.'
+            });
+        }
+
+        const trimmed = plate.trim().toUpperCase();
+        if (trimmed.length < 3) {
+            return res.status(400).json({
+                success: false,
+                message: 'Geçerli bir plaka numarası giriniz.'
+            });
+        }
+
+        const car = await yandexFleetApi.findCarByPlate(trimmed);
+
+        if (car) {
+            res.json({
+                success: true,
+                found: true,
+                car: {
+                    id: car.id,
+                    brand: car.brand,
+                    model: car.model,
+                    year: car.year,
+                    number: car.number
+                }
+            });
+        } else {
+            res.json({
+                success: true,
+                found: false,
+                car: null
+            });
+        }
+    } catch (error) {
+        console.error('[Server] Plaka kontrol hatası:', error.message);
+        res.status(500).json({
+            success: false,
+            message: error.message || 'Plaka kontrol edilirken hata oluştu.'
+        });
+    }
+});
+
+/**
+ * POST /api/drivers/change-car
+ * Sürücünün aracını değiştirir: kayıtlı araç varsa bağlar, yoksa yeni araç oluşturup bağlar
+ */
+app.post('/api/drivers/change-car', async (req, res) => {
+    try {
+        const { driverId, plate, carId, brand, model, year } = req.body;
+
+        if (!driverId) {
+            return res.status(400).json({
+                success: false,
+                message: 'Sürücü ID gereklidir.'
+            });
+        }
+
+        const trimmedPlate = (plate || '').trim().toUpperCase();
+        if (trimmedPlate.length < 3) {
+            return res.status(400).json({
+                success: false,
+                message: 'Geçerli bir plaka numarası giriniz.'
+            });
+        }
+
+        if (carId) {
+            await yandexFleetApi.bindCarToDriver(driverId, carId);
+            const car = await yandexFleetApi.findCarByPlate(trimmedPlate);
+            res.json({
+                success: true,
+                message: 'Araç başarıyla değiştirildi.',
+                car: car ? {
+                    id: car.id,
+                    brand: car.brand,
+                    model: car.model,
+                    year: car.year,
+                    number: car.number
+                } : null
+            });
+        } else {
+            if (!brand || !model || !year) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Yeni araç için marka, model ve yıl gereklidir.'
+                });
+            }
+            const result = await yandexFleetApi.createCarAndBind(trimmedPlate, brand, model, year, driverId);
+            res.json({
+                success: true,
+                message: 'Yeni araç kaydedildi ve size atandı.',
+                car: {
+                    id: result.vehicleId,
+                    brand: result.brand,
+                    model: result.model,
+                    year: result.year,
+                    number: result.plate
+                }
+            });
+        }
+    } catch (error) {
+        console.error('[Server] Araç değiştirme hatası:', error.message);
+        res.status(500).json({
+            success: false,
+            message: error.message || 'Araç değiştirilirken hata oluştu.'
+        });
+    }
+});
+
+/**
+ * GET /api/drivers/car-brands
+ * Yeni araç kaydı için marka listesi
+ */
+app.get('/api/drivers/car-brands', (req, res) => {
+    const brands = [
+        'Toyota', 'Honda', 'Ford', 'Volkswagen', 'Renault', 'Fiat', 'Peugeot',
+        'BMW', 'Mercedes-Benz', 'Audi', 'Hyundai', 'Kia', 'Nissan', 'Mazda',
+        'Opel', 'Skoda', 'Dacia', 'Chevrolet', 'Citroën', 'Seat', 'Volvo',
+        'Togg', 'Diğer'
+    ];
+    res.json({ success: true, brands });
+});
+
+/**
  * POST /api/drivers/update-car
- * Sürücünün araç plakasını günceller
+ * Sürücünün araç plakasını günceller (eski akış - geriye uyumluluk)
  */
 app.post('/api/drivers/update-car', async (req, res) => {
     try {

@@ -272,6 +272,178 @@ class YandexFleetApi {
     }
 
     /**
+     * Parktaki araç listesini getirir
+     * POST /v1/parks/cars/list
+     * @param {string} [textSearch] - Plaka veya araç bilgisi ile arama
+     */
+    async getCarsList(textSearch = '') {
+        const allCars = [];
+        let offset = 0;
+        const limit = 1000;
+
+        try {
+            while (true) {
+                const body = {
+                    query: {
+                        park: { id: this.parkId },
+                        text: (textSearch || '').trim()
+                    },
+                    fields: {
+                        car: ['id', 'brand', 'model', 'year', 'number', 'status', 'color']
+                    },
+                    limit,
+                    offset
+                };
+
+                const response = await axios.post(
+                    `${this.baseUrl}/v1/parks/cars/list`,
+                    body,
+                    {
+                        headers: {
+                            ...this.headers,
+                            'X-Park-ID': this.parkId
+                        }
+                    }
+                );
+
+                const data = response.data;
+                const cars = data.cars || [];
+                allCars.push(...cars);
+
+                if (offset + cars.length >= (data.total || 0) || cars.length === 0) {
+                    break;
+                }
+                offset += limit;
+            }
+            return allCars;
+        } catch (error) {
+            console.error('[YandexFleetApi] Araç listesi çekilirken hata:', error.response?.data?.message || error.message);
+            throw error;
+        }
+    }
+
+    /**
+     * Plaka ile araç arar (sistemde kayıtlı mı)
+     * @param {string} plate - Plaka numarası
+     * @returns {Object|null} Bulunan araç bilgisi veya null
+     */
+    async findCarByPlate(plate) {
+        const trimmed = (plate || '').trim().toUpperCase().replace(/\s/g, '');
+        if (!trimmed || trimmed.length < 3) return null;
+
+        const cars = await this.getCarsList(trimmed);
+
+        const found = cars.find(c => {
+            const carPlate = (c.number || '').trim().toUpperCase().replace(/\s/g, '');
+            return carPlate === trimmed || carPlate.replace(/\s/g, '') === trimmed;
+        });
+
+        if (found) {
+            return {
+                id: found.id,
+                brand: found.brand || '',
+                model: found.model || '',
+                year: found.year || '',
+                number: found.number || trimmed,
+                color: translateColor(found.color || '')
+            };
+        }
+        return null;
+    }
+
+    /**
+     * Araçı sürücüye bağlar
+     * PUT /v1/parks/driver-profiles/car-bindings
+     */
+    async bindCarToDriver(driverId, carId) {
+        try {
+            await axios.put(
+                `${this.baseUrl}/v1/parks/driver-profiles/car-bindings`,
+                {},
+                {
+                    params: {
+                        park_id: this.parkId,
+                        driver_profile_id: driverId,
+                        car_id: carId
+                    },
+                    headers: {
+                        'X-Client-ID': config.yandexFleet.clientId,
+                        'X-API-Key': config.yandexFleet.apiKey,
+                        'Content-Type': 'application/json'
+                    }
+                }
+            );
+            console.log(`[YandexFleetApi] Araç bağlandı: sürücü ${driverId} -> araç ${carId}`);
+            return true;
+        } catch (error) {
+            const msg = error.response?.data?.message || error.message;
+            console.error(`[YandexFleetApi] Araç bağlama hatası:`, msg);
+            throw new Error(msg);
+        }
+    }
+
+    /**
+     * Yeni araç oluşturur ve sürücüye bağlar
+     * POST /v2/parks/vehicles/car
+     */
+    async createCarAndBind(plate, brand, model, year, driverId) {
+        const trimmedPlate = (plate || '').trim().toUpperCase();
+        const body = {
+            vehicle_specifications: {
+                brand: (brand || '').trim(),
+                model: (model || '').trim(),
+                year: parseInt(year, 10) || new Date().getFullYear(),
+                color: 'Черный',
+                transmission: 'automatic',
+                vin: trimmedPlate.replace(/\D/g, '').padEnd(17, '0').substring(0, 17) || '0'.repeat(17),
+                body_number: trimmedPlate,
+                mileage: 0
+            },
+            vehicle_licenses: {
+                licence_plate_number: trimmedPlate,
+                registration_certificate: trimmedPlate,
+                licence_number: trimmedPlate
+            },
+            park_profile: {
+                callsign: trimmedPlate,
+                status: 'working',
+                categories: ['econom'],
+                fuel_type: 'petrol'
+            }
+        };
+
+        try {
+            const response = await axios.post(
+                `${this.baseUrl}/v2/parks/vehicles/car`,
+                body,
+                {
+                    headers: {
+                        'X-Client-ID': config.yandexFleet.clientId,
+                        'X-API-Key': config.yandexFleet.apiKey,
+                        'X-Park-ID': this.parkId,
+                        'X-Idempotency-Token': require('crypto').randomBytes(16).toString('hex'),
+                        'Content-Type': 'application/json',
+                        'Accept-Language': 'tr'
+                    }
+                }
+            );
+
+            const vehicleId = response.data?.vehicle_id;
+            if (!vehicleId) {
+                throw new Error('Araç oluşturuldu ancak ID alınamadı.');
+            }
+
+            await this.bindCarToDriver(driverId, vehicleId);
+            console.log(`[YandexFleetApi] Yeni araç oluşturuldu ve bağlandı: ${vehicleId}`);
+            return { vehicleId, plate: trimmedPlate, brand, model, year };
+        } catch (error) {
+            const msg = error.response?.data?.message || error.message;
+            console.error('[YandexFleetApi] Araç oluşturma hatası:', msg);
+            throw new Error(msg);
+        }
+    }
+
+    /**
      * Araç plakasını günceller
      * PUT /v2/parks/vehicles/car
      * @param {string} vehicleId
