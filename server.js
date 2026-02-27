@@ -310,18 +310,36 @@ app.post('/api/drivers/change-car', async (req, res) => {
         }
 
         if (carId) {
+            console.log(`[Server] Araç bağlama: sürücü ${driverId} -> araç ${carId} (plaka: ${trimmedPlate})`);
             await yandexFleetApi.bindCarToDriver(driverId, carId);
-            const car = await yandexFleetApi.findCarByPlate(trimmedPlate);
+
+            // Araç bilgilerini plaka ile ara (findCarByPlate düz formatta döner)
+            let car = null;
+            try {
+                car = await yandexFleetApi.findCarByPlate(trimmedPlate);
+            } catch (findErr) {
+                console.warn('[Server] Araç bilgisi alınamadı:', findErr.message);
+            }
+
+            const carInfo = car ? {
+                id: car.id || carId,
+                brand: car.brand || brand || '',
+                model: car.model || model || '',
+                year: car.year || year || '',
+                number: car.number || trimmedPlate
+            } : {
+                id: carId,
+                brand: brand || '',
+                model: model || '',
+                year: year || '',
+                number: trimmedPlate
+            };
+
+            console.log(`[Server] Araç başarıyla bağlandı:`, JSON.stringify(carInfo));
             res.json({
                 success: true,
                 message: 'Araç başarıyla değiştirildi.',
-                car: car ? {
-                    id: car.id,
-                    brand: car.brand,
-                    model: car.model,
-                    year: car.year,
-                    number: car.number
-                } : null
+                car: carInfo
             });
         } else {
             if (!brand || !model || !year) {

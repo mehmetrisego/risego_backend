@@ -357,7 +357,8 @@ class YandexFleetApi {
      */
     async bindCarToDriver(driverId, carId) {
         try {
-            await axios.put(
+            console.log(`[YandexFleetApi] Araç bağlama isteği: sürücü ${driverId} -> araç ${carId}`);
+            const response = await axios.put(
                 `${this.baseUrl}/v1/parks/driver-profiles/car-bindings`,
                 {},
                 {
@@ -367,18 +368,19 @@ class YandexFleetApi {
                         car_id: carId
                     },
                     headers: {
-                        'X-Client-ID': config.yandexFleet.clientId,
-                        'X-API-Key': config.yandexFleet.apiKey,
-                        'Content-Type': 'application/json'
+                        ...this.headers,
+                        'X-Park-ID': this.parkId
                     }
                 }
             );
-            console.log(`[YandexFleetApi] Araç bağlandı: sürücü ${driverId} -> araç ${carId}`);
+            console.log(`[YandexFleetApi] Araç bağlandı: sürücü ${driverId} -> araç ${carId}`, response.status);
             return true;
         } catch (error) {
-            const msg = error.response?.data?.message || error.message;
+            const errData = error.response?.data;
+            const msg = errData?.message || errData?.error?.text || error.message;
             console.error(`[YandexFleetApi] Araç bağlama hatası:`, msg);
-            throw new Error(msg);
+            console.error(`[YandexFleetApi] Hata detayı:`, JSON.stringify(errData || {}));
+            throw new Error(`Araç bağlama hatası: ${msg}`);
         }
     }
 
