@@ -10,7 +10,7 @@
 ## Backend Repo İçeriği (GitHub'a push edilecekler)
 
 - server.js, config.js, package.json
-- services/ (authService, yandexFleetApi, fileWriter)
+- services/ (authService, netgsmService, yandexFleetApi, fileWriter)
 - fetchDrivers.js
 - .env.example, .gitignore, DEPLOY.md
 - **risego_frontend YOK** - frontend ayrı repoda
@@ -22,6 +22,9 @@
    - `YANDEX_CLIENT_ID`
    - `YANDEX_API_KEY`
    - `YANDEX_PARTNER_ID`
+   - `NETGSM_USERNAME` (OTP SMS için)
+   - `NETGSM_USERCODE` (OTP SMS için)
+   - `NETGSM_MSGHEADER` (örn: RISE LTD)
 3. Deploy tamamlandığında URL alacaksınız: `https://xxx.up.railway.app`
 
 ## Frontend (GitHub Pages) - Ayrı Repo

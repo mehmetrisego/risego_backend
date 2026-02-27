@@ -1,9 +1,14 @@
 const crypto = require('crypto');
 const yandexFleetApi = require('./yandexFleetApi');
+const netgsmService = require('./netgsmService');
 
 class AuthService {
     constructor() {
         this.otpStore = new Map();
+
+        // OTP gönderim rate limit: telefon -> son gönderim zamanı
+        this.otpLastSentAt = new Map();
+        this.OTP_RATE_LIMIT_MS = 60 * 1000; // 1 dakikada 1 OTP
 
         // Sürücü cache (telefon -> profil)
         this.driverCache = new Map();
@@ -145,23 +150,48 @@ class AuthService {
             };
         }
 
+        const normalizedPhone = this.normalizePhone(phone);
+
+        // Rate limit: Aynı numaraya 1 dakikada birden fazla OTP gönderme
+        const lastSent = this.otpLastSentAt.get(normalizedPhone);
+        if (lastSent && Date.now() - lastSent < this.OTP_RATE_LIMIT_MS) {
+            const waitSec = Math.ceil((this.OTP_RATE_LIMIT_MS - (Date.now() - lastSent)) / 1000);
+            return {
+                success: false,
+                message: `Yeni kod göndermek için ${waitSec} saniye bekleyin.`
+            };
+        }
+
         // 2. OTP oluştur
         const otpCode = this.generateOTP();
         const expiresAt = Date.now() + 5 * 60 * 1000; // 5 dakika geçerli
 
-        this.otpStore.set(this.normalizePhone(phone), {
+        this.otpStore.set(normalizedPhone, {
             code: otpCode,
             expiresAt: expiresAt,
             attempts: 0,
             driver: driver
         });
 
-        console.log(`[AuthService] OTP oluşturuldu: ${phone} -> ${otpCode} (NetGSM entegrasyonu sonra eklenecek)`);
+        // 3. NetGSM ile OTP SMS gönder
+        const smsMessage = `RiseGo doğrulama kodunuz: ${otpCode}. Bu kod 5 dakika geçerlidir.`;
+        const smsResult = await netgsmService.sendOtpSms(normalizedPhone, smsMessage);
 
-        // OTP gönderimi: NetGSM API ile eklenecek. Şimdilik sadece store'da tutuluyor.
+        if (!smsResult.success) {
+            console.error('[AuthService] OTP SMS gönderilemedi:', smsResult.error);
+            // OTP store'da tutuluyor - kullanıcıya genel mesaj (güvenlik: detay verme)
+            return {
+                success: false,
+                message: 'SMS gönderilemedi. Lütfen bir süre sonra tekrar deneyin.'
+            };
+        }
+
+        this.otpLastSentAt.set(normalizedPhone, Date.now());
+        console.log(`[AuthService] OTP gönderildi: ${normalizedPhone} (JobID: ${smsResult.jobId})`);
+
         return {
             success: true,
-            message: 'Doğrulama kodu hazırlandı.'
+            message: 'Doğrulama kodu telefonunuza gönderildi.'
         };
     }
 
