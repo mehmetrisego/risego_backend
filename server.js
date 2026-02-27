@@ -5,8 +5,12 @@ const yandexFleetApi = require('./services/yandexFleetApi');
 const { writeDriversToFile } = require('./services/fileWriter');
 const authService = require('./services/authService');
 
+const path = require('path');
 const app = express();
 app.use(express.json());
+
+// Frontend statik dosyaları (local geliştirme: http://localhost:3000 üzerinden açın)
+app.use(express.static(path.join(__dirname, 'risego_frontend')));
 
 // CORS ayarları (frontend GitHub Pages'ten API çağrıları için)
 app.use((req, res, next) => {
@@ -38,7 +42,6 @@ app.post('/api/auth/login', async (req, res) => {
             });
         }
 
-        console.log(`\n[Server] Giriş isteği: ${phone} - ${city}`);
         const result = await authService.login(phone, city);
         res.json(result);
     } catch (error) {
@@ -65,7 +68,6 @@ app.post('/api/auth/verify-otp', async (req, res) => {
             });
         }
 
-        console.log(`[Server] OTP doğrulama isteği: ${phone}`);
         const result = await authService.verifyOTP(phone, otp);
         res.json(result);
     } catch (error) {
@@ -88,11 +90,9 @@ app.get('/api/auth/session', async (req, res) => {
             return res.json({ success: false });
         }
 
-        console.log('[Server] Oturum doğrulama istendi...');
         const driver = await authService.validateSession(token);
 
         if (driver) {
-            console.log(`[Server] Oturum geçerli: ${driver.name}`);
             res.json({ success: true, driver });
         } else {
             res.json({ success: false });
@@ -137,7 +137,6 @@ app.post('/api/drivers/trip-count', async (req, res) => {
         const validPeriods = ['daily', 'weekly', 'monthly', 'all'];
         const selectedPeriod = validPeriods.includes(period) ? period : 'all';
 
-        console.log(`[Server] Yolculuk sayısı istendi: ${driverId} - ${selectedPeriod}`);
         const tripCount = await yandexFleetApi.getDriverOrderCount(driverId, selectedPeriod);
 
         res.json({
@@ -169,7 +168,6 @@ app.post('/api/drivers/balance', async (req, res) => {
             });
         }
 
-        console.log(`[Server] Bakiye istendi: ${driverId}`);
         const balanceData = await yandexFleetApi.getDriverBalance(driverId);
 
         if (balanceData) {
@@ -200,8 +198,6 @@ app.post('/api/drivers/balance', async (req, res) => {
 app.get('/api/leaderboard', async (req, res) => {
     try {
         const driverId = req.query.driverId;
-        console.log('[Server] Leaderboard istendi...');
-
         const { drivers, totalDrivers } = await yandexFleetApi.getLeaderboardData();
 
         const top30 = drivers.slice(0, 30);
@@ -310,7 +306,6 @@ app.post('/api/drivers/change-car', async (req, res) => {
         }
 
         if (carId) {
-            console.log(`[Server] Araç bağlama: sürücü ${driverId} -> araç ${carId} (plaka: ${trimmedPlate})`);
             await yandexFleetApi.bindCarToDriver(driverId, carId);
 
             // Araç bilgilerini plaka ile ara (findCarByPlate düz formatta döner)
@@ -335,7 +330,6 @@ app.post('/api/drivers/change-car', async (req, res) => {
                 number: trimmedPlate
             };
 
-            console.log(`[Server] Araç başarıyla bağlandı:`, JSON.stringify(carInfo));
             res.json({
                 success: true,
                 message: 'Araç başarıyla değiştirildi.',
@@ -366,6 +360,112 @@ app.post('/api/drivers/change-car', async (req, res) => {
         res.status(500).json({
             success: false,
             message: error.message || 'Araç değiştirilirken hata oluştu.'
+        });
+    }
+});
+
+/**
+ * POST /api/drivers/register/request-otp
+ * Kayıt öncesi telefon doğrulaması - OTP gönderir (sürücü henüz oluşturulmaz)
+ */
+app.post('/api/drivers/register/request-otp', async (req, res) => {
+    try {
+        const {
+            firstName,
+            lastName,
+            phone,
+            city,
+            taxIdentificationNumber,
+            driverLicenseNumber,
+            driverLicenseIssueDate,
+            driverLicenseExpiryDate,
+            birthDate,
+            country
+        } = req.body;
+
+        if (!firstName || !lastName || !phone || !city || !taxIdentificationNumber || !driverLicenseNumber ||
+            !driverLicenseIssueDate || !driverLicenseExpiryDate || !birthDate) {
+            return res.status(400).json({
+                success: false,
+                message: 'Tüm zorunlu alanları doldurunuz.'
+            });
+        }
+
+        if (taxIdentificationNumber.length !== 11) {
+            return res.status(400).json({
+                success: false,
+                message: 'TC kimlik numarası 11 haneli olmalıdır.'
+            });
+        }
+
+        const phoneClean = phone.replace(/\D/g, '');
+        if (phoneClean.length < 10) {
+            return res.status(400).json({
+                success: false,
+                message: 'Geçerli bir telefon numarası giriniz.'
+            });
+        }
+
+        const normalizedPhone = phoneClean.startsWith('90') ? '+' + phoneClean : '+90' + phoneClean;
+
+        const result = await authService.sendRegistrationOTP(normalizedPhone, city, {
+            firstName: firstName.trim(),
+            lastName: lastName.trim(),
+            taxIdentificationNumber: taxIdentificationNumber.trim(),
+            driverLicenseNumber: driverLicenseNumber.trim(),
+            driverLicenseIssueDate,
+            driverLicenseExpiryDate,
+            birthDate,
+            country: country || 'tur'
+        });
+
+        res.json(result);
+    } catch (error) {
+        console.error('[Server] Kayıt OTP hatası:', error.message);
+        res.status(500).json({
+            success: false,
+            message: error.message || 'Kod gönderilirken hata oluştu.'
+        });
+    }
+});
+
+/**
+ * POST /api/drivers/register/verify
+ * OTP doğrular, sürücü oluşturur ve oturum açar
+ */
+app.post('/api/drivers/register/verify', async (req, res) => {
+    try {
+        const { phone, otp } = req.body;
+
+        if (!phone || !otp) {
+            return res.status(400).json({
+                success: false,
+                message: 'Telefon numarası ve doğrulama kodu gereklidir.'
+            });
+        }
+
+        const phoneClean = phone.replace(/\D/g, '');
+        const normalizedPhone = phoneClean.startsWith('90') ? '+' + phoneClean : '+90' + phoneClean;
+
+        const result = await authService.verifyRegistrationOTP(normalizedPhone, otp);
+
+        if (result.success) {
+            res.json({
+                success: true,
+                driver: result.driver,
+                sessionToken: result.sessionToken
+            });
+        } else {
+            res.status(400).json({
+                success: false,
+                message: result.message
+            });
+        }
+    } catch (error) {
+        console.error('[Server] Kayıt doğrulama hatası:', error.message);
+        res.status(500).json({
+            success: false,
+            message: error.message || 'Doğrulama sırasında hata oluştu.'
         });
     }
 });
@@ -407,7 +507,6 @@ app.post('/api/drivers/update-car', async (req, res) => {
             });
         }
 
-        console.log(`[Server] Plaka güncelleme istendi: ${carId} -> ${trimmedPlate}`);
         await yandexFleetApi.updateCarPlate(carId, trimmedPlate);
 
         res.json({
@@ -430,7 +529,6 @@ app.post('/api/drivers/update-car', async (req, res) => {
  */
 app.get('/api/drivers', async (req, res) => {
     try {
-        console.log('\n[Server] Sürücü bilgileri istendi...');
         const driversInfo = await yandexFleetApi.getAllDriversInfo();
 
         // Dosyaya yaz
@@ -459,7 +557,6 @@ app.get('/api/drivers', async (req, res) => {
  */
 app.get('/api/drivers/fetch', async (req, res) => {
     try {
-        console.log('\n[Server] Sürücü profilleri çekiliyor (hızlı mod)...');
         const driversInfo = await yandexFleetApi.getDriverProfilesFormatted();
 
         const filePath = writeDriversToFile(driversInfo);
@@ -514,6 +611,7 @@ app.listen(PORT, () => {
     console.log('='.repeat(50));
     console.log(`  RiseGo Backend - Yandex Fleet Sürücü Sistemi`);
     console.log(`  Sunucu http://localhost:${PORT} adresinde çalışıyor`);
+    console.log(`  Uygulama: http://localhost:${PORT} adresinden açın`);
     console.log('='.repeat(50));
     console.log('\nKullanılabilir endpointler:');
     console.log(`  GET  http://localhost:${PORT}/                    - API bilgisi`);

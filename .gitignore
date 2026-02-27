@@ -6,7 +6,7 @@ node_modules/
 .env.local
 .env.*.local
 
-# Frontend (ayrı repo'da GitHub Pages için - backend push'unda dahil edilmez)
+# Frontend (ayrı repo'da push ediliyor)
 risego_frontend/
 
 # Oluşturulan dosyalar
@@ -20,8 +20,13 @@ npm-debug.log*
 .DS_Store
 Thumbs.db
 
-# IDE
+# IDE / Editor
 .idea/
 .vscode/
+.cursor/
 *.swp
 *.swo
+
+# Geçici / Agent
+agent-tools/
+mcps/

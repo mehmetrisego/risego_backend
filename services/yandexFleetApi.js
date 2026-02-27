@@ -86,8 +86,6 @@ class YandexFleetApi {
                 const drivers = data.driver_profiles || [];
                 allDrivers.push(...drivers);
 
-                console.log(`[YandexFleetApi] ${offset + drivers.length} / ${data.total} sürücü çekildi`);
-
                 if (offset + limit >= data.total || drivers.length === 0) {
                     hasMore = false;
                 } else {
@@ -184,7 +182,6 @@ class YandexFleetApi {
         } catch (error) {
             const errorMsg = error.response?.data?.message || error.response?.data || error.message;
             if (error.response?.status === 429 || String(errorMsg).includes('Limit exceeded')) {
-                console.log(`[YandexFleetApi] Rate limit - 1 saniye bekleniyor...`);
                 await new Promise(resolve => setTimeout(resolve, 1000));
                 try {
                     const retryBody = {
@@ -352,12 +349,102 @@ class YandexFleetApi {
     }
 
     /**
+     * Çalışma kurallarını getirir (work_rule_id için)
+     * GET /v1/parks/driver-work-rules
+     */
+    async getDriverWorkRules() {
+        try {
+            const response = await axios.get(
+                `${this.baseUrl}/v1/parks/driver-work-rules`,
+                {
+                    params: { park_id: this.parkId },
+                    headers: this.headers
+                }
+            );
+            const rules = response.data?.rules || [];
+            return rules.filter(r => r.is_enabled).map(r => r.id);
+        } catch (error) {
+            console.error('[YandexFleetApi] Work rules hatası:', error.response?.data || error.message);
+            throw error;
+        }
+    }
+
+    /**
+     * Yeni taksi sürücüsü profili oluşturur
+     * POST /v2/parks/contractors/driver-profile
+     */
+    async createDriverProfile(data) {
+        let workRuleId = config.yandexFleet.workRuleId;
+        if (!workRuleId) {
+            const rules = await this.getDriverWorkRules();
+            workRuleId = rules[0];
+        }
+        if (!workRuleId) {
+            throw new Error('Çalışma kuralı bulunamadı. YANDEX_WORK_RULE_ID .env dosyasında tanımlayın.');
+        }
+
+        const body = {
+            person: {
+                full_name: {
+                    first_name: data.firstName,
+                    last_name: data.lastName
+                },
+                contact_info: {
+                    phone: data.phone
+                },
+                driver_license: {
+                    number: data.driverLicenseNumber,
+                    birth_date: data.birthDate,
+                    country: data.country || 'tur',
+                    issue_date: data.driverLicenseIssueDate,
+                    expiry_date: data.driverLicenseExpiryDate
+                },
+                driver_license_experience: {
+                    total_since_date: data.driverLicenseIssueDate
+                },
+                tax_identification_number: data.taxIdentificationNumber
+            },
+            account: {
+                work_rule_id: workRuleId
+            },
+            order_provider: {
+                platform: true,
+                partner: true
+            }
+        };
+
+        const idempotencyToken = require('crypto').randomBytes(16).toString('hex');
+        const headers = {
+            ...this.headers,
+            'X-Park-ID': this.parkId,
+            'X-Idempotency-Token': idempotencyToken
+        };
+
+        try {
+            const response = await axios.post(
+                `${this.baseUrl}/v2/parks/contractors/driver-profile`,
+                body,
+                { headers }
+            );
+            const contractorProfileId = response.data?.contractor_profile_id;
+            if (!contractorProfileId) {
+                throw new Error('Sürücü oluşturuldu ancak profil ID alınamadı.');
+            }
+            return { contractorProfileId };
+        } catch (error) {
+            const errData = error.response?.data;
+            const msg = errData?.message || errData?.code || error.message;
+            console.error('[YandexFleetApi] Sürücü oluşturma hatası:', msg, JSON.stringify(errData || {}));
+            throw new Error(msg);
+        }
+    }
+
+    /**
      * Araçı sürücüye bağlar
      * PUT /v1/parks/driver-profiles/car-bindings
      */
     async bindCarToDriver(driverId, carId) {
         try {
-            console.log(`[YandexFleetApi] Araç bağlama isteği: sürücü ${driverId} -> araç ${carId}`);
             const response = await axios.put(
                 `${this.baseUrl}/v1/parks/driver-profiles/car-bindings`,
                 {},
@@ -373,7 +460,6 @@ class YandexFleetApi {
                     }
                 }
             );
-            console.log(`[YandexFleetApi] Araç bağlandı: sürücü ${driverId} -> araç ${carId}`, response.status);
             return true;
         } catch (error) {
             const errData = error.response?.data;
@@ -436,7 +522,6 @@ class YandexFleetApi {
             }
 
             await this.bindCarToDriver(driverId, vehicleId);
-            console.log(`[YandexFleetApi] Yeni araç oluşturuldu ve bağlandı: ${vehicleId}`);
             return { vehicleId, plate: trimmedPlate, brand, model, year };
         } catch (error) {
             const msg = error.response?.data?.message || error.message;
@@ -481,7 +566,6 @@ class YandexFleetApi {
                     }
                 }
             );
-            console.log(`[YandexFleetApi] Araç plakası güncellendi: ${vehicleId} -> ${newPlate}`);
             return true;
         } catch (error) {
             const msg = error.response?.data?.message || error.message;
@@ -497,12 +581,10 @@ class YandexFleetApi {
      */
     async getLeaderboardData() {
         if (this._leaderboardCache && Date.now() < this._leaderboardExpiry) {
-            console.log('[YandexFleetApi] Leaderboard cache aktif.');
             return this._leaderboardCache;
         }
 
         if (this._leaderboardPending) {
-            console.log('[YandexFleetApi] Leaderboard zaten yükleniyor, bekleniyor...');
             return this._leaderboardPending;
         }
 
@@ -516,7 +598,6 @@ class YandexFleetApi {
     }
 
     async _fetchLeaderboard() {
-        console.log('[YandexFleetApi] Aylık sıralama verisi çekiliyor...');
 
         const profiles = await this.getDriverProfiles();
         const driverMap = {};
@@ -532,7 +613,6 @@ class YandexFleetApi {
                 : (firstName || 'X').substring(0, 1).toUpperCase() + '.';
             driverMap[id] = { id, initials, tripCount: 0 };
         });
-        console.log(`[YandexFleetApi] ${Object.keys(driverMap).length} sürücü profili yüklendi.`);
 
         const now = new Date();
         const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -579,7 +659,6 @@ class YandexFleetApi {
                     }
                 });
 
-                console.log(`[YandexFleetApi] Sayfa ${pageNum}: ${totalOrders} sipariş işlendi`);
 
                 const nextCursor = response.data.cursor;
                 if (orders.length < pageLimit || !nextCursor || nextCursor === '') {
@@ -588,7 +667,6 @@ class YandexFleetApi {
                 cursor = nextCursor;
             } catch (error) {
                 if (error.response?.status === 429) {
-                    console.log('[YandexFleetApi] Rate limit - 1 saniye bekleniyor...');
                     await new Promise(r => setTimeout(r, 1000));
                     continue;
                 }
@@ -603,7 +681,6 @@ class YandexFleetApi {
 
         this._leaderboardCache = { drivers, totalDrivers: Object.keys(driverMap).length };
         this._leaderboardExpiry = Date.now() + 30 * 60 * 1000;
-        console.log(`[YandexFleetApi] Leaderboard hazır: ${drivers.length} aktif sürücü, ${totalOrders} sipariş (bu ay).`);
         return this._leaderboardCache;
     }
 
@@ -680,7 +757,6 @@ class YandexFleetApi {
                 cursor = nextCursor;
             } catch (error) {
                 if (error.response?.status === 429) {
-                    console.log('[YandexFleetApi] Rate limit - 1 saniye bekleniyor...');
                     await new Promise(r => setTimeout(r, 1000));
                     continue;
                 }
@@ -697,14 +773,12 @@ class YandexFleetApi {
      * Leaderboard mantığı: tüm siparişler tek seferde çekilir, sürücü başına sayılır
      */
     async getAllDriversInfo() {
-        console.log('[YandexFleetApi] Sürücü profilleri ve yolculuk sayıları çekiliyor (bulk)...');
 
         const [driverProfiles, tripCountMap] = await Promise.all([
             this.getDriverProfiles(),
             this._fetchOrderCountsByDriver('all')
         ]);
 
-        console.log(`[YandexFleetApi] Toplam ${driverProfiles.length} sürücü, ${Object.keys(tripCountMap).length} aktif sürücü (yolculuk yapan)`);
 
         const driversInfo = driverProfiles.map(p => {
             const info = this.formatDriverProfile(p);
@@ -719,9 +793,7 @@ class YandexFleetApi {
      * Sadece sürücü profillerini çeker (yolculuk sayısı olmadan - hızlı mod)
      */
     async getDriverProfilesFormatted() {
-        console.log('[YandexFleetApi] Sürücü profilleri çekiliyor (hızlı mod)...');
         const driverProfiles = await this.getDriverProfiles();
-        console.log(`[YandexFleetApi] Toplam ${driverProfiles.length} sürücü bulundu.`);
 
         return driverProfiles.map(p => {
             const info = this.formatDriverProfile(p);

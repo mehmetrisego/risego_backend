@@ -6,6 +6,11 @@ class AuthService {
     constructor() {
         this.otpStore = new Map();
 
+        // Kayıt OTP store: telefon -> { code, expiresAt, attempts, registrationData }
+        this.registerOtpStore = new Map();
+        this.registerOtpLastSentAt = new Map();
+        this.REGISTER_OTP_RATE_LIMIT_MS = 60 * 1000; // 1 dakikada 1 OTP
+
         // OTP gönderim rate limit: telefon -> son gönderim zamanı
         this.otpLastSentAt = new Map();
         this.OTP_RATE_LIMIT_MS = 60 * 1000; // 1 dakikada 1 OTP
@@ -28,16 +33,22 @@ class AuthService {
     }
 
     /**
+     * Cache'i invalidate eder (yeni kayıt sonrası gibi)
+     */
+    invalidateDriverCache() {
+        this.cacheExpiry = null;
+        this.driverCache.clear();
+    }
+
+    /**
      * Sürücü veritabanını günceller/cache'ler
      */
     async refreshDriverCache() {
         const now = Date.now();
         if (this.driverCache.size > 0 && this.cacheExpiry && now < this.cacheExpiry) {
-            console.log('[AuthService] Sürücü cache aktif, API çağrısı atlanıyor.');
             return;
         }
 
-        console.log('[AuthService] Sürücü veritabanı güncelleniyor...');
         try {
             const driverProfiles = await yandexFleetApi.getDriverProfiles();
             this.driverCache.clear();
@@ -73,7 +84,6 @@ class AuthService {
             }
 
             this.cacheExpiry = now + this.cacheTTL;
-            console.log(`[AuthService] ${driverProfiles.length} sürücü cache'lendi. ${this.driverCache.size} telefon numarası eşlendi.`);
         } catch (error) {
             console.error('[AuthService] Sürücü veritabanı güncelleme hatası:', error.message);
             throw error;
@@ -114,7 +124,6 @@ class AuthService {
         await this.refreshDriverCache();
 
         const normalizedPhone = this.normalizePhone(phone);
-        console.log(`[AuthService] Sürücü aranıyor: ${normalizedPhone}`);
 
         // Exact match
         if (this.driverCache.has(normalizedPhone)) {
@@ -130,8 +139,146 @@ class AuthService {
             }
         }
 
-        console.log(`[AuthService] Sürücü bulunamadı: ${normalizedPhone}`);
         return null;
+    }
+
+    /**
+     * Kayıt için OTP gönderir (sürücü henüz oluşturulmadan)
+     * Telefon sistemde kayıtlı olmamalı
+     * @param {string} phone - Telefon numarası
+     * @param {string} city - Şehir
+     * @param {object} registrationData - Kayıt form verileri
+     * @returns {object} İşlem sonucu
+     */
+    async sendRegistrationOTP(phone, city, registrationData) {
+        const normalizedPhone = this.normalizePhone(phone);
+
+        // Telefon zaten sistemde kayıtlı mı?
+        const existingDriver = await this.findDriverByPhone(normalizedPhone);
+        if (existingDriver) {
+            return { success: false, message: 'Bu telefon numarası zaten kayıtlıdır.' };
+        }
+
+        // Rate limit
+        const lastSent = this.registerOtpLastSentAt.get(normalizedPhone);
+        if (lastSent && Date.now() - lastSent < this.REGISTER_OTP_RATE_LIMIT_MS) {
+            const waitSec = Math.ceil((this.REGISTER_OTP_RATE_LIMIT_MS - (Date.now() - lastSent)) / 1000);
+            return { success: false, message: `Yeni kod göndermek için ${waitSec} saniye bekleyin.` };
+        }
+
+        const otpCode = this.generateOTP();
+        const expiresAt = Date.now() + 5 * 60 * 1000; // 5 dakika
+
+        this.registerOtpStore.set(normalizedPhone, {
+            code: otpCode,
+            expiresAt,
+            attempts: 0,
+            registrationData: { ...registrationData, city }
+        });
+
+        const smsMessage = `RiseGo kayıt doğrulama kodunuz: ${otpCode}. Bu kod 5 dakika geçerlidir.`;
+        const smsResult = await netgsmService.sendOtpSms(normalizedPhone, smsMessage);
+
+        if (!smsResult.success) {
+            this.registerOtpStore.delete(normalizedPhone);
+            return { success: false, message: 'SMS gönderilemedi. Lütfen bir süre sonra tekrar deneyin.' };
+        }
+
+        this.registerOtpLastSentAt.set(normalizedPhone, Date.now());
+
+        return { success: true, message: 'Doğrulama kodu telefonunuza gönderildi.' };
+    }
+
+    /**
+     * Kayıt OTP doğrular, sürücü oluşturur ve oturum açar
+     * @param {string} phone - Telefon numarası
+     * @param {string} otp - OTP kodu
+     * @returns {object} { success, driver, sessionToken } veya hata
+     */
+    async verifyRegistrationOTP(phone, otp) {
+        const normalizedPhone = this.normalizePhone(phone);
+        const data = this.registerOtpStore.get(normalizedPhone);
+
+        if (!data) {
+            return { success: false, message: 'Doğrulama kodu bulunamadı. Lütfen tekrar deneyin.' };
+        }
+
+        if (Date.now() > data.expiresAt) {
+            this.registerOtpStore.delete(normalizedPhone);
+            return { success: false, message: 'Doğrulama kodunun süresi doldu. Lütfen yeni kod isteyin.' };
+        }
+
+        if (data.attempts >= 5) {
+            this.registerOtpStore.delete(normalizedPhone);
+            return { success: false, message: 'Çok fazla deneme yapıldı. Lütfen yeni kod isteyin.' };
+        }
+
+        data.attempts++;
+        if (data.code !== otp) {
+            return {
+                success: false,
+                message: `Geçersiz doğrulama kodu. ${5 - data.attempts} deneme hakkınız kaldı.`
+            };
+        }
+
+        // OTP doğru - store'dan al ve temizle
+        const { registrationData } = data;
+        this.registerOtpStore.delete(normalizedPhone);
+
+        // Sürücü oluştur (yandexFleetApi.createDriverProfile)
+        let result;
+        try {
+            result = await yandexFleetApi.createDriverProfile({
+                firstName: registrationData.firstName,
+                lastName: registrationData.lastName,
+                phone: normalizedPhone,
+                taxIdentificationNumber: registrationData.taxIdentificationNumber,
+                driverLicenseNumber: registrationData.driverLicenseNumber,
+                driverLicenseIssueDate: registrationData.driverLicenseIssueDate,
+                driverLicenseExpiryDate: registrationData.driverLicenseExpiryDate,
+                birthDate: registrationData.birthDate,
+                country: registrationData.country || 'tur'
+            });
+        } catch (err) {
+            console.error('[AuthService] Sürücü oluşturma hatası:', err.message);
+            return { success: false, message: err.message || 'Sürücü oluşturulurken hata oluştu.' };
+        }
+
+        this.invalidateDriverCache();
+
+        const driver = {
+            id: result.contractorProfileId,
+            name: `${registrationData.firstName} ${registrationData.lastName}`.trim(),
+            car: 'Araç atanmamış',
+            balance: '-',
+            tripCount: 0,
+            carId: null,
+            carNumber: null
+        };
+
+        // Bakiye ve yolculuk sayısını çek (yeni sürücü için 0 olacak)
+        try {
+            const [tripCount, balanceData] = await Promise.all([
+                yandexFleetApi.getDriverOrderCount(driver.id).catch(() => 0),
+                yandexFleetApi.getDriverBalance(driver.id).catch(() => null)
+            ]);
+            driver.tripCount = tripCount;
+            if (balanceData) {
+                const rawBal = parseFloat(balanceData.balance);
+                driver.balance = !isNaN(rawBal) ? `${Math.round(rawBal)} ₺` : '-';
+            }
+        } catch (e) {
+            console.error('[AuthService] Yeni sürücü verileri çekilemedi:', e.message);
+        }
+
+        const sessionToken = crypto.randomBytes(32).toString('hex');
+        this.sessions.set(sessionToken, {
+            phone: normalizedPhone,
+            driverId: driver.id,
+            createdAt: Date.now()
+        });
+
+        return { success: true, driver, sessionToken };
     }
 
     /**
@@ -187,7 +334,6 @@ class AuthService {
         }
 
         this.otpLastSentAt.set(normalizedPhone, Date.now());
-        console.log(`[AuthService] OTP gönderildi: ${normalizedPhone} (JobID: ${smsResult.jobId})`);
 
         return {
             success: true,
@@ -273,7 +419,6 @@ class AuthService {
             driverId: driver.id,
             createdAt: Date.now()
         });
-        console.log(`[AuthService] Oturum oluşturuldu: ${driver.name}`);
 
         return {
             success: true,
@@ -326,9 +471,7 @@ class AuthService {
      * Session'ı sonlandırır (çıkış)
      */
     destroySession(token) {
-        const existed = this.sessions.delete(token);
-        if (existed) console.log('[AuthService] Oturum sonlandırıldı.');
-        return existed;
+        return this.sessions.delete(token);
     }
 }
 

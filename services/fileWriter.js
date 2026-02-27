@@ -41,7 +41,6 @@ function writeDriversToFile(driversInfo) {
     content += '='.repeat(70) + '\n';
 
     fs.writeFileSync(filePath, content, 'utf8');
-    console.log(`[FileWriter] Sürücü bilgileri "${filePath}" dosyasına yazıldı.`);
     return filePath;
 }
 

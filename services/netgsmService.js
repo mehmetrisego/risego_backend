@@ -85,7 +85,6 @@ async function sendOtpSms(phone, message) {
 
         const data = response.data;
         if (data?.code === '00') {
-            console.log('[NetGSM] OTP gönderildi:', formattedPhone, '| JobID:', data.jobId || data.jobid);
             return { success: true, jobId: data.jobId || data.jobid };
         }
 
