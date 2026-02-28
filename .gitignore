@@ -6,8 +6,9 @@ node_modules/
 .env.local
 .env.*.local
 
-# Frontend (ayrı repo'da push ediliyor)
+# Frontend ve Admin Panel (ayrı repo'larda push ediliyor)
 risego_frontend/
+risego_adminpanel/
 
 # Oluşturulan dosyalar
 sürücüler.txt

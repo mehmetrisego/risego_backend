@@ -23,10 +23,16 @@ class AuthService {
         // Oturum yönetimi: token -> { phone, driverId, city, createdAt }
         this.sessions = new Map();
         this.SESSION_TTL = 30 * 24 * 60 * 60 * 1000; // 30 gün
+
+        // Admin panel OTP ve oturum
+        this.adminOtpStore = new Map();
+        this.adminOtpLastSentAt = new Map();
+        this.adminSessions = new Map();
+        this.ALLOWED_ADMIN_PHONES = ['+05466706626', '+905424571462'].map(p => this.normalizePhone(p));
     }
 
     /**
-     * 6 haneli rastgele OTP kodu oluşturur
+     * 6 haneli OTP kodu oluşturur
      */
     generateOTP() {
         return Math.floor(100000 + Math.random() * 900000).toString();
@@ -178,7 +184,6 @@ class AuthService {
 
         const smsMessage = `RiseGo kayıt doğrulama kodunuz: ${otpCode}. Bu kod 5 dakika geçerlidir.`;
         const smsResult = await netgsmService.sendOtpSms(normalizedPhone, smsMessage);
-
         if (!smsResult.success) {
             this.registerOtpStore.delete(normalizedPhone);
             return { success: false, message: 'SMS gönderilemedi. Lütfen bir süre sonra tekrar deneyin.' };
@@ -323,10 +328,8 @@ class AuthService {
         // 3. NetGSM ile OTP SMS gönder
         const smsMessage = `RiseGo doğrulama kodunuz: ${otpCode}. Bu kod 5 dakika geçerlidir.`;
         const smsResult = await netgsmService.sendOtpSms(normalizedPhone, smsMessage);
-
         if (!smsResult.success) {
             console.error('[AuthService] OTP SMS gönderilemedi:', smsResult.error);
-            // OTP store'da tutuluyor - kullanıcıya genel mesaj (güvenlik: detay verme)
             return {
                 success: false,
                 message: 'SMS gönderilemedi. Lütfen bir süre sonra tekrar deneyin.'
@@ -472,6 +475,174 @@ class AuthService {
      */
     destroySession(token) {
         return this.sessions.delete(token);
+    }
+
+    // ============================================
+    // Admin Panel OTP (sadece yetkili numaralar)
+    // ============================================
+
+    /**
+     * Admin giriş: sadece yetkili numaralara OTP gönderir
+     * @param {string} phone - Telefon numarası
+     * @returns {object} İşlem sonucu
+     */
+    async adminLogin(phone) {
+        const normalizedPhone = this.normalizePhone(phone);
+
+        // Yetkili numara kontrolü
+        const digits = normalizedPhone.replace(/\D/g, '');
+        const isAllowed = this.ALLOWED_ADMIN_PHONES.some(allowed => {
+            const allowedDigits = allowed.replace(/\D/g, '');
+            return digits === allowedDigits || digits.endsWith(allowedDigits.slice(-10)) || allowedDigits.endsWith(digits.slice(-10));
+        });
+
+        if (!isAllowed) {
+            return {
+                success: false,
+                message: 'Yetkisi olmayan bir numara tuşladınız'
+            };
+        }
+
+        // Rate limit
+        const lastSent = this.adminOtpLastSentAt.get(normalizedPhone);
+        if (lastSent && Date.now() - lastSent < this.OTP_RATE_LIMIT_MS) {
+            const waitSec = Math.ceil((this.OTP_RATE_LIMIT_MS - (Date.now() - lastSent)) / 1000);
+            return {
+                success: false,
+                message: `Yeni kod göndermek için ${waitSec} saniye bekleyin.`
+            };
+        }
+
+        const otpCode = this.generateOTP();
+        const expiresAt = Date.now() + 5 * 60 * 1000; // 5 dakika
+
+        this.adminOtpStore.set(normalizedPhone, {
+            code: otpCode,
+            expiresAt,
+            attempts: 0
+        });
+
+        console.log(`[Admin OTP] ${normalizedPhone} numarasına gönderilen kod: ${otpCode}`);
+
+        const smsMessage = `RiseGo doğrulama kodunuz: ${otpCode}. Bu kod 5 dakika geçerlidir.`;
+        const smsResult = await netgsmService.sendOtpSms(normalizedPhone, smsMessage);
+        if (!smsResult.success) {
+            this.adminOtpStore.delete(normalizedPhone);
+            return {
+                success: false,
+                message: 'SMS gönderilemedi. Lütfen bir süre sonra tekrar deneyin.'
+            };
+        }
+
+        this.adminOtpLastSentAt.set(normalizedPhone, Date.now());
+
+        return {
+            success: true,
+            message: 'Doğrulama kodu telefonunuza gönderildi.'
+        };
+    }
+
+    /**
+     * Admin OTP doğrulama
+     * @param {string} phone - Telefon numarası
+     * @param {string} otp - OTP kodu
+     * @returns {object} { success, adminSessionToken } veya hata
+     */
+    async adminVerifyOTP(phone, otp) {
+        const normalizedPhone = this.normalizePhone(phone);
+        const otpTrimmed = String(otp || '').trim().replace(/\D/g, '');
+
+        // Yetkili numara kontrolü (tekrar)
+        const digits = normalizedPhone.replace(/\D/g, '');
+        const isAllowed = this.ALLOWED_ADMIN_PHONES.some(allowed => {
+            const allowedDigits = allowed.replace(/\D/g, '');
+            return digits === allowedDigits || digits.endsWith(allowedDigits.slice(-10)) || allowedDigits.endsWith(digits.slice(-10));
+        });
+        if (!isAllowed) {
+            return { success: false, message: 'Yetkisi olmayan bir numara tuşladınız' };
+        }
+
+        // OTP verisini bul (normalizedPhone veya digit eşleşmesi ile)
+        let otpData = this.adminOtpStore.get(normalizedPhone);
+        let storeKey = normalizedPhone;
+        if (!otpData) {
+            const inputDigits = digits.length >= 10 ? digits.slice(-10) : digits;
+            for (const [key, data] of this.adminOtpStore.entries()) {
+                const keyDigits = key.replace(/\D/g, '');
+                const keyLast10 = keyDigits.length >= 10 ? keyDigits.slice(-10) : keyDigits;
+                if (keyDigits === digits || keyLast10 === inputDigits || keyDigits.endsWith(inputDigits) || digits.endsWith(keyLast10)) {
+                    otpData = data;
+                    storeKey = key;
+                    break;
+                }
+            }
+        }
+
+        if (!otpData) {
+            console.log(`[Admin OTP] Doğrulama: ${normalizedPhone} için store\'da kayıt yok. Store keys:`, [...this.adminOtpStore.keys()]);
+            return {
+                success: false,
+                message: 'Doğrulama kodu bulunamadı. Lütfen tekrar giriş yapın.'
+            };
+        }
+
+        if (Date.now() > otpData.expiresAt) {
+            this.adminOtpStore.delete(storeKey);
+            return {
+                success: false,
+                message: 'Doğrulama kodunun süresi doldu. Lütfen yeni kod isteyin.'
+            };
+        }
+
+        if (otpData.attempts >= 5) {
+            this.adminOtpStore.delete(storeKey);
+            return {
+                success: false,
+                message: 'Çok fazla deneme yapıldı. Lütfen yeni kod isteyin.'
+            };
+        }
+
+        otpData.attempts++;
+        if (otpData.code !== otpTrimmed) {
+            console.log(`[Admin OTP] Kod uyuşmazlığı - Beklenen: "${otpData.code}" (${typeof otpData.code}), Girilen: "${otpTrimmed}" (${typeof otpTrimmed}), Telefon: ${normalizedPhone}`);
+            return {
+                success: false,
+                message: `Geçersiz doğrulama kodu. ${5 - otpData.attempts} deneme hakkınız kaldı.`
+            };
+        }
+
+        this.adminOtpStore.delete(storeKey);
+
+        console.log(`[Admin OTP] Başarılı giriş: ${normalizedPhone}`);
+
+        const adminSessionToken = crypto.randomBytes(32).toString('hex');
+        this.adminSessions.set(adminSessionToken, {
+            phone: normalizedPhone,
+            createdAt: Date.now()
+        });
+
+        return {
+            success: true,
+            message: 'Giriş başarılı!',
+            adminSessionToken
+        };
+    }
+
+    /**
+     * Admin session doğrulama
+     */
+    validateAdminSession(token) {
+        const session = this.adminSessions.get(token);
+        if (!session) return null;
+        if (Date.now() - session.createdAt > this.SESSION_TTL) {
+            this.adminSessions.delete(token);
+            return null;
+        }
+        return session;
+    }
+
+    destroyAdminSession(token) {
+        return this.adminSessions.delete(token);
     }
 }
 

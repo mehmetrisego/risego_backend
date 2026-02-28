@@ -575,26 +575,294 @@ class YandexFleetApi {
     }
 
     /**
+     * 10 günlük dönem hesaplayıcı
+     * 1-10, 11-20, 21-ay sonu şeklinde dönemler oluşturur
+     * @returns {{ from: string, to: string, label: string }}
+     */
+    _get10DayPeriod() {
+        const now = new Date();
+        const year = now.getFullYear();
+        const month = now.getMonth();
+        const day = now.getDate();
+
+        let periodStart, periodEnd;
+
+        if (day <= 10) {
+            periodStart = new Date(year, month, 1);
+            periodEnd = new Date(year, month, 10, 23, 59, 59, 999);
+        } else if (day <= 20) {
+            periodStart = new Date(year, month, 11);
+            periodEnd = new Date(year, month, 20, 23, 59, 59, 999);
+        } else {
+            periodStart = new Date(year, month, 21);
+            // Ay sonunu hesapla
+            periodEnd = new Date(year, month + 1, 0, 23, 59, 59, 999);
+        }
+
+        const monthNames = ['Ocak', 'Şubat', 'Mart', 'Nisan', 'Mayıs', 'Haziran',
+            'Temmuz', 'Ağustos', 'Eylül', 'Ekim', 'Kasım', 'Aralık'];
+
+        const label = `${periodStart.getDate()} - ${periodEnd.getDate()} ${monthNames[month]} ${year}`;
+
+        return {
+            from: periodStart.toISOString(),
+            to: periodEnd.toISOString(),
+            label
+        };
+    }
+
+    /**
+     * Önceki 10 günlük dönemi hesaplar (sonlanmış kampanya)
+     * Örn: Şu an 11-20 Haziran ise → 1-10 Haziran döner
+     * @returns {{ from: string, to: string, label: string }}
+     */
+    _getPrev10DayPeriod() {
+        const now = new Date();
+        const year = now.getFullYear();
+        const month = now.getMonth();
+        const day = now.getDate();
+
+        const monthNames = ['Ocak', 'Şubat', 'Mart', 'Nisan', 'Mayıs', 'Haziran',
+            'Temmuz', 'Ağustos', 'Eylül', 'Ekim', 'Kasım', 'Aralık'];
+
+        let periodStart, periodEnd, labelMonth, labelYear;
+
+        if (day <= 10) {
+            // Şu an 1-10 arası → Önceki: geçen ay 21-son
+            periodStart = new Date(year, month - 1, 21);
+            periodEnd = new Date(year, month, 0, 23, 59, 59, 999);
+            labelMonth = month - 1;
+            labelYear = year;
+            if (labelMonth < 0) {
+                labelMonth = 11;
+                labelYear = year - 1;
+            }
+        } else if (day <= 20) {
+            // Şu an 11-20 arası → Önceki: 1-10
+            periodStart = new Date(year, month, 1);
+            periodEnd = new Date(year, month, 10, 23, 59, 59, 999);
+            labelMonth = month;
+            labelYear = year;
+        } else {
+            // Şu an 21-son arası → Önceki: 11-20
+            periodStart = new Date(year, month, 11);
+            periodEnd = new Date(year, month, 20, 23, 59, 59, 999);
+            labelMonth = month;
+            labelYear = year;
+        }
+
+        const label = `${periodStart.getDate()} - ${periodEnd.getDate()} ${monthNames[labelMonth]} ${labelYear}`;
+
+        return {
+            from: periodStart.toISOString(),
+            to: periodEnd.toISOString(),
+            label
+        };
+    }
+
+    /**
+     * Cache Isıtma (Server başlarken çağrılır)
+     */
+    initiateCacheWarming() {
+        console.log('[YandexFleetApi] Arka planda önyükleme (cache warming) başlatılıyor...');
+        // Mevcut ay genel leaderboard
+        this.getLeaderboardData().catch(e => console.error('[Cache Warming Error] Leaderboard (frontend):', e.message));
+        // Mevcut 10 günlük admin leaderboard
+        this.getAdminLeaderboardData(false).catch(e => console.error('[Cache Warming Error] Admin Leaderboard (current):', e.message));
+        // Önceki 10 günlük admin leaderboard
+        this.getAdminLeaderboardData(true).catch(e => console.error('[Cache Warming Error] Admin Leaderboard (prev):', e.message));
+
+        // Her 15 dakikada bir cache'leri tazele
+        setInterval(() => {
+            console.log('[YandexFleetApi] Arka plan cache tazeleme rutini çalışıyor...');
+            this._fetchLeaderboard().catch(() => { });
+            this._fetchAdminLeaderboard(this._get10DayPeriod(), false).catch(() => { });
+            this._fetchAdminLeaderboard(this._getPrev10DayPeriod(), true).catch(() => { });
+        }, 15 * 60 * 1000);
+    }
+
+    /**
+     * Admin paneli için 10 günlük leaderboard: park genelinde siparişleri çeker,
+     * sürücü başına sayar, profil isimleri (Ad Soyad) ile eşleştirir.
+     * İlk 10 sürücüyü döner. 15 dakika cache'lenir. Stale-while-revalidate kullanır.
+     * @param {boolean} [previousPeriod=false] - true ise sonlanmış önceki dönemi döner
+     * @param {string} [customFrom=null] - İsteğe bağlı filtreleme için başlangıç tarihi
+     * @param {string} [customTo=null] - İsteğe bağlı filtreleme için bitiş tarihi
+     */
+    async getAdminLeaderboardData(previousPeriod = false, customFrom = null, customTo = null) {
+        if (customFrom && customTo) {
+            const startDate = new Date(customFrom);
+            const endDate = new Date(customTo);
+            // Bitiş tarihini günün sonuna ayarla
+            endDate.setHours(23, 59, 59, 999);
+
+            const monthNames = ['Ocak', 'Şubat', 'Mart', 'Nisan', 'Mayıs', 'Haziran',
+                'Temmuz', 'Ağustos', 'Eylül', 'Ekim', 'Kasım', 'Aralık'];
+            const label = `${startDate.getDate()} ${monthNames[startDate.getMonth()]} ${startDate.getFullYear()} - ${endDate.getDate()} ${monthNames[endDate.getMonth()]} ${endDate.getFullYear()}`;
+
+            const period = {
+                from: startDate.toISOString(),
+                to: endDate.toISOString(),
+                label
+            };
+
+            // Özel filtreleme için cache kullanmadan direkt çek (skipCache = true)
+            return await this._fetchAdminLeaderboard(period, false, true);
+        }
+
+        const period = previousPeriod ? this._getPrev10DayPeriod() : this._get10DayPeriod();
+        const cacheKey = period.label;
+
+        if (previousPeriod) {
+            if (this._adminLeaderboardPrevCache && this._adminLeaderboardPrevCacheKey === cacheKey) {
+                // Cache var, ancak süresi dolmuşsa arka planda yenile
+                if (Date.now() >= this._adminLeaderboardPrevExpiry && !this._adminLeaderboardPrevPending) {
+                    this._adminLeaderboardPrevPending = this._fetchAdminLeaderboard(period, true).finally(() => this._adminLeaderboardPrevPending = null);
+                }
+                return this._adminLeaderboardPrevCache; // Anında yanıt dön
+            }
+            if (this._adminLeaderboardPrevPending) return this._adminLeaderboardPrevPending;
+
+            this._adminLeaderboardPrevPending = this._fetchAdminLeaderboard(period, true).finally(() => this._adminLeaderboardPrevPending = null);
+            return this._adminLeaderboardPrevPending;
+        }
+
+        if (this._adminLeaderboardCache && this._adminLeaderboardCacheKey === cacheKey) {
+            // Cache var, ancak süresi dolmuşsa arka planda yenile
+            if (Date.now() >= this._adminLeaderboardExpiry && !this._adminLeaderboardPending) {
+                this._adminLeaderboardPending = this._fetchAdminLeaderboard(period, false).finally(() => this._adminLeaderboardPending = null);
+            }
+            return this._adminLeaderboardCache; // Anında yanıt dön
+        }
+        if (this._adminLeaderboardPending) return this._adminLeaderboardPending;
+
+        this._adminLeaderboardPending = this._fetchAdminLeaderboard(period, false).finally(() => this._adminLeaderboardPending = null);
+        return this._adminLeaderboardPending;
+    }
+
+    /**
+     * Admin leaderboard verisini çeker (10 günlük dönem, top 10, Ad Soyad)
+     * @param {{ from: string, to: string, label: string }} period
+     * @param {boolean} [isPrevious=false] - Önceki dönem cache'i için
+     * @param {boolean} [skipCache=false] - Özel dönem için cache atla
+     */
+    async _fetchAdminLeaderboard(period, isPrevious = false, skipCache = false) {
+        // Sürücü profillerini çek (Ad Soyad bilgisi için)
+        const profiles = await this.getDriverProfiles();
+        const driverMap = {};
+        profiles.forEach(p => {
+            const dp = p.driver_profile || {};
+            const id = dp.id;
+            if (!id) return;
+            const firstName = dp.first_name || '';
+            const lastName = dp.last_name || '';
+            const fullName = [firstName, lastName].filter(Boolean).join(' ') || 'İsimsiz';
+            driverMap[id] = { id, fullName, tripCount: 0 };
+        });
+
+        // Dönem içindeki siparişleri çek
+        let cursor = undefined;
+        const pageLimit = 500;
+        let totalOrders = 0;
+
+        while (true) {
+            try {
+                const requestBody = {
+                    query: {
+                        park: {
+                            id: this.parkId,
+                            order: {
+                                booked_at: { from: period.from, to: period.to },
+                                statuses: ['complete']
+                            }
+                        }
+                    },
+                    limit: pageLimit
+                };
+                if (cursor) requestBody.cursor = cursor;
+
+                const response = await axios.post(
+                    `${this.baseUrl}/v1/parks/orders/list`,
+                    requestBody,
+                    { headers: this.headers }
+                );
+
+                const orders = response.data.orders || [];
+                totalOrders += orders.length;
+
+                orders.forEach(order => {
+                    const driverId = order.driver?.id || order.driver_profile?.id;
+                    if (driverId && driverMap[driverId]) {
+                        driverMap[driverId].tripCount++;
+                    } else if (driverId) {
+                        driverMap[driverId] = { id: driverId, fullName: 'Bilinmeyen Sürücü', tripCount: 1 };
+                    }
+                });
+
+                const nextCursor = response.data.cursor;
+                if (orders.length < pageLimit || !nextCursor || nextCursor === '') {
+                    break;
+                }
+                cursor = nextCursor;
+            } catch (error) {
+                if (error.response?.status === 429) {
+                    await new Promise(r => setTimeout(r, 1000));
+                    continue;
+                }
+                console.error('[YandexFleetApi] Admin leaderboard sipariş hatası:', error.response?.data || error.message);
+                break;
+            }
+        }
+
+        // Sıralama: en çok yolculuk yapan ilk 10
+        const drivers = Object.values(driverMap).filter(d => d.tripCount > 0);
+        drivers.sort((a, b) => b.tripCount - a.tripCount);
+        const top10 = drivers.slice(0, 10).map((d, i) => ({ ...d, rank: i + 1 }));
+
+        const result = {
+            top10,
+            periodLabel: period.label,
+            totalOrders,
+            totalDrivers: Object.keys(driverMap).length
+        };
+
+        // Cache: 15 dakika (mevcut / önceki dönem ayrı cache, özel dönem cache'lenmez)
+        if (!skipCache) {
+            if (isPrevious) {
+                this._adminLeaderboardPrevCache = result;
+                this._adminLeaderboardPrevCacheKey = period.label;
+                this._adminLeaderboardPrevExpiry = Date.now() + 15 * 60 * 1000;
+            } else {
+                this._adminLeaderboardCache = result;
+                this._adminLeaderboardCacheKey = period.label;
+                this._adminLeaderboardExpiry = Date.now() + 15 * 60 * 1000;
+            }
+        }
+
+        console.log(`[YandexFleetApi] Admin leaderboard yüklendi: ${period.label}, ${totalOrders} sipariş, ${top10.length} sürücü`);
+        return result;
+    }
+
+    /**
      * Aylık sıralama tablosu: park genelinde tüm siparişleri bulk çeker,
      * sürücü başına sayar, profil isimleriyle eşleştirir.
-     * 30 dakika cache'lenir. Her ay otomatik sıfırlanır.
+     * 30 dakika cache'lenir. Stale-while-revalidate kullanır.
      */
     async getLeaderboardData() {
-        if (this._leaderboardCache && Date.now() < this._leaderboardExpiry) {
-            return this._leaderboardCache;
+        if (this._leaderboardCache) {
+            // Cache var ama süresi dolmuşsa arka planda yenile
+            if (Date.now() >= this._leaderboardExpiry && !this._leaderboardPending) {
+                this._leaderboardPending = this._fetchLeaderboard().finally(() => this._leaderboardPending = null);
+            }
+            return this._leaderboardCache; // Süresi dolsa bile mevcut cache'i dön (anında yanıt)
         }
 
         if (this._leaderboardPending) {
             return this._leaderboardPending;
         }
 
-        this._leaderboardPending = this._fetchLeaderboard();
-        try {
-            const result = await this._leaderboardPending;
-            return result;
-        } finally {
-            this._leaderboardPending = null;
-        }
+        this._leaderboardPending = this._fetchLeaderboard().finally(() => this._leaderboardPending = null);
+        return this._leaderboardPending;
     }
 
     async _fetchLeaderboard() {

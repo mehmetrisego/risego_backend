@@ -9,19 +9,67 @@ const path = require('path');
 const app = express();
 app.use(express.json());
 
+// ============================================
+// Kampanya State (in-memory - sunucu yeniden başlatılana kadar kalır)
+// Prodüksiyon ortamında veritabanına taşınmalı
+// ============================================
+let activeCampaign = {
+    text: '',       // Kampanya metni
+    active: false,  // Kampanya aktif mi?
+    updatedAt: null // Son güncelleme tarihi
+};
+
 // Frontend statik dosyaları (local geliştirme: http://localhost:3000 üzerinden açın)
 app.use(express.static(path.join(__dirname, 'risego_frontend')));
+
+// Admin panel statik dosyaları (/admin yolundan erişim)
+app.use('/admin', express.static(path.join(__dirname, 'risego_adminpanel')));
 
 // CORS ayarları (frontend GitHub Pages'ten API çağrıları için)
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, X-Session-Token');
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, X-Session-Token, X-Admin-Token');
     res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
     if (req.method === 'OPTIONS') {
         return res.sendStatus(200);
     }
     next();
 });
+
+// ============================================
+// Auth Middleware - Sürücü endpoint'leri için oturum doğrulama
+// ============================================
+async function requireAuth(req, res, next) {
+    const token = req.headers['x-session-token'];
+    if (!token) {
+        return res.status(401).json({ success: false, message: 'Oturum bulunamadı. Lütfen giriş yapın.' });
+    }
+    try {
+        const driver = await authService.validateSession(token);
+        if (!driver) {
+            return res.status(401).json({ success: false, message: 'Oturum geçersiz veya süresi dolmuş. Lütfen tekrar giriş yapın.' });
+        }
+        req.sessionDriver = driver;
+        next();
+    } catch (error) {
+        console.error('[Server] Auth middleware hatası:', error.message);
+        res.status(401).json({ success: false, message: 'Oturum doğrulanamadı.' });
+    }
+}
+
+// Admin panel oturum doğrulama
+function requireAdminAuth(req, res, next) {
+    const token = req.headers['x-admin-token'];
+    if (!token) {
+        return res.status(401).json({ success: false, message: 'Oturum bulunamadı. Lütfen giriş yapın.' });
+    }
+    const session = authService.validateAdminSession(token);
+    if (!session) {
+        return res.status(401).json({ success: false, message: 'Oturum geçersiz veya süresi dolmuş. Lütfen tekrar giriş yapın.' });
+    }
+    req.adminSession = session;
+    next();
+}
 
 // ============================================
 // Auth Endpoints
@@ -121,18 +169,12 @@ app.delete('/api/auth/session', (req, res) => {
 
 /**
  * POST /api/drivers/trip-count
- * Belirli bir sürücünün dönem bazlı yolculuk sayısını döner
+ * Belirli bir sürücünün dönem bazlı yolculuk sayısını döner (oturum gerekli)
  */
-app.post('/api/drivers/trip-count', async (req, res) => {
+app.post('/api/drivers/trip-count', requireAuth, async (req, res) => {
     try {
-        const { driverId, period } = req.body;
-
-        if (!driverId) {
-            return res.status(400).json({
-                success: false,
-                message: 'Sürücü ID gereklidir.'
-            });
-        }
+        const { period } = req.body;
+        const driverId = req.sessionDriver.id;
 
         const validPeriods = ['daily', 'weekly', 'monthly', 'all'];
         const selectedPeriod = validPeriods.includes(period) ? period : 'all';
@@ -155,18 +197,11 @@ app.post('/api/drivers/trip-count', async (req, res) => {
 
 /**
  * POST /api/drivers/balance
- * Belirli bir sürücünün bakiyesini döner
+ * Belirli bir sürücünün bakiyesini döner (oturum gerekli)
  */
-app.post('/api/drivers/balance', async (req, res) => {
+app.post('/api/drivers/balance', requireAuth, async (req, res) => {
     try {
-        const { driverId } = req.body;
-
-        if (!driverId) {
-            return res.status(400).json({
-                success: false,
-                message: 'Sürücü ID gereklidir.'
-            });
-        }
+        const driverId = req.sessionDriver.id;
 
         const balanceData = await yandexFleetApi.getDriverBalance(driverId);
 
@@ -193,25 +228,23 @@ app.post('/api/drivers/balance', async (req, res) => {
 
 /**
  * GET /api/leaderboard
- * Sıralama tablosu: top 30 + kullanıcının sırası
+ * Sıralama tablosu: top 30 + kullanıcının sırası (oturum gerekli)
  */
-app.get('/api/leaderboard', async (req, res) => {
+app.get('/api/leaderboard', requireAuth, async (req, res) => {
     try {
-        const driverId = req.query.driverId;
+        const driverId = req.sessionDriver.id;
         const { drivers, totalDrivers } = await yandexFleetApi.getLeaderboardData();
 
         const top30 = drivers.slice(0, 30);
 
         let currentUser = null;
-        if (driverId) {
-            const found = drivers.find(d => d.id === driverId);
-            if (found) {
-                if (found.rank > 30) {
-                    currentUser = found;
-                }
-            } else {
-                currentUser = { id: driverId, initials: '?', tripCount: 0, rank: drivers.length + 1 };
+        const found = drivers.find(d => d.id === driverId);
+        if (found) {
+            if (found.rank > 30) {
+                currentUser = found;
             }
+        } else {
+            currentUser = { id: driverId, initials: '?', tripCount: 0, rank: drivers.length + 1 };
         }
 
         res.json({
@@ -231,9 +264,9 @@ app.get('/api/leaderboard', async (req, res) => {
 
 /**
  * POST /api/drivers/check-plate
- * Plakanın sistemde kayıtlı olup olmadığını kontrol eder
+ * Plakanın sistemde kayıtlı olup olmadığını kontrol eder (oturum gerekli)
  */
-app.post('/api/drivers/check-plate', async (req, res) => {
+app.post('/api/drivers/check-plate', requireAuth, async (req, res) => {
     try {
         const { plate } = req.body;
 
@@ -284,18 +317,12 @@ app.post('/api/drivers/check-plate', async (req, res) => {
 
 /**
  * POST /api/drivers/change-car
- * Sürücünün aracını değiştirir: kayıtlı araç varsa bağlar, yoksa yeni araç oluşturup bağlar
+ * Sürücünün aracını değiştirir: kayıtlı araç varsa bağlar, yoksa yeni araç oluşturup bağlar (oturum gerekli)
  */
-app.post('/api/drivers/change-car', async (req, res) => {
+app.post('/api/drivers/change-car', requireAuth, async (req, res) => {
     try {
-        const { driverId, plate, carId, brand, model, year } = req.body;
-
-        if (!driverId) {
-            return res.status(400).json({
-                success: false,
-                message: 'Sürücü ID gereklidir.'
-            });
-        }
+        const { plate, carId, brand, model, year } = req.body;
+        const driverId = req.sessionDriver.id;
 
         const trimmedPlate = (plate || '').trim().toUpperCase();
         if (trimmedPlate.length < 3) {
@@ -486,16 +513,25 @@ app.get('/api/drivers/car-brands', (req, res) => {
 
 /**
  * POST /api/drivers/update-car
- * Sürücünün araç plakasını günceller (eski akış - geriye uyumluluk)
+ * Sürücünün araç plakasını günceller (eski akış - geriye uyumluluk, oturum gerekli)
  */
-app.post('/api/drivers/update-car', async (req, res) => {
+app.post('/api/drivers/update-car', requireAuth, async (req, res) => {
     try {
         const { carId, newPlate } = req.body;
+        const driverId = req.sessionDriver.id;
 
         if (!carId || !newPlate) {
             return res.status(400).json({
                 success: false,
                 message: 'Araç ID ve yeni plaka gereklidir.'
+            });
+        }
+
+        // Araç sadece oturumdaki sürücüye ait olduğunda güncellenebilir
+        if (req.sessionDriver.carId !== carId) {
+            return res.status(403).json({
+                success: false,
+                message: 'Bu aracı güncelleme yetkiniz yok.'
             });
         }
 
@@ -590,6 +626,182 @@ app.get('/api/health', (req, res) => {
     });
 });
 
+// ============================================
+// Admin Auth Endpoints (OTP - sadece yetkili numaralar)
+// ============================================
+
+/**
+ * POST /api/admin/auth/login
+ * Yetkili telefon numarasına OTP gönderir
+ */
+app.post('/api/admin/auth/login', async (req, res) => {
+    try {
+        const { phone } = req.body;
+        if (!phone) {
+            return res.status(400).json({ success: false, message: 'Telefon numarası gereklidir.' });
+        }
+        const result = await authService.adminLogin(phone);
+        res.json(result);
+    } catch (error) {
+        console.error('[Server] Admin login hatası:', error.message);
+        res.status(500).json({ success: false, message: 'Sunucu hatası oluştu.' });
+    }
+});
+
+/**
+ * POST /api/admin/auth/verify-otp
+ * Admin OTP doğrulama
+ */
+app.post('/api/admin/auth/verify-otp', async (req, res) => {
+    try {
+        const { phone, otp } = req.body;
+        if (!phone || !otp) {
+            return res.status(400).json({ success: false, message: 'Telefon numarası ve doğrulama kodu gereklidir.' });
+        }
+        const result = await authService.adminVerifyOTP(phone, otp);
+        res.json(result);
+    } catch (error) {
+        console.error('[Server] Admin OTP hatası:', error.message);
+        res.status(500).json({ success: false, message: 'Sunucu hatası oluştu.' });
+    }
+});
+
+/**
+ * GET /api/admin/auth/session
+ * Admin oturum kontrolü
+ */
+app.get('/api/admin/auth/session', (req, res) => {
+    const token = req.headers['x-admin-token'];
+    if (!token) {
+        return res.json({ success: false, message: 'Oturum bulunamadı.' });
+    }
+    const session = authService.validateAdminSession(token);
+    if (!session) {
+        return res.json({ success: false, message: 'Oturum geçersiz.' });
+    }
+    res.json({ success: true });
+});
+
+/**
+ * POST /api/admin/auth/logout
+ * Admin oturum sonlandırma
+ */
+app.post('/api/admin/auth/logout', (req, res) => {
+    const token = req.headers['x-admin-token'];
+    if (token) authService.destroyAdminSession(token);
+    res.json({ success: true });
+});
+
+// ============================================
+// Kampanya Yönetimi Endpoints (Admin Panel)
+// ============================================
+
+/**
+ * POST /api/admin/campaign
+ * Admin panelinden kampanya metni kaydetme
+ */
+app.post('/api/admin/campaign', requireAdminAuth, (req, res) => {
+    try {
+        const { text } = req.body;
+
+        if (!text || typeof text !== 'string' || text.trim().length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'Kampanya metni boş olamaz.'
+            });
+        }
+
+        activeCampaign = {
+            text: text.trim(),
+            active: true,
+            updatedAt: new Date().toISOString()
+        };
+
+        console.log(`[Server] Kampanya güncellendi: "${activeCampaign.text}"`);
+
+        res.json({
+            success: true,
+            message: 'Kampanya başarıyla kaydedildi.',
+            campaign: activeCampaign
+        });
+    } catch (error) {
+        console.error('[Server] Kampanya kaydetme hatası:', error.message);
+        res.status(500).json({
+            success: false,
+            message: 'Kampanya kaydedilirken hata oluştu.'
+        });
+    }
+});
+
+/**
+ * GET /api/admin/campaign
+ * Admin panelinden aktif kampanyayı okuma
+ */
+app.get('/api/admin/campaign', requireAdminAuth, (req, res) => {
+    res.json({
+        success: true,
+        campaign: activeCampaign
+    });
+});
+
+/**
+ * DELETE /api/admin/campaign
+ * Admin panelinden kampanyayı silme
+ */
+app.delete('/api/admin/campaign', requireAdminAuth, (req, res) => {
+    activeCampaign = {
+        text: '',
+        active: false,
+        updatedAt: new Date().toISOString()
+    };
+
+    console.log('[Server] Kampanya silindi.');
+
+    res.json({
+        success: true,
+        message: 'Kampanya başarıyla silindi.'
+    });
+});
+
+/**
+ * GET /api/campaign
+ * Sürücü frontend'i için aktif kampanyayı okuma (public endpoint)
+ */
+app.get('/api/campaign', (req, res) => {
+    res.json({
+        success: true,
+        campaign: activeCampaign
+    });
+});
+
+/**
+ * GET /api/admin/leaderboard
+ * Admin paneli için 10 günlük dönem leaderboard (top 10, Ad Soyad)
+ * Query: ?previous=1 → sonlanmış önceki dönem
+ */
+app.get('/api/admin/leaderboard', requireAdminAuth, async (req, res) => {
+    try {
+        const previous = req.query.previous === '1' || req.query.previous === 'true';
+        const { from, to } = req.query;
+
+        const data = await yandexFleetApi.getAdminLeaderboardData(previous, from, to);
+
+        res.json({
+            success: true,
+            leaderboard: data.top10,
+            periodLabel: data.periodLabel,
+            totalOrders: data.totalOrders,
+            totalDrivers: data.totalDrivers
+        });
+    } catch (error) {
+        console.error('[Server] Admin leaderboard hatası:', error.message);
+        res.status(500).json({
+            success: false,
+            message: 'Leaderboard verisi yüklenirken hata oluştu.'
+        });
+    }
+});
+
 // Ana sayfa - API bilgisi (frontend ayrı repo'da GitHub Pages'te)
 app.get('/', (req, res) => {
     res.json({
@@ -600,7 +812,10 @@ app.get('/', (req, res) => {
             verifyOtp: 'POST /api/auth/verify-otp',
             session: 'GET /api/auth/session',
             tripCount: 'POST /api/drivers/trip-count',
-            leaderboard: 'GET /api/leaderboard'
+            leaderboard: 'GET /api/leaderboard',
+            campaign: 'GET /api/campaign',
+            adminCampaign: 'POST|GET|DELETE /api/admin/campaign',
+            adminLeaderboard: 'GET /api/admin/leaderboard'
         }
     });
 });
@@ -622,6 +837,9 @@ app.listen(PORT, () => {
     console.log(`  GET  http://localhost:${PORT}/api/drivers         - Detaylı sürücü bilgileri`);
     console.log(`  GET  http://localhost:${PORT}/api/drivers/fetch   - Hızlı sürücü profilleri`);
     console.log('');
+
+    // Leaderboard önbelleklerini (cache) sunucu başlarken arka planda ısıt
+    yandexFleetApi.initiateCacheWarming();
 });
 
 
