@@ -31,13 +31,13 @@ function translateColor(color) {
 class YandexFleetApi {
     constructor() {
         this.baseUrl = config.yandexFleet.baseUrl;
+        this.parkId = config.yandexFleet.partnerId;
         this.headers = {
             'X-Client-ID': config.yandexFleet.clientId,
             'X-API-Key': config.yandexFleet.apiKey,
             'Content-Type': 'application/json',
             'Accept-Language': 'tr'
         };
-        this.parkId = config.yandexFleet.partnerId;
     }
 
     /**
@@ -663,21 +663,29 @@ class YandexFleetApi {
     /**
      * Cache Isıtma (Server başlarken çağrılır)
      */
-    initiateCacheWarming() {
+    async initiateCacheWarming() {
         console.log('[YandexFleetApi] Arka planda önyükleme (cache warming) başlatılıyor...');
-        // Mevcut ay genel leaderboard
-        this.getLeaderboardData().catch(e => console.error('[Cache Warming Error] Leaderboard (frontend):', e.message));
-        // Mevcut 10 günlük admin leaderboard
-        this.getAdminLeaderboardData(false).catch(e => console.error('[Cache Warming Error] Admin Leaderboard (current):', e.message));
-        // Önceki 10 günlük admin leaderboard
-        this.getAdminLeaderboardData(true).catch(e => console.error('[Cache Warming Error] Admin Leaderboard (prev):', e.message));
+        try {
+            await this.getLeaderboardData();
+            await this.getAdminLeaderboardData(false);
+            await this.getAdminLeaderboardData(true);
+            console.log('[YandexFleetApi] Önyükleme başarıyla tamamlandı!');
+        } catch (e) {
+            console.error('[Cache Warming Error]:', e.message);
+        }
 
         // Her 15 dakikada bir cache'leri tazele
-        setInterval(() => {
-            console.log('[YandexFleetApi] Arka plan cache tazeleme rutini çalışıyor...');
-            this._fetchLeaderboard().catch(() => { });
-            this._fetchAdminLeaderboard(this._get10DayPeriod(), false).catch(() => { });
-            this._fetchAdminLeaderboard(this._getPrev10DayPeriod(), true).catch(() => { });
+        setInterval(async () => {
+            try {
+                console.log('[YandexFleetApi] Arka plan cache tazeleme rutini çalışıyor...');
+                await this._fetchLeaderboardForPeriod(this._get10DayPeriod()).catch(() => { });
+                await new Promise(r => setTimeout(r, 2000));
+                await this._fetchAdminLeaderboard(this._get10DayPeriod(), false).catch(() => { });
+                await new Promise(r => setTimeout(r, 2000));
+                await this._fetchAdminLeaderboard(this._getPrev10DayPeriod(), true).catch(() => { });
+            } catch (e) {
+                console.error('[Cache Update Error] Periyodik güncelleştirme başarısız', e.message);
+            }
         }, 15 * 60 * 1000);
     }
 
@@ -764,6 +772,8 @@ class YandexFleetApi {
         let cursor = undefined;
         const pageLimit = 500;
         let totalOrders = 0;
+        let retries = 0;
+        const MAX_RETRIES = 3;
 
         while (true) {
             try {
@@ -799,14 +809,16 @@ class YandexFleetApi {
                     }
                 });
 
+                retries = 0;
                 const nextCursor = response.data.cursor;
                 if (orders.length < pageLimit || !nextCursor || nextCursor === '') {
                     break;
                 }
                 cursor = nextCursor;
             } catch (error) {
-                if (error.response?.status === 429) {
-                    await new Promise(r => setTimeout(r, 1000));
+                if (error.response?.status === 429 && retries < MAX_RETRIES) {
+                    retries++;
+                    await new Promise(r => setTimeout(r, retries * 1000));
                     continue;
                 }
                 console.error('[YandexFleetApi] Admin leaderboard sipariş hatası:', error.response?.data || error.message);
@@ -919,6 +931,8 @@ class YandexFleetApi {
         let cursor = undefined;
         const pageLimit = 500;
         let totalOrders = 0;
+        let retries = 0;
+        const MAX_RETRIES = 3;
 
         while (true) {
             try {
@@ -954,14 +968,16 @@ class YandexFleetApi {
                     }
                 });
 
+                retries = 0;
                 const nextCursor = response.data.cursor;
                 if (orders.length < pageLimit || !nextCursor || nextCursor === '') {
                     break;
                 }
                 cursor = nextCursor;
             } catch (error) {
-                if (error.response?.status === 429) {
-                    await new Promise(r => setTimeout(r, 1000));
+                if (error.response?.status === 429 && retries < MAX_RETRIES) {
+                    retries++;
+                    await new Promise(r => setTimeout(r, retries * 1000));
                     continue;
                 }
                 console.error('[YandexFleetApi] Sipariş çekilirken hata:', error.response?.data || error.message);
@@ -1016,6 +1032,8 @@ class YandexFleetApi {
         const pageLimit = 500;
         const countMap = {};
         let cursor = undefined;
+        let retries = 0;
+        const MAX_RETRIES = 3;
 
         while (true) {
             try {
@@ -1047,14 +1065,16 @@ class YandexFleetApi {
                     }
                 });
 
+                retries = 0;
                 const nextCursor = response.data.cursor;
                 if (orders.length < pageLimit || !nextCursor || nextCursor === '') {
                     break;
                 }
                 cursor = nextCursor;
             } catch (error) {
-                if (error.response?.status === 429) {
-                    await new Promise(r => setTimeout(r, 1000));
+                if (error.response?.status === 429 && retries < MAX_RETRIES) {
+                    retries++;
+                    await new Promise(r => setTimeout(r, retries * 1000));
                     continue;
                 }
                 console.error('[YandexFleetApi] Sipariş çekilirken hata:', error.response?.data?.message || error.message);
