@@ -1,11 +1,11 @@
-const fs = require('fs');
+const fs = require('fs').promises;
 const path = require('path');
 
 /**
  * Sürücü bilgilerini sürücüler.txt dosyasına yazar
  * @param {Array} driversInfo - Sürücü bilgileri dizisi
  */
-function writeDriversToFile(driversInfo) {
+async function writeDriversToFile(driversInfo) {
     const filePath = path.join(__dirname, '..', 'sürücüler.txt');
 
     let content = '='.repeat(70) + '\n';
@@ -40,7 +40,7 @@ function writeDriversToFile(driversInfo) {
     content += '                    RAPOR SONU\n';
     content += '='.repeat(70) + '\n';
 
-    fs.writeFileSync(filePath, content, 'utf8');
+    await fs.writeFile(filePath, content, 'utf8');
     return filePath;
 }
 

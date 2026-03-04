@@ -1,5 +1,9 @@
 require('dotenv').config();
 const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+
 const config = require('./config');
 const yandexFleetApi = require('./services/yandexFleetApi');
 const { writeDriversToFile } = require('./services/fileWriter');
@@ -7,7 +11,31 @@ const authService = require('./services/authService');
 
 const path = require('path');
 const app = express();
+
+// Güvenlik Katmanı 1: Helmet - Başlıkları güvenlik altına alır
+app.use(helmet());
+
+// Güvenlik Katmanı 2: CORS - Sadece belirtilen domainlere izin verilir (Tarayıcı saldırı koruması)
+app.use(cors({
+    origin: ['https://risegodriver.com', 'http://localhost:3000', 'null', 'http://127.0.0.1:5500', 'http://localhost:5500'],
+    methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'x-session-token', 'x-admin-token'],
+    credentials: true
+}));
+
 app.use(express.json());
+
+// Güvenlik Katmanı 3: Rate Limiting - SMS Brute Force engellemek için
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 10,
+    message: { success: false, message: 'Çok fazla giriş denemesi yaptınız, lütfen daha sonra tekrar deneyin.' }
+});
+
+// Login, OTP ve Admin limitlerini bağla
+app.use('/api/auth/login', authLimiter);
+app.use('/api/drivers/register/request-otp', authLimiter);
+app.use('/api/admin/auth/login', authLimiter);
 
 // ============================================
 // Kampanya State (in-memory - sunucu yeniden başlatılana kadar kalır)
@@ -18,23 +46,6 @@ let activeCampaign = {
     active: false,  // Kampanya aktif mi?
     updatedAt: null // Son güncelleme tarihi
 };
-
-// Frontend statik dosyaları (local geliştirme: http://localhost:3000 üzerinden açın)
-app.use(express.static(path.join(__dirname, 'risego_frontend')));
-
-// Admin panel statik dosyaları (/admin yolundan erişim)
-app.use('/admin', express.static(path.join(__dirname, 'risego_adminpanel')));
-
-// CORS ayarları (frontend GitHub Pages'ten API çağrıları için)
-app.use((req, res, next) => {
-    res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, X-Session-Token, X-Admin-Token');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-    if (req.method === 'OPTIONS') {
-        return res.sendStatus(200);
-    }
-    next();
-});
 
 // ============================================
 // Auth Middleware - Sürücü endpoint'leri için oturum doğrulama
@@ -605,7 +616,7 @@ app.get('/api/drivers', async (req, res) => {
         const driversInfo = await yandexFleetApi.getAllDriversInfo();
 
         // Dosyaya yaz
-        const filePath = writeDriversToFile(driversInfo);
+        const filePath = await writeDriversToFile(driversInfo);
 
         res.json({
             success: true,
@@ -632,7 +643,7 @@ app.get('/api/drivers/fetch', async (req, res) => {
     try {
         const driversInfo = await yandexFleetApi.getDriverProfilesFormatted();
 
-        const filePath = writeDriversToFile(driversInfo);
+        const filePath = await writeDriversToFile(driversInfo);
 
         res.json({
             success: true,

@@ -1,4 +1,5 @@
 const axios = require('axios');
+const crypto = require('crypto');
 const config = require('../config');
 
 // Rusça renk isimlerini Türkçe'ye çevir
@@ -32,19 +33,77 @@ class YandexFleetApi {
     constructor() {
         this.baseUrl = config.yandexFleet.baseUrl;
         this.parkId = config.yandexFleet.partnerId;
-        this.headers = {
-            'X-Client-ID': config.yandexFleet.clientId,
-            'X-API-Key': config.yandexFleet.apiKey,
-            'Content-Type': 'application/json',
-            'Accept-Language': 'tr'
-        };
+
+        // ✅ OPT-1: Tek bir axios instance — bağlantı havuzu (keep-alive) ve header tekrarını önler
+        this.httpClient = axios.create({
+            baseURL: this.baseUrl,
+            timeout: 30000, // ✅ OPT-2: 30s timeout — asılı kalan istekler sunucuyu dondurmasın
+            headers: {
+                'X-Client-ID': config.yandexFleet.clientId,
+                'X-API-Key': config.yandexFleet.apiKey,
+                'Content-Type': 'application/json',
+                'Accept-Language': 'tr'
+            }
+        });
+
+        // ✅ OPT-3: Sürücü profilleri için 5 dakikalık in-memory cache
+        // Her leaderboard veya yetkilendirme isteği bunu kullanır, tekrar çekmez
+        this._profilesCache = null;
+        this._profilesCacheExpiry = 0;
+        this._profilesPending = null;
+        this.PROFILES_TTL = 5 * 60 * 1000; // 5 dakika
+
+        // Standart 10 günlük leaderboard cache'leri
+        this._leaderboardCache = null;
+        this._leaderboardCacheKey = null;
+        this._leaderboardExpiry = 0;
+        this._leaderboardPending = null;
+
+        this._adminLeaderboardCache = null;
+        this._adminLeaderboardCacheKey = null;
+        this._adminLeaderboardExpiry = 0;
+        this._adminLeaderboardPending = null;
+
+        this._adminLeaderboardPrevCache = null;
+        this._adminLeaderboardPrevCacheKey = null;
+        this._adminLeaderboardPrevExpiry = 0;
+        this._adminLeaderboardPrevPending = null;
+
+        // ✅ OPT-8: Özel tarih aralığı LRU cache (5 dk TTL, max 20 giriş)
+        // Aynı from+to sorgusu 5 dk içinde tekrar gelirse aninda döner
+        this._customRangeCache = new Map(); // key -> { result, expiry, pending }
+        this.CUSTOM_RANGE_TTL = 5 * 60 * 1000; // 5 dakika
+        this.CUSTOM_RANGE_MAX = 20; // En fazla 20 farklı sorgu sakla
     }
 
     /**
-     * Sürücü profillerini listeler (ContractorProfiles)
+     * ✅ OPT-3: Merkezi, cache'li sürücü profil çekici
+     * Her çağrıda API yerine cache kullanır — leaderboard için kritik
+     * Paralel çağrılar için promise deduplication (tek istek, N bekleyen)
+     */
+    async _getCachedDriverProfiles() {
+        const now = Date.now();
+        if (this._profilesCache && now < this._profilesCacheExpiry) {
+            return this._profilesCache;
+        }
+        if (this._profilesPending) return this._profilesPending;
+
+        this._profilesPending = this._fetchDriverProfilesFromAPI()
+            .then(profiles => {
+                this._profilesCache = profiles;
+                this._profilesCacheExpiry = Date.now() + this.PROFILES_TTL;
+                return profiles;
+            })
+            .finally(() => { this._profilesPending = null; });
+
+        return this._profilesPending;
+    }
+
+    /**
+     * Sürücü profillerini Yandex API'sinden çeker (offset pagination)
      * POST /v1/parks/driver-profiles/list
      */
-    async getDriverProfiles() {
+    async _fetchDriverProfilesFromAPI() {
         const allDrivers = [];
         let offset = 0;
         const limit = 1000;
@@ -52,17 +111,15 @@ class YandexFleetApi {
 
         while (hasMore) {
             try {
-                const response = await axios.post(
-                    `${this.baseUrl}/v1/parks/driver-profiles/list`,
+                const response = await this.httpClient.post(
+                    '/v1/parks/driver-profiles/list',
                     {
                         query: {
-                            park: {
-                                id: this.parkId
-                            }
+                            park: { id: this.parkId }
                         },
                         fields: {
                             account: ['balance'],
-                            car: ['brand', 'model', 'number', 'year', 'color'],
+                            car: ['brand', 'model', 'number', 'year', 'color', 'id'],
                             driver_profile: [
                                 'first_name',
                                 'last_name',
@@ -70,16 +127,10 @@ class YandexFleetApi {
                                 'id'
                             ]
                         },
-                        limit: limit,
-                        offset: offset,
-                        sort_order: [
-                            {
-                                direction: 'asc',
-                                field: 'driver_profile.created_date'
-                            }
-                        ]
-                    },
-                    { headers: this.headers }
+                        limit,
+                        offset,
+                        sort_order: [{ direction: 'asc', field: 'driver_profile.created_date' }]
+                    }
                 );
 
                 const data = response.data;
@@ -98,6 +149,81 @@ class YandexFleetApi {
         }
 
         return allDrivers;
+    }
+
+    /**
+     * Public: sürücü profillerini döner (cache'li)
+     */
+    async getDriverProfiles() {
+        return this._getCachedDriverProfiles();
+    }
+
+    /**
+     * Profile cache'ini geçersiz kılar (yeni sürücü oluşturulunca çağrılmalı)
+     */
+    invalidateProfileCache() {
+        this._profilesCache = null;
+        this._profilesCacheExpiry = 0;
+        this._profilesPending = null;
+    }
+
+    /**
+     * ✅ OPT-8: Özel tarih aralığı LRU cache
+     * @param {string} cacheKey - Benzersiz sorgu anahtarı (from:to)
+     * @param {Function} fetcher - Asıl veriyi çeken async fonksiyon
+     * @returns {Promise<any>}
+     *
+     * Davranış:
+     *  - Cache HIT (5dk içinde): Anında döner, Yandex'e gitme
+     *  - Cache MISS: fetcher çağrılır, sonuç cache'lenir
+     *  - Paralel istek (pending): Tek fetch promise'ine bağlanır (dedup)
+     *  - Max 20 girişi geçince en eski silinir (LRU eviction)
+     */
+    async _cachedCustomLeaderboard(cacheKey, fetcher) {
+        const now = Date.now();
+        const entry = this._customRangeCache.get(cacheKey);
+
+        // Cache HIT — geçerli sonuç var, anında dön
+        if (entry && entry.result && now < entry.expiry) {
+            console.log(`[YandexFleetApi] Custom range cache HIT: ${cacheKey}`);
+            return entry.result;
+        }
+
+        // Zaten fetch ediliyor — aynı promise'e bağlan (deduplicate)
+        if (entry && entry.pending) {
+            console.log(`[YandexFleetApi] Custom range fetch zaten sürüyor, bekleniyor: ${cacheKey}`);
+            return entry.pending;
+        }
+
+        // Cache MISS — yeni fetch başlat
+        console.log(`[YandexFleetApi] Custom range cache MISS, fetch başlatılıyor: ${cacheKey}`);
+
+        const pending = fetcher()
+            .then(result => {
+                this._customRangeCache.set(cacheKey, {
+                    result,
+                    expiry: Date.now() + this.CUSTOM_RANGE_TTL,
+                    pending: null
+                });
+                return result;
+            })
+            .catch(err => {
+                // Hata durumunda cache'den sil ki tekrar denesin
+                this._customRangeCache.delete(cacheKey);
+                throw err;
+            });
+
+        // Pending durumunu kaydet (paralel istekler beklesin)
+        this._customRangeCache.set(cacheKey, { result: null, expiry: 0, pending });
+
+        // LRU Eviction: max 20 girişi aş, en eskiyi sil
+        if (this._customRangeCache.size > this.CUSTOM_RANGE_MAX) {
+            const oldestKey = this._customRangeCache.keys().next().value;
+            this._customRangeCache.delete(oldestKey);
+            console.log(`[YandexFleetApi] Custom range cache doldu, silindi: ${oldestKey}`);
+        }
+
+        return pending;
     }
 
     /**
@@ -123,113 +249,171 @@ class YandexFleetApi {
     }
 
     /**
-     * Belirli bir sürücünün yolculuk sayısını getirir (cursor-based pagination)
-     * POST /v1/parks/orders/list
-     * API yanıtında total alanı yok; cursor ile sayfalama yapılmalı
-     * @param {string} driverId
-     * @param {string} period - 'daily' | 'weekly' | 'monthly' | 'all'
+     * @description Merkezi Cursor Sayfalama ve Üstel Gecikmeli (Exponential Backoff) Fetch Motoru
+     * @param {string} endpoint - İstek atılacak URL yolu
+     * @param {Object} basePayload - Query, fields vb. barındıran asıl gövde
+     * @param {number} pageLimit - Her sayfada çekilecek veri sayısı
+     * @returns {Promise<Array>}
      */
-    async getDriverOrderCount(driverId, period = 'all') {
-        const from = this._getPeriodStartDate(period);
-        const to = new Date().toISOString();
-        const pageLimit = 500;
-        let totalCount = 0;
-        let cursor = undefined;
+    async _fetchAllPagesWithCursor(endpoint, basePayload, pageLimit = 1000) {
+        const bookedAt = basePayload?.query?.park?.order?.booked_at;
+        const isSingleDriver = !!basePayload?.query?.park?.driver_profile?.id;
 
-        try {
-            while (true) {
-                const requestBody = {
-                    query: {
-                        park: {
-                            id: this.parkId,
-                            driver_profile: {
-                                id: driverId
-                            },
-                            order: {
-                                booked_at: {
-                                    from: from,
-                                    to: to
-                                },
-                                statuses: ['complete']
-                            }
+        // Park geneli büyük veri isteklerinde zaman dilimine böl
+        if (bookedAt && bookedAt.from && bookedAt.to && !isSingleDriver) {
+            const startMs = new Date(bookedAt.from).getTime();
+            const endMs = new Date(bookedAt.to).getTime();
+
+            const MAX_CHUNK_DAYS = 7; // ✅ 5→7 gün: daha az parça = daha az istek
+            const chunkMs = MAX_CHUNK_DAYS * 24 * 60 * 60 * 1000;
+
+            if (endMs - startMs > chunkMs) {
+                const chunks = [];
+                for (let cur = startMs; cur < endMs; cur += chunkMs) {
+                    const nextMs = Math.min(cur + chunkMs, endMs);
+                    const isLastChunk = nextMs === endMs;
+                    chunks.push({
+                        from: new Date(cur).toISOString(),
+                        to: new Date(isLastChunk ? nextMs : nextMs - 1).toISOString()
+                    });
+                }
+
+                // ✅ OPT-8: Kontrollü Paralel Çekim (concurrency = 2)
+                // Sıralı yerine 2'li gruplar halinde paralel — yarı süre, API patlamaz
+                const CONCURRENCY = 2;
+                console.log(`[YandexFleetApi] Paralel Parçalayıcı (x${CONCURRENCY}): ${chunks.length} parçaya bölündü.`);
+                let allResults = [];
+
+                for (let i = 0; i < chunks.length; i += CONCURRENCY) {
+                    const batch = chunks.slice(i, i + CONCURRENCY);
+
+                    const batchPromises = batch.map(chunk => {
+                        const chunkPayload = structuredClone(basePayload);
+                        if (chunkPayload.query?.park?.order) {
+                            chunkPayload.query.park.order.booked_at = chunk;
                         }
-                    },
-                    limit: pageLimit
-                };
+                        return this._fetchSingleCursorRange(endpoint, chunkPayload, pageLimit)
+                            .catch(err => {
+                                console.error(`[YandexFleetApi] Parça atlanıyor (${chunk.from.slice(0, 10)})...`);
+                                return [];
+                            });
+                    });
 
+                    const batchResults = await Promise.all(batchPromises);
+                    batchResults.forEach(r => allResults.push(...r));
+
+                    // Gruplar arasında kısa nefes (son grupta bekleme yok)
+                    if (i + CONCURRENCY < chunks.length) {
+                        await new Promise(r => setTimeout(r, 400));
+                    }
+                }
+
+                return allResults;
+            }
+        }
+
+        return this._fetchSingleCursorRange(endpoint, basePayload, pageLimit);
+    }
+
+    /**
+     * @description Tekil bir cursor döngüsü
+     */
+    async _fetchSingleCursorRange(endpoint, basePayload, pageLimit = 1000) {
+        let cursor = undefined;
+        let retries = 0;
+        const MAX_RETRIES = 5;  // ✅ 4→5 deneme
+        const results = [];
+
+        while (true) {
+            try {
+                const requestBody = { ...basePayload, limit: pageLimit };
                 if (cursor) {
                     requestBody.cursor = cursor;
                 }
 
-                const response = await axios.post(
-                    `${this.baseUrl}/v1/parks/orders/list`,
-                    requestBody,
-                    { headers: this.headers }
-                );
+                const response = await this.httpClient.post(endpoint, requestBody);
 
-                const orders = response.data.orders || [];
-                totalCount += orders.length;
+                const dataKey = Object.keys(response.data).find(k => k !== 'cursor' && Array.isArray(response.data[k]));
+                const items = dataKey ? response.data[dataKey] : [];
+
+                results.push(...items);
+                retries = 0;
 
                 const nextCursor = response.data.cursor;
-                if (orders.length < pageLimit || !nextCursor || nextCursor === '') {
+                if (items.length < pageLimit || !nextCursor || nextCursor === '') {
                     break;
                 }
-
                 cursor = nextCursor;
-            }
 
-            return totalCount;
-        } catch (error) {
-            const errorMsg = error.response?.data?.message || error.response?.data || error.message;
-            if (error.response?.status === 429 || String(errorMsg).includes('Limit exceeded')) {
-                await new Promise(resolve => setTimeout(resolve, 1000));
-                try {
-                    const retryBody = {
-                        query: {
-                            park: {
-                                id: this.parkId,
-                                driver_profile: { id: driverId },
-                                order: {
-                                    booked_at: { from, to },
-                                    statuses: ['complete']
-                                }
-                            }
-                        },
-                        limit: pageLimit
-                    };
-                    const retryResponse = await axios.post(
-                        `${this.baseUrl}/v1/parks/orders/list`,
-                        retryBody,
-                        { headers: this.headers }
-                    );
-                    return (retryResponse.data.orders || []).length;
-                } catch (retryError) {
-                    console.error(`[YandexFleetApi] Tekrar denemede de hata: ${retryError.response?.data?.message || retryError.message}`);
-                    return 0;
+            } catch (error) {
+                const status = error.response?.status;
+                const errorMsg = error.response?.data?.message || error.response?.data || error.message;
+
+                if ((status === 429 || status >= 500 || String(errorMsg).includes('Limit exceeded')) && retries < MAX_RETRIES) {
+                    retries++;
+
+                    // ✅ Yandex'in Retry-After header'ını önce dene (varsa onu kullan)
+                    const retryAfterSec = parseInt(error.response?.headers?.['retry-after'] || '0', 10);
+                    const backoffTime = retryAfterSec > 0
+                        ? retryAfterSec * 1000
+                        : Math.min((Math.pow(2, retries) * 1500) + Math.floor(Math.random() * 1000), 20000);
+                    // ✅ Backoff: 3s → 6s → 12s → 20s (max) — önceki: 2s → 4s → 8s → 16s
+                    console.warn(`[YandexFleetApi] API tıkandı (${status || 'Limit'}). ${Math.round(backoffTime / 1000)}s bekleniyor... (${retries}/${MAX_RETRIES})`);
+
+
+                    await new Promise(r => setTimeout(r, backoffTime));
+                    continue;
+                }
+
+                console.error(`[YandexFleetApi] Cursor Motoru Hatası (${endpoint}):`, errorMsg);
+                throw error;
+            }
+        }
+
+        return results;
+    }
+
+    /**
+     * Belirli bir sürücünün yolculuk sayısını getirir (cursor-based pagination)
+     * POST /v1/parks/orders/list
+     */
+    async getDriverOrderCount(driverId, period = 'daily') {
+        const from = this._getPeriodStartDate(period);
+        const to = new Date().toISOString();
+
+        const basePayload = {
+            query: {
+                park: {
+                    id: this.parkId,
+                    driver_profile: { id: driverId },
+                    order: {
+                        booked_at: { from, to },
+                        statuses: ['complete']
+                    }
                 }
             }
-            console.error(`[YandexFleetApi] Sürücü ${driverId} siparişleri çekilirken hata:`, errorMsg);
+        };
+
+        try {
+            const allOrders = await this._fetchAllPagesWithCursor('/v1/parks/orders/list', basePayload, 500);
+            return allOrders.length;
+        } catch (error) {
+            console.error(`[YandexFleetApi] Sürücü ${driverId} siparişleri çekilirken hata oluştu.`);
             return 0;
         }
     }
 
     /**
-     * Sürücünün bakiyesini dedicated endpoint ile getirir
+     * Sürücünün bakiyesini getirir
      * GET /v1/parks/contractors/blocked-balance
-     * @param {string} driverId
      */
     async getDriverBalance(driverId) {
         try {
-            const response = await axios.get(
-                `${this.baseUrl}/v1/parks/contractors/blocked-balance`,
+            const response = await this.httpClient.get(
+                '/v1/parks/contractors/blocked-balance',
                 {
                     params: { contractor_id: driverId },
-                    headers: {
-                        'X-Client-ID': config.yandexFleet.clientId,
-                        'X-API-Key': config.yandexFleet.apiKey,
-                        'X-Park-ID': this.parkId,
-                        'Accept-Language': 'tr'
-                    }
+                    headers: { 'X-Park-ID': this.parkId }
                 }
             );
             return {
@@ -245,20 +429,14 @@ class YandexFleetApi {
     /**
      * Araç detaylarını getirir
      * GET /v2/parks/vehicles/car
-     * @param {string} vehicleId
      */
     async getCarDetails(vehicleId) {
         try {
-            const response = await axios.get(
-                `${this.baseUrl}/v2/parks/vehicles/car`,
+            const response = await this.httpClient.get(
+                '/v2/parks/vehicles/car',
                 {
                     params: { vehicle_id: vehicleId },
-                    headers: {
-                        'X-Client-ID': config.yandexFleet.clientId,
-                        'X-API-Key': config.yandexFleet.apiKey,
-                        'X-Park-ID': this.parkId,
-                        'Accept-Language': 'tr'
-                    }
+                    headers: { 'X-Park-ID': this.parkId }
                 }
             );
             return response.data;
@@ -271,7 +449,6 @@ class YandexFleetApi {
     /**
      * Parktaki araç listesini getirir
      * POST /v1/parks/cars/list
-     * @param {string} [textSearch] - Plaka veya araç bilgisi ile arama
      */
     async getCarsList(textSearch = '') {
         const allCars = [];
@@ -292,15 +469,10 @@ class YandexFleetApi {
                     offset
                 };
 
-                const response = await axios.post(
-                    `${this.baseUrl}/v1/parks/cars/list`,
+                const response = await this.httpClient.post(
+                    '/v1/parks/cars/list',
                     body,
-                    {
-                        headers: {
-                            ...this.headers,
-                            'X-Park-ID': this.parkId
-                        }
-                    }
+                    { headers: { 'X-Park-ID': this.parkId } }
                 );
 
                 const data = response.data;
@@ -320,9 +492,7 @@ class YandexFleetApi {
     }
 
     /**
-     * Plaka ile araç arar (sistemde kayıtlı mı)
-     * @param {string} plate - Plaka numarası
-     * @returns {Object|null} Bulunan araç bilgisi veya null
+     * Plaka ile araç arar
      */
     async findCarByPlate(plate) {
         const trimmed = (plate || '').trim().toUpperCase().replace(/\s/g, '');
@@ -332,7 +502,7 @@ class YandexFleetApi {
 
         const found = cars.find(c => {
             const carPlate = (c.number || '').trim().toUpperCase().replace(/\s/g, '');
-            return carPlate === trimmed || carPlate.replace(/\s/g, '') === trimmed;
+            return carPlate === trimmed;
         });
 
         if (found) {
@@ -349,17 +519,14 @@ class YandexFleetApi {
     }
 
     /**
-     * Çalışma kurallarını getirir (work_rule_id için)
+     * Çalışma kurallarını getirir
      * GET /v1/parks/driver-work-rules
      */
     async getDriverWorkRules() {
         try {
-            const response = await axios.get(
-                `${this.baseUrl}/v1/parks/driver-work-rules`,
-                {
-                    params: { park_id: this.parkId },
-                    headers: this.headers
-                }
+            const response = await this.httpClient.get(
+                '/v1/parks/driver-work-rules',
+                { params: { park_id: this.parkId } }
             );
             const rules = response.data?.rules || [];
             return rules.filter(r => r.is_enabled).map(r => r.id);
@@ -413,23 +580,28 @@ class YandexFleetApi {
             }
         };
 
-        const idempotencyToken = require('crypto').randomBytes(16).toString('hex');
-        const headers = {
-            ...this.headers,
-            'X-Park-ID': this.parkId,
-            'X-Idempotency-Token': idempotencyToken
-        };
+        // ✅ OPT-5: crypto artık top-level import, require() içinde çağrılmıyor
+        const idempotencyToken = crypto.randomBytes(16).toString('hex');
 
         try {
-            const response = await axios.post(
-                `${this.baseUrl}/v2/parks/contractors/driver-profile`,
+            const response = await this.httpClient.post(
+                '/v2/parks/contractors/driver-profile',
                 body,
-                { headers }
+                {
+                    headers: {
+                        'X-Park-ID': this.parkId,
+                        'X-Idempotency-Token': idempotencyToken
+                    }
+                }
             );
             const contractorProfileId = response.data?.contractor_profile_id;
             if (!contractorProfileId) {
                 throw new Error('Sürücü oluşturuldu ancak profil ID alınamadı.');
             }
+
+            // ✅ Yeni sürücü oluşunca profil cache'ini temizle
+            this.invalidateProfileCache();
+
             return { contractorProfileId };
         } catch (error) {
             const errData = error.response?.data;
@@ -445,8 +617,8 @@ class YandexFleetApi {
      */
     async bindCarToDriver(driverId, carId) {
         try {
-            const response = await axios.put(
-                `${this.baseUrl}/v1/parks/driver-profiles/car-bindings`,
+            await this.httpClient.put(
+                '/v1/parks/driver-profiles/car-bindings',
                 {},
                 {
                     params: {
@@ -454,10 +626,7 @@ class YandexFleetApi {
                         driver_profile_id: driverId,
                         car_id: carId
                     },
-                    headers: {
-                        ...this.headers,
-                        'X-Park-ID': this.parkId
-                    }
+                    headers: { 'X-Park-ID': this.parkId }
                 }
             );
             return true;
@@ -501,17 +670,14 @@ class YandexFleetApi {
         };
 
         try {
-            const response = await axios.post(
-                `${this.baseUrl}/v2/parks/vehicles/car`,
+            const response = await this.httpClient.post(
+                '/v2/parks/vehicles/car',
                 body,
                 {
                     headers: {
-                        'X-Client-ID': config.yandexFleet.clientId,
-                        'X-API-Key': config.yandexFleet.apiKey,
                         'X-Park-ID': this.parkId,
-                        'X-Idempotency-Token': require('crypto').randomBytes(16).toString('hex'),
-                        'Content-Type': 'application/json',
-                        'Accept-Language': 'tr'
+                        // ✅ OPT-5: crypto top-level
+                        'X-Idempotency-Token': crypto.randomBytes(16).toString('hex')
                     }
                 }
             );
@@ -533,8 +699,6 @@ class YandexFleetApi {
     /**
      * Araç plakasını günceller
      * PUT /v2/parks/vehicles/car
-     * @param {string} vehicleId
-     * @param {string} newPlate - Yeni plaka numarası
      */
     async updateCarPlate(vehicleId, newPlate) {
         const carData = await this.getCarDetails(vehicleId);
@@ -552,18 +716,12 @@ class YandexFleetApi {
         };
 
         try {
-            await axios.put(
-                `${this.baseUrl}/v2/parks/vehicles/car`,
+            await this.httpClient.put(
+                '/v2/parks/vehicles/car',
                 updateBody,
                 {
                     params: { vehicle_id: vehicleId },
-                    headers: {
-                        'X-Client-ID': config.yandexFleet.clientId,
-                        'X-API-Key': config.yandexFleet.apiKey,
-                        'X-Park-ID': this.parkId,
-                        'Content-Type': 'application/json',
-                        'Accept-Language': 'tr'
-                    }
+                    headers: { 'X-Park-ID': this.parkId }
                 }
             );
             return true;
@@ -576,8 +734,6 @@ class YandexFleetApi {
 
     /**
      * 10 günlük dönem hesaplayıcı
-     * 1-10, 11-20, 21-ay sonu şeklinde dönemler oluşturur
-     * @returns {{ from: string, to: string, label: string }}
      */
     _get10DayPeriod() {
         const now = new Date();
@@ -595,7 +751,6 @@ class YandexFleetApi {
             periodEnd = new Date(year, month, 20, 23, 59, 59, 999);
         } else {
             periodStart = new Date(year, month, 21);
-            // Ay sonunu hesapla
             periodEnd = new Date(year, month + 1, 0, 23, 59, 59, 999);
         }
 
@@ -604,17 +759,11 @@ class YandexFleetApi {
 
         const label = `${periodStart.getDate()} - ${periodEnd.getDate()} ${monthNames[month]} ${year}`;
 
-        return {
-            from: periodStart.toISOString(),
-            to: periodEnd.toISOString(),
-            label
-        };
+        return { from: periodStart.toISOString(), to: periodEnd.toISOString(), label };
     }
 
     /**
-     * Önceki 10 günlük dönemi hesaplar (sonlanmış kampanya)
-     * Örn: Şu an 11-20 Haziran ise → 1-10 Haziran döner
-     * @returns {{ from: string, to: string, label: string }}
+     * Önceki 10 günlük dönemi hesaplar
      */
     _getPrev10DayPeriod() {
         const now = new Date();
@@ -628,23 +777,17 @@ class YandexFleetApi {
         let periodStart, periodEnd, labelMonth, labelYear;
 
         if (day <= 10) {
-            // Şu an 1-10 arası → Önceki: geçen ay 21-son
             periodStart = new Date(year, month - 1, 21);
             periodEnd = new Date(year, month, 0, 23, 59, 59, 999);
             labelMonth = month - 1;
             labelYear = year;
-            if (labelMonth < 0) {
-                labelMonth = 11;
-                labelYear = year - 1;
-            }
+            if (labelMonth < 0) { labelMonth = 11; labelYear = year - 1; }
         } else if (day <= 20) {
-            // Şu an 11-20 arası → Önceki: 1-10
             periodStart = new Date(year, month, 1);
             periodEnd = new Date(year, month, 10, 23, 59, 59, 999);
             labelMonth = month;
             labelYear = year;
         } else {
-            // Şu an 21-son arası → Önceki: 11-20
             periodStart = new Date(year, month, 11);
             periodEnd = new Date(year, month, 20, 23, 59, 59, 999);
             labelMonth = month;
@@ -653,11 +796,7 @@ class YandexFleetApi {
 
         const label = `${periodStart.getDate()} - ${periodEnd.getDate()} ${monthNames[labelMonth]} ${labelYear}`;
 
-        return {
-            from: periodStart.toISOString(),
-            to: periodEnd.toISOString(),
-            label
-        };
+        return { from: periodStart.toISOString(), to: periodEnd.toISOString(), label };
     }
 
     /**
@@ -690,18 +829,13 @@ class YandexFleetApi {
     }
 
     /**
-     * Admin paneli için 10 günlük leaderboard: park genelinde siparişleri çeker,
-     * sürücü başına sayar, profil isimleri (Ad Soyad) ile eşleştirir.
-     * İlk 10 sürücüyü döner. 15 dakika cache'lenir. Stale-while-revalidate kullanır.
-     * @param {boolean} [previousPeriod=false] - true ise sonlanmış önceki dönemi döner
-     * @param {string} [customFrom=null] - İsteğe bağlı filtreleme için başlangıç tarihi
-     * @param {string} [customTo=null] - İsteğe bağlı filtreleme için bitiş tarihi
+     * Admin paneli için 10 günlük leaderboard
+     * Stale-while-revalidate cache stratejisi
      */
     async getAdminLeaderboardData(previousPeriod = false, customFrom = null, customTo = null) {
         if (customFrom && customTo) {
             const startDate = new Date(customFrom);
             const endDate = new Date(customTo);
-            // Bitiş tarihini günün sonuna ayarla
             endDate.setHours(23, 59, 59, 999);
 
             const monthNames = ['Ocak', 'Şubat', 'Mart', 'Nisan', 'Mayıs', 'Haziran',
@@ -714,8 +848,10 @@ class YandexFleetApi {
                 label
             };
 
-            // Özel filtreleme için cache kullanmadan direkt çek (skipCache = true)
-            return await this._fetchAdminLeaderboard(period, false, true);
+            // ✅ OPT-8: Özel aralık cache — admin için de aynı ortak LRU
+            return this._cachedCustomLeaderboard(`admin:${customFrom}:${customTo}`, () =>
+                this._fetchAdminLeaderboard(period, false, true)
+            );
         }
 
         const period = previousPeriod ? this._getPrev10DayPeriod() : this._get10DayPeriod();
@@ -723,11 +859,10 @@ class YandexFleetApi {
 
         if (previousPeriod) {
             if (this._adminLeaderboardPrevCache && this._adminLeaderboardPrevCacheKey === cacheKey) {
-                // Cache var, ancak süresi dolmuşsa arka planda yenile
                 if (Date.now() >= this._adminLeaderboardPrevExpiry && !this._adminLeaderboardPrevPending) {
                     this._adminLeaderboardPrevPending = this._fetchAdminLeaderboard(period, true).finally(() => this._adminLeaderboardPrevPending = null);
                 }
-                return this._adminLeaderboardPrevCache; // Anında yanıt dön
+                return this._adminLeaderboardPrevCache;
             }
             if (this._adminLeaderboardPrevPending) return this._adminLeaderboardPrevPending;
 
@@ -736,11 +871,10 @@ class YandexFleetApi {
         }
 
         if (this._adminLeaderboardCache && this._adminLeaderboardCacheKey === cacheKey) {
-            // Cache var, ancak süresi dolmuşsa arka planda yenile
             if (Date.now() >= this._adminLeaderboardExpiry && !this._adminLeaderboardPending) {
                 this._adminLeaderboardPending = this._fetchAdminLeaderboard(period, false).finally(() => this._adminLeaderboardPending = null);
             }
-            return this._adminLeaderboardCache; // Anında yanıt dön
+            return this._adminLeaderboardCache;
         }
         if (this._adminLeaderboardPending) return this._adminLeaderboardPending;
 
@@ -749,14 +883,29 @@ class YandexFleetApi {
     }
 
     /**
-     * Admin leaderboard verisini çeker (10 günlük dönem, top 10, Ad Soyad)
-     * @param {{ from: string, to: string, label: string }} period
-     * @param {boolean} [isPrevious=false] - Önceki dönem cache'i için
-     * @param {boolean} [skipCache=false] - Özel dönem için cache atla
+     * Admin leaderboard verisini çeker
+     * ✅ OPT-6: Profil + siparişler PARALEL çekiliyor (Promise.all)
      */
     async _fetchAdminLeaderboard(period, isPrevious = false, skipCache = false) {
-        // Sürücü profillerini çek (Ad Soyad bilgisi için)
-        const profiles = await this.getDriverProfiles();
+        // ✅ OPT-6: Profiller ve siparişleri aynı anda başlat
+        const [profiles, allOrders] = await Promise.all([
+            this._getCachedDriverProfiles(),
+            this._fetchAllPagesWithCursor('/v1/parks/orders/list', {
+                query: {
+                    park: {
+                        id: this.parkId,
+                        order: {
+                            booked_at: { from: period.from, to: period.to },
+                            statuses: ['complete']
+                        }
+                    }
+                }
+            }, 500).catch(error => {
+                console.error('[YandexFleetApi] Admin leaderboard siparişleri çekilemedi:', error.message);
+                return [];
+            })
+        ]);
+
         const driverMap = {};
         profiles.forEach(p => {
             const dp = p.driver_profile || {};
@@ -768,65 +917,16 @@ class YandexFleetApi {
             driverMap[id] = { id, fullName, tripCount: 0 };
         });
 
-        // Dönem içindeki siparişleri çek
-        let cursor = undefined;
-        const pageLimit = 500;
-        let totalOrders = 0;
-        let retries = 0;
-        const MAX_RETRIES = 3;
-
-        while (true) {
-            try {
-                const requestBody = {
-                    query: {
-                        park: {
-                            id: this.parkId,
-                            order: {
-                                booked_at: { from: period.from, to: period.to },
-                                statuses: ['complete']
-                            }
-                        }
-                    },
-                    limit: pageLimit
-                };
-                if (cursor) requestBody.cursor = cursor;
-
-                const response = await axios.post(
-                    `${this.baseUrl}/v1/parks/orders/list`,
-                    requestBody,
-                    { headers: this.headers }
-                );
-
-                const orders = response.data.orders || [];
-                totalOrders += orders.length;
-
-                orders.forEach(order => {
-                    const driverId = order.driver?.id || order.driver_profile?.id;
-                    if (driverId && driverMap[driverId]) {
-                        driverMap[driverId].tripCount++;
-                    } else if (driverId) {
-                        driverMap[driverId] = { id: driverId, fullName: 'Bilinmeyen Sürücü', tripCount: 1 };
-                    }
-                });
-
-                retries = 0;
-                const nextCursor = response.data.cursor;
-                if (orders.length < pageLimit || !nextCursor || nextCursor === '') {
-                    break;
-                }
-                cursor = nextCursor;
-            } catch (error) {
-                if (error.response?.status === 429 && retries < MAX_RETRIES) {
-                    retries++;
-                    await new Promise(r => setTimeout(r, retries * 1000));
-                    continue;
-                }
-                console.error('[YandexFleetApi] Admin leaderboard sipariş hatası:', error.response?.data || error.message);
-                break;
+        const totalOrders = allOrders.length;
+        allOrders.forEach(order => {
+            const driverId = order.driver?.id || order.driver_profile?.id;
+            if (driverId && driverMap[driverId]) {
+                driverMap[driverId].tripCount++;
+            } else if (driverId) {
+                driverMap[driverId] = { id: driverId, fullName: 'Bilinmeyen Sürücü', tripCount: 1 };
             }
-        }
+        });
 
-        // Sıralama: en çok yolculuk yapan ilk 10
         const drivers = Object.values(driverMap).filter(d => d.tripCount > 0);
         drivers.sort((a, b) => b.tripCount - a.tripCount);
         const top10 = drivers.slice(0, 10).map((d, i) => ({ ...d, rank: i + 1 }));
@@ -838,7 +938,6 @@ class YandexFleetApi {
             totalDrivers: Object.keys(driverMap).length
         };
 
-        // Cache: 15 dakika (mevcut / önceki dönem ayrı cache, özel dönem cache'lenmez)
         if (!skipCache) {
             if (isPrevious) {
                 this._adminLeaderboardPrevCache = result;
@@ -856,12 +955,8 @@ class YandexFleetApi {
     }
 
     /**
-     * Sürücü sıralama tablosu: park genelinde siparişleri çeker, sürücü başına sayar.
-     * Admin paneli ile aynı 10 günlük dönem mantığını kullanır.
-     * @param {boolean} [previousPeriod=false] - true ise sonlanmış önceki dönem
-     * @param {string} [customFrom=null] - Özel filtreleme için başlangıç tarihi (YYYY-MM-DD)
-     * @param {string} [customTo=null] - Özel filtreleme için bitiş tarihi (YYYY-MM-DD)
-     * @returns {{ drivers, totalDrivers, totalOrders, periodLabel }}
+     * Sürücü sıralama tablosu (public leaderboard)
+     * Stale-while-revalidate cache stratejisi
      */
     async getLeaderboardData(previousPeriod = false, customFrom = null, customTo = null) {
         if (customFrom && customTo) {
@@ -878,7 +973,11 @@ class YandexFleetApi {
                 to: endDate.toISOString(),
                 label
             };
-            return await this._fetchLeaderboardForPeriod(period);
+
+            // ✅ OPT-8: Özel aralık cache — aynı from+to 5 dk içinde tekrar gelirse anında döner
+            return this._cachedCustomLeaderboard(`lb:${customFrom}:${customTo}`, () =>
+                this._fetchLeaderboardForPeriod(period)
+            );
         }
 
         const period = previousPeriod ? this._getPrev10DayPeriod() : this._get10DayPeriod();
@@ -909,11 +1008,29 @@ class YandexFleetApi {
     }
 
     /**
-     * Belirli bir dönem için sürücü leaderboard verisini çeker (top 30, initials formatı)
-     * @param {{ from: string, to: string, label: string }} period
+     * Belirli bir dönem için sürücü leaderboard verisini çeker
+     * ✅ OPT-6: Profil + siparişler PARALEL çekiliyor (Promise.all)
      */
     async _fetchLeaderboardForPeriod(period) {
-        const profiles = await this.getDriverProfiles();
+        // ✅ OPT-6: Paralel fetch (eskiden sıralıydı, şimdi eş zamanlı)
+        const [profiles, allOrders] = await Promise.all([
+            this._getCachedDriverProfiles(),
+            this._fetchAllPagesWithCursor('/v1/parks/orders/list', {
+                query: {
+                    park: {
+                        id: this.parkId,
+                        order: {
+                            booked_at: { from: period.from, to: period.to },
+                            statuses: ['complete']
+                        }
+                    }
+                }
+            }, 500).catch(error => {
+                console.error('[YandexFleetApi] Leaderboard siparişleri çekilemedi:', error.message);
+                return [];
+            })
+        ]);
+
         const driverMap = {};
         profiles.forEach(p => {
             const dp = p.driver_profile || {};
@@ -928,62 +1045,15 @@ class YandexFleetApi {
             driverMap[id] = { id, initials, tripCount: 0 };
         });
 
-        let cursor = undefined;
-        const pageLimit = 500;
-        let totalOrders = 0;
-        let retries = 0;
-        const MAX_RETRIES = 3;
-
-        while (true) {
-            try {
-                const requestBody = {
-                    query: {
-                        park: {
-                            id: this.parkId,
-                            order: {
-                                booked_at: { from: period.from, to: period.to },
-                                statuses: ['complete']
-                            }
-                        }
-                    },
-                    limit: pageLimit
-                };
-                if (cursor) requestBody.cursor = cursor;
-
-                const response = await axios.post(
-                    `${this.baseUrl}/v1/parks/orders/list`,
-                    requestBody,
-                    { headers: this.headers }
-                );
-
-                const orders = response.data.orders || [];
-                totalOrders += orders.length;
-
-                orders.forEach(order => {
-                    const driverId = order.driver?.id || order.driver_profile?.id;
-                    if (driverId && driverMap[driverId]) {
-                        driverMap[driverId].tripCount++;
-                    } else if (driverId) {
-                        driverMap[driverId] = { id: driverId, initials: '?.', tripCount: 1 };
-                    }
-                });
-
-                retries = 0;
-                const nextCursor = response.data.cursor;
-                if (orders.length < pageLimit || !nextCursor || nextCursor === '') {
-                    break;
-                }
-                cursor = nextCursor;
-            } catch (error) {
-                if (error.response?.status === 429 && retries < MAX_RETRIES) {
-                    retries++;
-                    await new Promise(r => setTimeout(r, retries * 1000));
-                    continue;
-                }
-                console.error('[YandexFleetApi] Sipariş çekilirken hata:', error.response?.data || error.message);
-                break;
+        const totalOrders = allOrders.length;
+        allOrders.forEach(order => {
+            const driverId = order.driver?.id || order.driver_profile?.id;
+            if (driverId && driverMap[driverId]) {
+                driverMap[driverId].tripCount++;
+            } else if (driverId) {
+                driverMap[driverId] = { id: driverId, initials: '?.', tripCount: 1 };
             }
-        }
+        });
 
         const drivers = Object.values(driverMap).filter(d => d.tripCount > 0);
         drivers.sort((a, b) => b.tripCount - a.tripCount);
@@ -1022,80 +1092,49 @@ class YandexFleetApi {
     }
 
     /**
-     * Park genelinde tüm siparişleri çekip sürücü başına sayar (bulk - tek seferde)
-     * @param {string} period - 'daily' | 'weekly' | 'monthly' | 'all'
-     * @returns {Object} { driverId: count }
+     * Park genelinde tüm siparişleri çekip sürücü başına sayar (bulk)
      */
     async _fetchOrderCountsByDriver(period = 'all') {
         const from = this._getPeriodStartDate(period);
         const to = new Date().toISOString();
-        const pageLimit = 500;
         const countMap = {};
-        let cursor = undefined;
-        let retries = 0;
-        const MAX_RETRIES = 3;
 
-        while (true) {
-            try {
-                const requestBody = {
-                    query: {
-                        park: {
-                            id: this.parkId,
-                            order: {
-                                booked_at: { from, to },
-                                statuses: ['complete']
-                            }
-                        }
-                    },
-                    limit: pageLimit
-                };
-                if (cursor) requestBody.cursor = cursor;
-
-                const response = await axios.post(
-                    `${this.baseUrl}/v1/parks/orders/list`,
-                    requestBody,
-                    { headers: this.headers }
-                );
-
-                const orders = response.data.orders || [];
-                orders.forEach(order => {
-                    const driverId = order.driver?.id || order.driver_profile?.id;
-                    if (driverId) {
-                        countMap[driverId] = (countMap[driverId] || 0) + 1;
+        const basePayload = {
+            query: {
+                park: {
+                    id: this.parkId,
+                    order: {
+                        booked_at: { from, to },
+                        statuses: ['complete']
                     }
-                });
-
-                retries = 0;
-                const nextCursor = response.data.cursor;
-                if (orders.length < pageLimit || !nextCursor || nextCursor === '') {
-                    break;
                 }
-                cursor = nextCursor;
-            } catch (error) {
-                if (error.response?.status === 429 && retries < MAX_RETRIES) {
-                    retries++;
-                    await new Promise(r => setTimeout(r, retries * 1000));
-                    continue;
-                }
-                console.error('[YandexFleetApi] Sipariş çekilirken hata:', error.response?.data?.message || error.message);
-                break;
             }
+        };
+
+        try {
+            const allOrders = await this._fetchAllPagesWithCursor('/v1/parks/orders/list', basePayload, 500);
+
+            allOrders.forEach(order => {
+                const driverId = order.driver?.id || order.driver_profile?.id;
+                if (driverId) {
+                    countMap[driverId] = (countMap[driverId] || 0) + 1;
+                }
+            });
+        } catch (error) {
+            console.error('[YandexFleetApi] Genel siparişler çekilirken hata oluştu:', error.message);
         }
 
         return countMap;
     }
 
     /**
-     * Tüm sürücülerin bilgilerini (telefon, araç, yolculuk sayısı) toplar
-     * Leaderboard mantığı: tüm siparişler tek seferde çekilir, sürücü başına sayılır
+     * Tüm sürücülerin bilgilerini toplar (paralel)
      */
     async getAllDriversInfo() {
-
         const [driverProfiles, tripCountMap] = await Promise.all([
             this.getDriverProfiles(),
             this._fetchOrderCountsByDriver('all')
         ]);
-
 
         const driversInfo = driverProfiles.map(p => {
             const info = this.formatDriverProfile(p);
@@ -1107,7 +1146,7 @@ class YandexFleetApi {
     }
 
     /**
-     * Sadece sürücü profillerini çeker (yolculuk sayısı olmadan - hızlı mod)
+     * Sadece sürücü profillerini çeker (hızlı mod)
      */
     async getDriverProfilesFormatted() {
         const driverProfiles = await this.getDriverProfiles();

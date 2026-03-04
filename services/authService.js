@@ -18,17 +18,68 @@ class AuthService {
         // Sürücü cache (telefon -> profil)
         this.driverCache = new Map();
         this.cacheExpiry = null;
-        this.cacheTTL = 5 * 60 * 1000;
+        this.cacheTTL = 10 * 60 * 1000; // ✅ 10 dakika (eskiden 5'ti)
+
+        // ✅ OPT-7: Sürücü başına bakiye+trip mini-cache (2 dakika)
+        // validateSession her çağrıda 2 API isteği atmaması için
+        this._driverLiveCache = new Map(); // driverId -> { balance, tripCount, expiry }
 
         // Oturum yönetimi: token -> { phone, driverId, city, createdAt }
         this.sessions = new Map();
-        this.SESSION_TTL = 30 * 24 * 60 * 60 * 1000; // 30 gün
-
+        this.SESSION_TTL = 7 * 24 * 60 * 60 * 1000; // 7 gün
         // Admin panel OTP ve oturum
         this.adminOtpStore = new Map();
         this.adminOtpLastSentAt = new Map();
         this.adminSessions = new Map();
         this.ALLOWED_ADMIN_PHONES = ['+05466706626', '+905424571462'].map(p => this.normalizePhone(p));
+
+        // Memory Leak önlemek için belli periyotlarla ölü oturumları silen görev başlatılıyor
+        this._startGarbageCollector();
+    }
+
+    /**
+     * RAM şişmesini önleyen asenkron temizleyici görev
+     */
+    _startGarbageCollector() {
+        setInterval(() => {
+            const now = Date.now();
+            // Süresi dolan oturumları temizle
+            for (const [token, session] of this.sessions.entries()) {
+                if (now - session.createdAt > this.SESSION_TTL) {
+                    this.sessions.delete(token);
+                }
+            }
+            // Süresi dolan admin oturumları temizle
+            for (const [token, session] of this.adminSessions.entries()) {
+                if (now - session.createdAt > this.SESSION_TTL) {
+                    this.adminSessions.delete(token);
+                }
+            }
+            // Süresi dolan (veya patlamış) OTP verilerini temizle
+            for (const [phone, otpData] of this.otpStore.entries()) {
+                if (now > otpData.expiresAt) {
+                    this.otpStore.delete(phone);
+                }
+            }
+            // Süresi dolan kayıt form OTP çöplerini temizle
+            for (const [phone, otpData] of this.registerOtpStore.entries()) {
+                if (now > otpData.expiresAt) {
+                    this.registerOtpStore.delete(phone);
+                }
+            }
+            // Admin OTP kayıtlarını temizle
+            for (const [phone, otpData] of this.adminOtpStore.entries()) {
+                if (now > otpData.expiresAt) {
+                    this.adminOtpStore.delete(phone);
+                }
+            }
+            // ✅ OPT-7: Sürücü mini live-cache'teki eski kayıtları temizle
+            for (const [driverId, entry] of this._driverLiveCache.entries()) {
+                if (now > entry.expiry) {
+                    this._driverLiveCache.delete(driverId);
+                }
+            }
+        }, 1000 * 60 * 30); // ✅ Her 30 dakikada bir (eskiden saatte birdi)
     }
 
     /**
@@ -44,6 +95,9 @@ class AuthService {
     invalidateDriverCache() {
         this.cacheExpiry = null;
         this.driverCache.clear();
+        this._driverLiveCache.clear();
+        // ✅ OPT: Yandex profil cache'ini de sıfırla
+        yandexFleetApi.invalidateProfileCache();
     }
 
     /**
@@ -392,20 +446,13 @@ class AuthService {
         const driver = otpData.driver;
         this.otpStore.delete(normalizedPhone);
 
-        // Yolculuk sayısı ve bakiyeyi paralel çek
+        // Bakiye ve yolculuk (Sadece giriş anında bakiyeye ve günlük yolculuğa odaklanıldı, sistemi boğmamak için)
         try {
-            const [tripCount, balanceData] = await Promise.all([
-                yandexFleetApi.getDriverOrderCount(driver.id).catch(err => {
-                    console.error('[AuthService] Yolculuk sayısı çekilemedi:', err.message);
-                    return 0;
-                }),
-                yandexFleetApi.getDriverBalance(driver.id).catch(err => {
-                    console.error('[AuthService] Bakiye çekilemedi:', err.message);
-                    return null;
-                })
-            ]);
+            const balanceData = await yandexFleetApi.getDriverBalance(driver.id).catch(err => null);
 
-            driver.tripCount = tripCount;
+            // Tüm zamanları çekmek çok ağır, UI'de göstermek için 'daily' (günlük) veya dashboard'un kendi isteği tercih edilmeli.
+            // driver.tripCount manuel veya ayrı apiden gelsin. Burada sistemi kilitlemiyoruz.
+            driver.tripCount = await yandexFleetApi.getDriverOrderCount(driver.id, 'all').catch(() => 0);
 
             if (balanceData) {
                 const rawBal = parseFloat(balanceData.balance);
@@ -433,7 +480,8 @@ class AuthService {
 
     /**
      * Session token ile oturum doğrulama
-     * Geçerliyse sürücü verisini taze çekip döner
+     * ✅ OPT-7: Bakiye ve tripCount sürücü başına 2 dakika cache'lenir
+     * Her sayfa yenilemesinde 2 API isteği atılmasını önler
      */
     async validateSession(token) {
         const session = this.sessions.get(token);
@@ -452,19 +500,37 @@ class AuthService {
             return null;
         }
 
-        // Bakiye ve yolculuk sayısını taze çek
-        try {
-            const [tripCount, balanceData] = await Promise.all([
-                yandexFleetApi.getDriverOrderCount(driver.id).catch(() => 0),
-                yandexFleetApi.getDriverBalance(driver.id).catch(() => null)
-            ]);
-            driver.tripCount = tripCount;
-            if (balanceData) {
-                const rawBal = parseFloat(balanceData.balance);
-                driver.balance = !isNaN(rawBal) ? `${Math.round(rawBal)} ₺` : driver.balance;
+        const now = Date.now();
+        const LIVE_TTL = 2 * 60 * 1000; // 2 dakika
+        const cached = this._driverLiveCache.get(driver.id);
+
+        if (cached && now < cached.expiry) {
+            // Cache geçerli — API'ye gitmeden taze gibi göster
+            driver.balance = cached.balance;
+            driver.tripCount = cached.tripCount;
+        } else {
+            // Cache süresi dolmuş veya yok — taze çek
+            try {
+                const [balanceData, tripCount] = await Promise.all([
+                    yandexFleetApi.getDriverBalance(driver.id).catch(() => null),
+                    yandexFleetApi.getDriverOrderCount(driver.id, 'all').catch(() => 0)
+                ]);
+
+                if (balanceData) {
+                    const rawBal = parseFloat(balanceData.balance);
+                    driver.balance = !isNaN(rawBal) ? `${Math.round(rawBal)} ₺` : driver.balance;
+                }
+                driver.tripCount = tripCount;
+
+                // Mini-cache'e yaz
+                this._driverLiveCache.set(driver.id, {
+                    balance: driver.balance,
+                    tripCount: driver.tripCount,
+                    expiry: now + LIVE_TTL
+                });
+            } catch (e) {
+                console.error('[AuthService] Session veri çekme hatası:', e.message);
             }
-        } catch (e) {
-            console.error('[AuthService] Session veri çekme hatası:', e.message);
         }
 
         return driver;
