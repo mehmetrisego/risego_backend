@@ -229,11 +229,46 @@ app.post('/api/drivers/balance', requireAuth, async (req, res) => {
 /**
  * GET /api/leaderboard
  * Sıralama tablosu: top 30 + kullanıcının sırası (oturum gerekli)
+ * Query: ?from=YYYY-MM-DD&to=YYYY-MM-DD → tarih aralığı (zorunlu, en fazla 31 gün)
  */
 app.get('/api/leaderboard', requireAuth, async (req, res) => {
     try {
         const driverId = req.sessionDriver.id;
-        const { drivers, totalDrivers } = await yandexFleetApi.getLeaderboardData();
+        const { from, to } = req.query;
+
+        if (!from || !to) {
+            return res.status(400).json({
+                success: false,
+                message: 'Başlangıç ve bitiş tarihi gereklidir (from, to).'
+            });
+        }
+
+        const startDate = new Date(from);
+        const endDate = new Date(to);
+        if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
+            return res.status(400).json({
+                success: false,
+                message: 'Geçersiz tarih formatı.'
+            });
+        }
+        if (startDate > endDate) {
+            return res.status(400).json({
+                success: false,
+                message: 'Başlangıç tarihi bitiş tarihinden sonra olamaz.'
+            });
+        }
+
+        const diffMs = endDate - startDate;
+        const diffDays = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
+        if (diffDays > 31) {
+            return res.status(400).json({
+                success: false,
+                message: 'En fazla 1 aylık (31 gün) dönem seçebilirsiniz.'
+            });
+        }
+
+        const data = await yandexFleetApi.getLeaderboardData(false, from, to);
+        const { drivers, totalDrivers, totalOrders, periodLabel } = data;
 
         const top30 = drivers.slice(0, 30);
 
@@ -251,7 +286,9 @@ app.get('/api/leaderboard', requireAuth, async (req, res) => {
             success: true,
             leaderboard: top30,
             currentUser: currentUser,
-            totalDrivers: totalDrivers
+            totalDrivers: totalDrivers,
+            totalOrders: totalOrders || 0,
+            periodLabel: periodLabel || ''
         });
     } catch (error) {
         console.error('[Server] Leaderboard hatası:', error.message);

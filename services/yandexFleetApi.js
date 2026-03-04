@@ -844,29 +844,63 @@ class YandexFleetApi {
     }
 
     /**
-     * Aylık sıralama tablosu: park genelinde tüm siparişleri bulk çeker,
-     * sürücü başına sayar, profil isimleriyle eşleştirir.
-     * 30 dakika cache'lenir. Stale-while-revalidate kullanır.
+     * Sürücü sıralama tablosu: park genelinde siparişleri çeker, sürücü başına sayar.
+     * Admin paneli ile aynı 10 günlük dönem mantığını kullanır.
+     * @param {boolean} [previousPeriod=false] - true ise sonlanmış önceki dönem
+     * @param {string} [customFrom=null] - Özel filtreleme için başlangıç tarihi (YYYY-MM-DD)
+     * @param {string} [customTo=null] - Özel filtreleme için bitiş tarihi (YYYY-MM-DD)
+     * @returns {{ drivers, totalDrivers, totalOrders, periodLabel }}
      */
-    async getLeaderboardData() {
-        if (this._leaderboardCache) {
-            // Cache var ama süresi dolmuşsa arka planda yenile
+    async getLeaderboardData(previousPeriod = false, customFrom = null, customTo = null) {
+        if (customFrom && customTo) {
+            const startDate = new Date(customFrom);
+            const endDate = new Date(customTo);
+            endDate.setHours(23, 59, 59, 999);
+
+            const monthNames = ['Ocak', 'Şubat', 'Mart', 'Nisan', 'Mayıs', 'Haziran',
+                'Temmuz', 'Ağustos', 'Eylül', 'Ekim', 'Kasım', 'Aralık'];
+            const label = `${startDate.getDate()} ${monthNames[startDate.getMonth()]} ${startDate.getFullYear()} - ${endDate.getDate()} ${monthNames[endDate.getMonth()]} ${endDate.getFullYear()}`;
+
+            const period = {
+                from: startDate.toISOString(),
+                to: endDate.toISOString(),
+                label
+            };
+            return await this._fetchLeaderboardForPeriod(period);
+        }
+
+        const period = previousPeriod ? this._getPrev10DayPeriod() : this._get10DayPeriod();
+
+        if (this._leaderboardCache && this._leaderboardCacheKey === period.label && !previousPeriod) {
             if (Date.now() >= this._leaderboardExpiry && !this._leaderboardPending) {
-                this._leaderboardPending = this._fetchLeaderboard().finally(() => this._leaderboardPending = null);
+                this._leaderboardPending = this._fetchLeaderboardForPeriod(period).then(r => {
+                    this._leaderboardCache = r;
+                    this._leaderboardCacheKey = period.label;
+                    this._leaderboardExpiry = Date.now() + 30 * 60 * 1000;
+                    return r;
+                }).finally(() => { this._leaderboardPending = null; });
             }
-            return this._leaderboardCache; // Süresi dolsa bile mevcut cache'i dön (anında yanıt)
+            return this._leaderboardCache;
         }
 
-        if (this._leaderboardPending) {
-            return this._leaderboardPending;
-        }
+        if (this._leaderboardPending) return this._leaderboardPending;
 
-        this._leaderboardPending = this._fetchLeaderboard().finally(() => this._leaderboardPending = null);
+        this._leaderboardPending = this._fetchLeaderboardForPeriod(period).then(r => {
+            if (!previousPeriod) {
+                this._leaderboardCache = r;
+                this._leaderboardCacheKey = period.label;
+                this._leaderboardExpiry = Date.now() + 30 * 60 * 1000;
+            }
+            return r;
+        }).finally(() => { this._leaderboardPending = null; });
         return this._leaderboardPending;
     }
 
-    async _fetchLeaderboard() {
-
+    /**
+     * Belirli bir dönem için sürücü leaderboard verisini çeker (top 30, initials formatı)
+     * @param {{ from: string, to: string, label: string }} period
+     */
+    async _fetchLeaderboardForPeriod(period) {
         const profiles = await this.getDriverProfiles();
         const driverMap = {};
         profiles.forEach(p => {
@@ -882,15 +916,9 @@ class YandexFleetApi {
             driverMap[id] = { id, initials, tripCount: 0 };
         });
 
-        const now = new Date();
-        const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-        const from = monthStart.toISOString();
-        const to = now.toISOString();
-
         let cursor = undefined;
         const pageLimit = 500;
         let totalOrders = 0;
-        let pageNum = 0;
 
         while (true) {
             try {
@@ -899,7 +927,7 @@ class YandexFleetApi {
                         park: {
                             id: this.parkId,
                             order: {
-                                booked_at: { from, to },
+                                booked_at: { from: period.from, to: period.to },
                                 statuses: ['complete']
                             }
                         }
@@ -915,7 +943,6 @@ class YandexFleetApi {
                 );
 
                 const orders = response.data.orders || [];
-                pageNum++;
                 totalOrders += orders.length;
 
                 orders.forEach(order => {
@@ -926,7 +953,6 @@ class YandexFleetApi {
                         driverMap[driverId] = { id: driverId, initials: '?.', tripCount: 1 };
                     }
                 });
-
 
                 const nextCursor = response.data.cursor;
                 if (orders.length < pageLimit || !nextCursor || nextCursor === '') {
@@ -947,9 +973,12 @@ class YandexFleetApi {
         drivers.sort((a, b) => b.tripCount - a.tripCount);
         drivers.forEach((d, i) => { d.rank = i + 1; });
 
-        this._leaderboardCache = { drivers, totalDrivers: Object.keys(driverMap).length };
-        this._leaderboardExpiry = Date.now() + 30 * 60 * 1000;
-        return this._leaderboardCache;
+        return {
+            drivers,
+            totalDrivers: Object.keys(driverMap).length,
+            totalOrders,
+            periodLabel: period.label
+        };
     }
 
     /**
