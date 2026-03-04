@@ -1,0 +1,33 @@
+# Bağımlılıklar
+node_modules/
+
+# Ortam değişkenleri - API anahtarları ve hassas veriler
+.env
+.env.local
+.env.*.local
+
+# Frontend ve Admin Panel (ayrı repo'larda push ediliyor)
+risego_frontend/
+risego_adminpanel/
+
+# Oluşturulan dosyalar
+sürücüler.txt
+
+# Log dosyaları
+*.log
+npm-debug.log*
+
+# İşletim sistemi
+.DS_Store
+Thumbs.db
+
+# IDE / Editor
+.idea/
+.vscode/
+.cursor/
+*.swp
+*.swo
+
+# Geçici / Agent
+agent-tools/
+mcps/
