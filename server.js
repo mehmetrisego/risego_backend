@@ -16,8 +16,23 @@ const app = express();
 app.use(helmet());
 
 // Güvenlik Katmanı 2: CORS - Sadece belirtilen domainlere izin verilir (Tarayıcı saldırı koruması)
+const allowedOrigins = [
+    'https://risegodriver.com',
+    'https://www.risegodriver.com',
+    'https://mehmetrisego.github.io',
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+    'http://127.0.0.1:5500',
+    'http://localhost:5500',
+    'null'  // file:// ile açılan sayfalar
+];
 app.use(cors({
-    origin: ['https://risegodriver.com', 'http://localhost:3000', 'null', 'http://127.0.0.1:5500', 'http://localhost:5500'],
+    origin: (origin, callback) => {
+        if (!origin) return callback(null, true);  // Postman, curl vb.
+        if (allowedOrigins.includes(origin)) return callback(null, true);
+        if (origin.endsWith('.risegodriver.com') || origin.endsWith('.github.io')) return callback(null, true);
+        callback(null, false);  // İzin verilmedi
+    },
     methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'x-session-token', 'x-admin-token'],
     credentials: true
