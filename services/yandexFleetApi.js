@@ -83,6 +83,24 @@ class YandexFleetApi {
     }
 
     /**
+     * Tarihi Türkiye saat dilimine (GMT+3) göre ISO formatında (+03:00) döndürür
+     */
+    _toLocalISOString(date) {
+        const offsetMs = date.getTimezoneOffset() * 60 * 1000;
+        const localDate = new Date(date.getTime() - offsetMs);
+        let isoStr = localDate.toISOString();
+        isoStr = isoStr.replace('Z', '');
+
+        const offset = -date.getTimezoneOffset();
+        const sign = offset >= 0 ? '+' : '-';
+        const pad = (num) => String(num).padStart(2, '0');
+        const offsetHours = pad(Math.floor(Math.abs(offset) / 60));
+        const offsetMinutes = pad(Math.abs(offset) % 60);
+
+        return `${isoStr}${sign}${offsetHours}:${offsetMinutes}`;
+    }
+
+    /**
      * ✅ OPT-3: Merkezi, cache'li sürücü profil çekici
      * Her çağrıda API yerine cache kullanır — leaderboard için kritik
      * Paralel çağrılar için promise deduplication (tek istek, N bekleyen)
@@ -851,8 +869,8 @@ class YandexFleetApi {
                 const fromDate = new Date(now);
                 fromDate.setDate(now.getDate() - 45); // Son 45 gün
 
-                const from = fromDate.toISOString();
-                const to = now.toISOString();
+                const from = this._toLocalISOString(fromDate);
+                const to = this._toLocalISOString(now);
 
                 console.log(`[YandexFleetApi] Son 45 günlük siparişler belleğe yükleniyor... (${from} - ${to})`);
 
