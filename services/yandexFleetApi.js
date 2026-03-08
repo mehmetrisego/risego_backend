@@ -908,34 +908,61 @@ class YandexFleetApi {
      * Mümkünse _last45DaysOrdersCache'den süzülerek döner, değilse doğrudan Yandex API çağırır.
      */
     async _getOrdersForPeriod(period) {
-        const fromDate = new Date(period.from);
+        let fromDate = new Date(period.from);
         const toDate = new Date(period.to);
 
-        // Cache mevcutsa ve istenen tarihleri tamamen kapsıyorsa
+        let cachedOrders = [];
+        let needApiFetch = true;
+        let apiFetchFrom = period.from;
+
+        // Cache mevcutsa ve istenen baslangıç tarihi cache'in kapsama alanı içindeyse
         if (this._last45DaysOrdersCache && this._last45DaysFrom && this._last45DaysTo) {
-            if (fromDate >= this._last45DaysFrom && toDate <= this._last45DaysTo) {
+            // İstenen başlangıç çok eskiyse komple API denebilir, ama 45 gün içindeyse optimize et
+            if (fromDate >= this._last45DaysFrom) {
                 console.log(`[YandexFleetApi] Siparişler bellekten(cache) filtreleniyor (${period.label})`);
-                // Bellekten dön
-                return this._last45DaysOrdersCache.filter(order => {
+
+                // Cache'den dönen kısmı al
+                cachedOrders = this._last45DaysOrdersCache.filter(order => {
                     if (!order.booked_at) return false;
                     const orderDate = new Date(order.booked_at);
                     return orderDate >= fromDate && orderDate <= toDate;
                 });
+
+                // İstek, cache'in bitiş süresini aşıyorsa (örn: cache saat 18:00'de alındı, sürücü 23:59 istiyor)
+                // Sadece aradaki saat farkını API'den çek
+                if (toDate > this._last45DaysTo) {
+                    apiFetchFrom = this._toLocalISOString(this._last45DaysTo);
+                    needApiFetch = true;
+                    console.log(`[YandexFleetApi] Eksik zaman dilimi API'den tamamlanıyor: ${apiFetchFrom} - ${period.to}`);
+                } else {
+                    needApiFetch = false;
+                }
             }
         }
 
-        console.log(`[YandexFleetApi] Siparişler API'den çekiliyor (${period.label})`);
-        return this._fetchAllPagesWithCursor('/v1/parks/orders/list', {
-            query: {
-                park: {
-                    id: this.parkId,
-                    order: {
-                        booked_at: { from: period.from, to: period.to },
-                        statuses: ['complete']
+        if (needApiFetch) {
+            console.log(`[YandexFleetApi] Siparişler API'den çekiliyor (${apiFetchFrom} - ${period.to})`);
+            const apiOrders = await this._fetchAllPagesWithCursor('/v1/parks/orders/list', {
+                query: {
+                    park: {
+                        id: this.parkId,
+                        order: {
+                            booked_at: { from: apiFetchFrom, to: period.to },
+                            statuses: ['complete']
+                        }
                     }
                 }
-            }
-        }, 500);
+            }, 500);
+
+            // Gelen API verisini ve filtrelediğimiz Cache verisini birleştir (mükerrer kayıt süzgeci)
+            const allOrdersMap = new Map();
+            cachedOrders.forEach(o => allOrdersMap.set(o.id, o));
+            apiOrders.forEach(o => allOrdersMap.set(o.id, o));
+
+            return Array.from(allOrdersMap.values());
+        }
+
+        return cachedOrders;
     }
 
     /**
