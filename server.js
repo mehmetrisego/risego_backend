@@ -1,3 +1,6 @@
+// Sunucunun saat dilimini Türkiye (İstanbul) olarak ayarla
+process.env.TZ = 'Europe/Istanbul';
+
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
