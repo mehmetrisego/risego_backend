@@ -40,6 +40,9 @@ app.use(cors({
 
 app.use(express.json());
 
+// Railway, Heroku gibi ortamlarda (Reverse Proxy arkasında) IP adresini doğru almak için:
+app.set('trust proxy', 1);
+
 // Güvenlik Katmanı 3: Rate Limiting - SMS Brute Force engellemek için
 const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
