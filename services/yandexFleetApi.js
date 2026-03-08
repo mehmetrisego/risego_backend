@@ -74,6 +74,12 @@ class YandexFleetApi {
         this._customRangeCache = new Map(); // key -> { result, expiry, pending }
         this.CUSTOM_RANGE_TTL = 5 * 60 * 1000; // 5 dakika
         this.CUSTOM_RANGE_MAX = 20; // En fazla 20 farklı sorgu sakla
+
+        // 1 Ay geriye dönük tüm siparişleri tutacak olan in-memory cache
+        this._lastMonthOrdersCache = null;
+        this._lastMonthFrom = null;
+        this._lastMonthTo = null;
+        this._lastMonthPending = null;
     }
 
     /**
@@ -805,6 +811,8 @@ class YandexFleetApi {
     async initiateCacheWarming() {
         console.log('[YandexFleetApi] Arka planda önyükleme (cache warming) başlatılıyor...');
         try {
+            // İlk açılışta 1 aylık veriyi çek
+            await this._fetchLastMonthOrders();
             await this.getLeaderboardData();
             await this.getAdminLeaderboardData(false);
             await this.getAdminLeaderboardData(true);
@@ -817,6 +825,9 @@ class YandexFleetApi {
         setInterval(async () => {
             try {
                 console.log('[YandexFleetApi] Arka plan cache tazeleme rutini çalışıyor...');
+                // 1 aylık veriyi her 15 dakikada bir yenile
+                await this._fetchLastMonthOrders();
+
                 await this._fetchLeaderboardForPeriod(this._get10DayPeriod()).catch(() => { });
                 await new Promise(r => setTimeout(r, 2000));
                 await this._fetchAdminLeaderboard(this._get10DayPeriod(), false).catch(() => { });
@@ -826,6 +837,89 @@ class YandexFleetApi {
                 console.error('[Cache Update Error] Periyodik güncelleştirme başarısız', e.message);
             }
         }, 15 * 60 * 1000);
+    }
+
+    /**
+     * Son 1 aya ait tüm tamamlanmış siparişleri getirir ve in-memory cache'e yazar
+     */
+    async _fetchLastMonthOrders() {
+        if (this._lastMonthPending) return this._lastMonthPending;
+
+        this._lastMonthPending = (async () => {
+            try {
+                const now = new Date();
+                const fromDate = new Date(now);
+                fromDate.setMonth(now.getMonth() - 1);
+                // Bir nebze daha erken başlasın ki zaman farklarında kayıp olmasın
+                fromDate.setDate(fromDate.getDate() - 1); 
+                
+                const from = fromDate.toISOString();
+                const to = now.toISOString();
+
+                console.log(`[YandexFleetApi] Son 1 aylık siparişler belleğe yükleniyor... (${from} - ${to})`);
+
+                const allOrders = await this._fetchAllPagesWithCursor('/v1/parks/orders/list', {
+                    query: {
+                        park: {
+                            id: this.parkId,
+                            order: {
+                                booked_at: { from, to },
+                                statuses: ['complete']
+                            }
+                        }
+                    }
+                }, 500);
+
+                this._lastMonthOrdersCache = allOrders;
+                this._lastMonthFrom = fromDate;
+                this._lastMonthTo = now;
+
+                console.log(`[YandexFleetApi] Son 1 aylık siparişler belleğe yüklendi. Toplam sipariş: ${allOrders.length}`);
+                return allOrders;
+            } catch (error) {
+                console.error('[YandexFleetApi] Son 1 aylık siparişler çekilemedi:', error.message);
+                return [];
+            } finally {
+                this._lastMonthPending = null;
+            }
+        })();
+
+        return this._lastMonthPending;
+    }
+
+    /**
+     * İstenilen dönemdeki siparişleri döner.
+     * Mümkünse _lastMonthOrdersCache'den süzülerek döner, değilse doğrudan Yandex API çağırır.
+     */
+    async _getOrdersForPeriod(period) {
+        const fromDate = new Date(period.from);
+        const toDate = new Date(period.to);
+
+        // Cache mevcutsa ve istenen tarihleri tamamen kapsıyorsa
+        if (this._lastMonthOrdersCache && this._lastMonthFrom && this._lastMonthTo) {
+            if (fromDate >= this._lastMonthFrom && toDate <= this._lastMonthTo) {
+                console.log(`[YandexFleetApi] Siparişler bellekten(cache) filtreleniyor (${period.label})`);
+                // Bellekten dön
+                return this._lastMonthOrdersCache.filter(order => {
+                    if (!order.booked_at) return false;
+                    const orderDate = new Date(order.booked_at);
+                    return orderDate >= fromDate && orderDate <= toDate;
+                });
+            }
+        }
+
+        console.log(`[YandexFleetApi] Siparişler API'den çekiliyor (${period.label})`);
+        return this._fetchAllPagesWithCursor('/v1/parks/orders/list', {
+            query: {
+                park: {
+                    id: this.parkId,
+                    order: {
+                        booked_at: { from: period.from, to: period.to },
+                        statuses: ['complete']
+                    }
+                }
+            }
+        }, 500);
     }
 
     /**
@@ -890,17 +984,7 @@ class YandexFleetApi {
         // ✅ OPT-6: Profiller ve siparişleri aynı anda başlat
         const [profiles, allOrders] = await Promise.all([
             this._getCachedDriverProfiles(),
-            this._fetchAllPagesWithCursor('/v1/parks/orders/list', {
-                query: {
-                    park: {
-                        id: this.parkId,
-                        order: {
-                            booked_at: { from: period.from, to: period.to },
-                            statuses: ['complete']
-                        }
-                    }
-                }
-            }, 500).catch(error => {
+            this._getOrdersForPeriod(period).catch(error => {
                 console.error('[YandexFleetApi] Admin leaderboard siparişleri çekilemedi:', error.message);
                 return [];
             })
@@ -1015,17 +1099,7 @@ class YandexFleetApi {
         // ✅ OPT-6: Paralel fetch (eskiden sıralıydı, şimdi eş zamanlı)
         const [profiles, allOrders] = await Promise.all([
             this._getCachedDriverProfiles(),
-            this._fetchAllPagesWithCursor('/v1/parks/orders/list', {
-                query: {
-                    park: {
-                        id: this.parkId,
-                        order: {
-                            booked_at: { from: period.from, to: period.to },
-                            statuses: ['complete']
-                        }
-                    }
-                }
-            }, 500).catch(error => {
+            this._getOrdersForPeriod(period).catch(error => {
                 console.error('[YandexFleetApi] Leaderboard siparişleri çekilemedi:', error.message);
                 return [];
             })
