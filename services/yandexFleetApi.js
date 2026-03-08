@@ -839,11 +839,11 @@ class YandexFleetApi {
             console.error('[Cache Warming Error]:', e.message);
         }
 
-        // Her 15 dakikada bir cache'leri tazele
+        // Her 1 saatte bir cache'leri tazele
         setInterval(async () => {
             try {
                 console.log('[YandexFleetApi] Arka plan cache tazeleme rutini çalışıyor...');
-                // 45 günlük veriyi her 15 dakikada bir yenile
+                // 45 günlük veriyi her 1 saatte bir yenile
                 await this._fetchLast45DaysOrders();
 
                 await this._fetchLeaderboardForPeriod(this._get10DayPeriod()).catch(() => { });
@@ -854,7 +854,7 @@ class YandexFleetApi {
             } catch (e) {
                 console.error('[Cache Update Error] Periyodik güncelleştirme başarısız', e.message);
             }
-        }, 15 * 60 * 1000);
+        }, 60 * 60 * 1000);
     }
 
     /**
