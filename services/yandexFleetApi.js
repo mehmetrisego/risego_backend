@@ -75,11 +75,11 @@ class YandexFleetApi {
         this.CUSTOM_RANGE_TTL = 5 * 60 * 1000; // 5 dakika
         this.CUSTOM_RANGE_MAX = 20; // En fazla 20 farklı sorgu sakla
 
-        // 1 Ay geriye dönük tüm siparişleri tutacak olan in-memory cache
-        this._lastMonthOrdersCache = null;
-        this._lastMonthFrom = null;
-        this._lastMonthTo = null;
-        this._lastMonthPending = null;
+        // 45 Gün geriye dönük tüm siparişleri tutacak olan in-memory cache
+        this._last45DaysOrdersCache = null;
+        this._last45DaysFrom = null;
+        this._last45DaysTo = null;
+        this._last45DaysPending = null;
     }
 
     /**
@@ -811,8 +811,8 @@ class YandexFleetApi {
     async initiateCacheWarming() {
         console.log('[YandexFleetApi] Arka planda önyükleme (cache warming) başlatılıyor...');
         try {
-            // İlk açılışta 1 aylık veriyi çek
-            await this._fetchLastMonthOrders();
+            // İlk açılışta 45 günlük veriyi çek
+            await this._fetchLast45DaysOrders();
             await this.getLeaderboardData();
             await this.getAdminLeaderboardData(false);
             await this.getAdminLeaderboardData(true);
@@ -825,8 +825,8 @@ class YandexFleetApi {
         setInterval(async () => {
             try {
                 console.log('[YandexFleetApi] Arka plan cache tazeleme rutini çalışıyor...');
-                // 1 aylık veriyi her 15 dakikada bir yenile
-                await this._fetchLastMonthOrders();
+                // 45 günlük veriyi her 15 dakikada bir yenile
+                await this._fetchLast45DaysOrders();
 
                 await this._fetchLeaderboardForPeriod(this._get10DayPeriod()).catch(() => { });
                 await new Promise(r => setTimeout(r, 2000));
@@ -840,23 +840,21 @@ class YandexFleetApi {
     }
 
     /**
-     * Son 1 aya ait tüm tamamlanmış siparişleri getirir ve in-memory cache'e yazar
+     * Son 45 güne ait tüm tamamlanmış siparişleri getirir ve in-memory cache'e yazar
      */
-    async _fetchLastMonthOrders() {
-        if (this._lastMonthPending) return this._lastMonthPending;
+    async _fetchLast45DaysOrders() {
+        if (this._last45DaysPending) return this._last45DaysPending;
 
-        this._lastMonthPending = (async () => {
+        this._last45DaysPending = (async () => {
             try {
                 const now = new Date();
                 const fromDate = new Date(now);
-                fromDate.setMonth(now.getMonth() - 1);
-                // Bir nebze daha erken başlasın ki zaman farklarında kayıp olmasın
-                fromDate.setDate(fromDate.getDate() - 1); 
-                
+                fromDate.setDate(now.getDate() - 45); // Son 45 gün
+
                 const from = fromDate.toISOString();
                 const to = now.toISOString();
 
-                console.log(`[YandexFleetApi] Son 1 aylık siparişler belleğe yükleniyor... (${from} - ${to})`);
+                console.log(`[YandexFleetApi] Son 45 günlük siparişler belleğe yükleniyor... (${from} - ${to})`);
 
                 const allOrders = await this._fetchAllPagesWithCursor('/v1/parks/orders/list', {
                     query: {
@@ -870,37 +868,37 @@ class YandexFleetApi {
                     }
                 }, 500);
 
-                this._lastMonthOrdersCache = allOrders;
-                this._lastMonthFrom = fromDate;
-                this._lastMonthTo = now;
+                this._last45DaysOrdersCache = allOrders;
+                this._last45DaysFrom = fromDate;
+                this._last45DaysTo = now;
 
-                console.log(`[YandexFleetApi] Son 1 aylık siparişler belleğe yüklendi. Toplam sipariş: ${allOrders.length}`);
+                console.log(`[YandexFleetApi] Son 45 günlük siparişler belleğe yüklendi. Toplam sipariş: ${allOrders.length}`);
                 return allOrders;
             } catch (error) {
-                console.error('[YandexFleetApi] Son 1 aylık siparişler çekilemedi:', error.message);
+                console.error('[YandexFleetApi] Son 45 günlük siparişler çekilemedi:', error.message);
                 return [];
             } finally {
-                this._lastMonthPending = null;
+                this._last45DaysPending = null;
             }
         })();
 
-        return this._lastMonthPending;
+        return this._last45DaysPending;
     }
 
     /**
      * İstenilen dönemdeki siparişleri döner.
-     * Mümkünse _lastMonthOrdersCache'den süzülerek döner, değilse doğrudan Yandex API çağırır.
+     * Mümkünse _last45DaysOrdersCache'den süzülerek döner, değilse doğrudan Yandex API çağırır.
      */
     async _getOrdersForPeriod(period) {
         const fromDate = new Date(period.from);
         const toDate = new Date(period.to);
 
         // Cache mevcutsa ve istenen tarihleri tamamen kapsıyorsa
-        if (this._lastMonthOrdersCache && this._lastMonthFrom && this._lastMonthTo) {
-            if (fromDate >= this._lastMonthFrom && toDate <= this._lastMonthTo) {
+        if (this._last45DaysOrdersCache && this._last45DaysFrom && this._last45DaysTo) {
+            if (fromDate >= this._last45DaysFrom && toDate <= this._last45DaysTo) {
                 console.log(`[YandexFleetApi] Siparişler bellekten(cache) filtreleniyor (${period.label})`);
                 // Bellekten dön
-                return this._lastMonthOrdersCache.filter(order => {
+                return this._last45DaysOrdersCache.filter(order => {
                     if (!order.booked_at) return false;
                     const orderDate = new Date(order.booked_at);
                     return orderDate >= fromDate && orderDate <= toDate;
