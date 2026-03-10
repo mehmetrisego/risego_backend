@@ -364,7 +364,11 @@ class YandexFleetApi {
                 retries = 0;
 
                 const nextCursor = response.data.cursor;
-                if (items.length < pageLimit || !nextCursor || nextCursor === '') {
+                // ✅ DÜZELTME: Yandex Fleet, filtrelediği querylerde (örn: sadece statuses: 'complete') 
+                // pageLimit'ten (500) daha az data (örneğin 480) dönse bile cursor vermeye devam eder.
+                // "items.length < pageLimit" kontrolü, sonraki sayfaları çöpe atıyordu. 
+                // Artık sadece cursor'ın bitip bitmediğine bakar.
+                if (!nextCursor || nextCursor === '') {
                     break;
                 }
                 cursor = nextCursor;
