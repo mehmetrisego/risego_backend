@@ -402,24 +402,67 @@ class YandexFleetApi {
      * POST /v1/parks/orders/list
      */
     async getDriverOrderCount(driverId, period = 'daily') {
-        const from = this._getPeriodStartDate(period);
-        const to = new Date().toISOString();
+        const fromMs = new Date(this._getPeriodStartDate(period)).getTime();
+        const toMs = Date.now();
 
-        const basePayload = {
-            query: {
-                park: {
-                    id: this.parkId,
-                    driver_profile: { id: driverId },
-                    order: {
-                        booked_at: { from, to },
-                        statuses: ['complete']
+        // ✅ Önce 45 günlük cache'den filtrele — Yandex'e ayrı istek atmaya gerek yok
+        if (this._last45DaysOrdersCache && this._last45DaysOrdersCache.length > 0) {
+            const cacheFromMs = this._last45DaysFrom ? this._last45DaysFrom.getTime() : Infinity;
+
+            if (cacheFromMs <= fromMs) {
+                const cacheToMs = this._last45DaysTo ? this._last45DaysTo.getTime() : 0;
+
+                let count = this._last45DaysOrdersCache.filter(order => {
+                    const dId = order.driver?.id || order.driver_profile?.id;
+                    if (dId !== driverId) return false;
+                    if (!order.booked_at) return false;
+                    const t = new Date(order.booked_at).getTime();
+                    return t >= fromMs && t <= cacheToMs;
+                }).length;
+
+                // Cache bitiş zamanından bu yana yeni sipariş varsa API'den tamamla
+                if (cacheToMs < toMs) {
+                    try {
+                        const extraFrom = this._toLocalISOString(new Date(cacheToMs));
+                        const extraTo = this._toLocalISOString(new Date(toMs));
+                        const extraOrders = await this._fetchAllPagesWithCursor('/v1/parks/orders/list', {
+                            query: {
+                                park: {
+                                    id: this.parkId,
+                                    driver_profile: { id: driverId },
+                                    order: {
+                                        booked_at: { from: extraFrom, to: extraTo },
+                                        statuses: ['complete']
+                                    }
+                                }
+                            }
+                        }, 500);
+                        count += extraOrders.length;
+                    } catch (err) {
+                        console.warn(`[YandexFleetApi] Delta trip count tamamlanamadı (${driverId}):`, err.message);
                     }
                 }
-            }
-        };
 
+                return count;
+            }
+        }
+
+        // Cache yoksa veya dönemi kapsamıyorsa doğrudan Yandex API'ye git
+        const from = this._getPeriodStartDate(period);
+        const to = new Date().toISOString();
         try {
-            const allOrders = await this._fetchAllPagesWithCursor('/v1/parks/orders/list', basePayload, 500);
+            const allOrders = await this._fetchAllPagesWithCursor('/v1/parks/orders/list', {
+                query: {
+                    park: {
+                        id: this.parkId,
+                        driver_profile: { id: driverId },
+                        order: {
+                            booked_at: { from, to },
+                            statuses: ['complete']
+                        }
+                    }
+                }
+            }, 500);
             return allOrders.length;
         } catch (error) {
             console.error(`[YandexFleetApi] Sürücü ${driverId} siparişleri çekilirken hata oluştu.`);
@@ -866,15 +909,31 @@ class YandexFleetApi {
         this._last45DaysPending = (async () => {
             try {
                 const now = new Date();
-                const fromDate = new Date(now);
-                fromDate.setDate(now.getDate() - 45); // Son 45 gün
+                // ✅ DÜZELTME: Saatli bir an yerine tam gece yarısı 00:00:00 kullan.
+                // Eskiden: new Date(now) → setDate(now.getDate() - 45)
+                // → Sunucu örn. 15:41'de başlarsa 45 gün önce saat 15:41'den başlıyordu.
+                // Bu da bugün 00:00-15:41 arasındaki siparişlerin cache'e girmemesine yol açıyordu.
+                const fromDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 45, 0, 0, 0, 0);
 
-                const from = this._toLocalISOString(fromDate);
+                let fetchFromDate = fromDate;
+                let isDeltaUpdate = false;
+
+                // Eğer zaten önbellekte siparişlerimiz varsa, yalnızca arada eksik kalan saatleri API'den çek
+                if (this._last45DaysOrdersCache && this._last45DaysTo) {
+                    fetchFromDate = this._last45DaysTo;
+                    isDeltaUpdate = true;
+                }
+
+                const from = this._toLocalISOString(fetchFromDate);
                 const to = this._toLocalISOString(now);
 
-                console.log(`[YandexFleetApi] Son 45 günlük siparişler belleğe yükleniyor... (${from} - ${to})`);
+                if (isDeltaUpdate) {
+                    console.log(`[YandexFleetApi] Eksik zaman dilimi (Delta Update) API'den çekiliyor... (${from} - ${to})`);
+                } else {
+                    console.log(`[YandexFleetApi] Son 45 günlük siparişler API'den komple çekiliyor... (${from} - ${to})`);
+                }
 
-                const allOrders = await this._fetchAllPagesWithCursor('/v1/parks/orders/list', {
+                const newOrders = await this._fetchAllPagesWithCursor('/v1/parks/orders/list', {
                     query: {
                         park: {
                             id: this.parkId,
@@ -886,15 +945,41 @@ class YandexFleetApi {
                     }
                 }, 500);
 
-                this._last45DaysOrdersCache = allOrders;
+                if (isDeltaUpdate) {
+                    // Cache'e yeni eklenen siparişleri dahil et (mükerrer kayıt var mı diye kontrol et)
+                    const existingOrderIds = new Set(this._last45DaysOrdersCache.map(o => o.id));
+                    let addedCount = 0;
+                    newOrders.forEach(o => {
+                        if (!existingOrderIds.has(o.id)) {
+                            this._last45DaysOrdersCache.push(o);
+                            addedCount++;
+                        }
+                    });
+
+                    // Garbage Collection: 45 Günden çok daha eski hale gelmiş siparişleri bellekten (RAM) buda
+                    const thresholdDateMs = fromDate.getTime();
+                    const initialSize = this._last45DaysOrdersCache.length;
+
+                    this._last45DaysOrdersCache = this._last45DaysOrdersCache.filter(order => {
+                        if (!order.booked_at) return false;
+                        return new Date(order.booked_at).getTime() >= thresholdDateMs;
+                    });
+
+                    const removedCount = initialSize - this._last45DaysOrdersCache.length;
+                    console.log(`[YandexFleetApi] Delta Update tamamlandı: +${addedCount} yeni sipariş eklendi, -${removedCount} eski sipariş budandı. Toplam Bellek: ${this._last45DaysOrdersCache.length}`);
+                } else {
+                    // İlk defa çekiliyorsa direkt belleğe al
+                    this._last45DaysOrdersCache = newOrders;
+                    console.log(`[YandexFleetApi] Son 45 günlük siparişler belleğe yüklendi. Toplam sipariş: ${newOrders.length}`);
+                }
+
                 this._last45DaysFrom = fromDate;
                 this._last45DaysTo = now;
 
-                console.log(`[YandexFleetApi] Son 45 günlük siparişler belleğe yüklendi. Toplam sipariş: ${allOrders.length}`);
-                return allOrders;
+                return this._last45DaysOrdersCache;
             } catch (error) {
-                console.error('[YandexFleetApi] Son 45 günlük siparişler çekilemedi:', error.message);
-                return [];
+                console.error('[YandexFleetApi] Siparişler çekilemedi:', error.message);
+                return this._last45DaysOrdersCache || [];
             } finally {
                 this._last45DaysPending = null;
             }
@@ -971,17 +1056,20 @@ class YandexFleetApi {
      */
     async getAdminLeaderboardData(previousPeriod = false, customFrom = null, customTo = null) {
         if (customFrom && customTo) {
-            const startDate = new Date(customFrom);
-            const endDate = new Date(customTo);
-            endDate.setHours(23, 59, 59, 999);
+            // ✅ DÜZELTME: new Date('2026-03-10') UTC parse eder (= İstanbul 03:00) → günün ilk 3 saati kayar.
+            // Tarih stringini parçalara bölerek yerel gece yarısı 00:00:00'dan başlatıyoruz.
+            const [sy, sm, sd] = customFrom.split('-').map(Number);
+            const [ey, em, ed] = customTo.split('-').map(Number);
+            const startDate = new Date(sy, sm - 1, sd, 0, 0, 0, 0);      // Yerel gece yarısı
+            const endDate = new Date(ey, em - 1, ed, 23, 59, 59, 999); // Yerel gün sonu
 
             const monthNames = ['Ocak', 'Şubat', 'Mart', 'Nisan', 'Mayıs', 'Haziran',
                 'Temmuz', 'Ağustos', 'Eylül', 'Ekim', 'Kasım', 'Aralık'];
             const label = `${startDate.getDate()} ${monthNames[startDate.getMonth()]} ${startDate.getFullYear()} - ${endDate.getDate()} ${monthNames[endDate.getMonth()]} ${endDate.getFullYear()}`;
 
             const period = {
-                from: startDate.toISOString(),
-                to: endDate.toISOString(),
+                from: this._toLocalISOString(startDate),
+                to: this._toLocalISOString(endDate),
                 label
             };
 
@@ -1056,10 +1144,10 @@ class YandexFleetApi {
 
         const drivers = Object.values(driverMap).filter(d => d.tripCount > 0);
         drivers.sort((a, b) => b.tripCount - a.tripCount);
-        const top10 = drivers.slice(0, 10).map((d, i) => ({ ...d, rank: i + 1 }));
+        const top100 = drivers.slice(0, 100).map((d, i) => ({ ...d, rank: i + 1 }));
 
         const result = {
-            top10,
+            top10: top100, // Property named 'top10' is kept for backward compatibility with existing callers, but it actually contains up to 100 drivers.
             periodLabel: period.label,
             totalOrders,
             totalDrivers: Object.keys(driverMap).length
@@ -1077,7 +1165,7 @@ class YandexFleetApi {
             }
         }
 
-        console.log(`[YandexFleetApi] Admin leaderboard yüklendi: ${period.label}, ${totalOrders} sipariş, ${top10.length} sürücü`);
+        console.log(`[YandexFleetApi] Admin leaderboard yüklendi: ${period.label}, ${totalOrders} sipariş, ${top100.length} sürücü`);
         return result;
     }
 
@@ -1087,17 +1175,21 @@ class YandexFleetApi {
      */
     async getLeaderboardData(previousPeriod = false, customFrom = null, customTo = null) {
         if (customFrom && customTo) {
-            const startDate = new Date(customFrom);
-            const endDate = new Date(customTo);
-            endDate.setHours(23, 59, 59, 999);
+            // ✅ DÜZELTME: new Date('2026-03-10') UTC gece yarısını parse eder (= İstanbul 03:00).
+            // Bu yüzden günün ilk 3 saatindeki yolculuklar (00:00-03:00 İstanbul) leaderboard'da görünmüzyordu.
+            // Tarih stringini parçalara bölerek yerel saat gece yarısı 00:00:00'dan başlatıyoruz.
+            const [sy, sm, sd] = customFrom.split('-').map(Number);
+            const [ey, em, ed] = customTo.split('-').map(Number);
+            const startDate = new Date(sy, sm - 1, sd, 0, 0, 0, 0);      // Yerel gece yarısı
+            const endDate = new Date(ey, em - 1, ed, 23, 59, 59, 999); // Yerel gün sonu
 
             const monthNames = ['Ocak', 'Şubat', 'Mart', 'Nisan', 'Mayıs', 'Haziran',
                 'Temmuz', 'Ağustos', 'Eylül', 'Ekim', 'Kasım', 'Aralık'];
             const label = `${startDate.getDate()} ${monthNames[startDate.getMonth()]} ${startDate.getFullYear()} - ${endDate.getDate()} ${monthNames[endDate.getMonth()]} ${endDate.getFullYear()}`;
 
             const period = {
-                from: startDate.toISOString(),
-                to: endDate.toISOString(),
+                from: this._toLocalISOString(startDate),
+                to: this._toLocalISOString(endDate),
                 label
             };
 
@@ -1159,7 +1251,8 @@ class YandexFleetApi {
             const initials = parts.length >= 2
                 ? `${parts[0][0].toUpperCase()}. ${parts[parts.length - 1][0].toUpperCase()}.`
                 : (firstName || 'X').substring(0, 1).toUpperCase() + '.';
-            driverMap[id] = { id, initials, tripCount: 0 };
+            const fullName = parts.join(' ') || 'İsimsiz';
+            driverMap[id] = { id, initials, fullName, tripCount: 0 };
         });
 
         const totalOrders = allOrders.length;
@@ -1168,12 +1261,17 @@ class YandexFleetApi {
             if (driverId && driverMap[driverId]) {
                 driverMap[driverId].tripCount++;
             } else if (driverId) {
-                driverMap[driverId] = { id: driverId, initials: '?.', tripCount: 1 };
+                driverMap[driverId] = { id: driverId, initials: '?.', fullName: 'Bilinmeyen Sürücü', tripCount: 1 };
             }
         });
 
         const drivers = Object.values(driverMap).filter(d => d.tripCount > 0);
-        drivers.sort((a, b) => b.tripCount - a.tripCount);
+        drivers.sort((a, b) => {
+            if (b.tripCount !== a.tripCount) {
+                return b.tripCount - a.tripCount;
+            }
+            return a.fullName.localeCompare(b.fullName, 'tr-TR');
+        });
         drivers.forEach((d, i) => { d.rank = i + 1; });
 
         return {

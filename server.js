@@ -58,6 +58,15 @@ app.use('/api/auth/login', authLimiter);
 app.use('/api/drivers/register/request-otp', authLimiter);
 app.use('/api/admin/auth/login', authLimiter);
 
+// Güvenlik Katmanı 4: Özel Tarih Filtreleme (DDoS / Memory Leak Koruması)
+// Sadece ?from ve ?to olan isteklerde max 10 saniyede 1 istek atılmasına izin verilir (IP tabanlı)
+const customLeaderboardLimiter = rateLimit({
+    windowMs: 10 * 1000, // 10 saniye
+    max: 1, // IP başına 1 istek
+    message: { success: false, message: 'Çok sık tarih filtresi attınız. Lütfen 10 saniye bekleyip tekrar deneyiniz.' },
+    skip: (req) => !req.query.from && !req.query.to // Sadece özel tarih filtreliler rate limit yer, normal leaderboard hızlıdır
+});
+
 // ============================================
 // Kampanya State (in-memory - sunucu yeniden başlatılana kadar kalır)
 // Prodüksiyon ortamında veritabanına taşınmalı
@@ -263,7 +272,7 @@ app.post('/api/drivers/balance', requireAuth, async (req, res) => {
  * Sıralama tablosu: top 30 + kullanıcının sırası (oturum gerekli)
  * Query: ?from=YYYY-MM-DD&to=YYYY-MM-DD → tarih aralığı (zorunlu, en fazla 31 gün)
  */
-app.get('/api/leaderboard', requireAuth, async (req, res) => {
+app.get('/api/leaderboard', requireAuth, customLeaderboardLimiter, async (req, res) => {
     try {
         const driverId = req.sessionDriver.id;
         const { from, to } = req.query;
@@ -302,13 +311,23 @@ app.get('/api/leaderboard', requireAuth, async (req, res) => {
         const data = await yandexFleetApi.getLeaderboardData(false, from, to);
         const { drivers, totalDrivers, totalOrders, periodLabel } = data;
 
-        const top30 = drivers.slice(0, 30);
+        const top30 = drivers.slice(0, 30).map(d => ({
+            id: d.id,
+            initials: d.initials,
+            tripCount: d.tripCount,
+            rank: d.rank
+        }));
 
         let currentUser = null;
         const found = drivers.find(d => d.id === driverId);
         if (found) {
             if (found.rank > 30) {
-                currentUser = found;
+                currentUser = {
+                    id: found.id,
+                    initials: found.initials,
+                    tripCount: found.tripCount,
+                    rank: found.rank
+                };
             }
         } else {
             currentUser = { id: driverId, initials: '?', tripCount: 0, rank: drivers.length + 1 };
@@ -748,7 +767,8 @@ app.get('/api/admin/auth/session', (req, res) => {
     if (!session) {
         return res.json({ success: false, message: 'Oturum geçersiz.' });
     }
-    res.json({ success: true });
+    const activeDriverSessions = authService.getActiveDriverSessionCount();
+    res.json({ success: true, activeDriverSessions });
 });
 
 /**
@@ -848,16 +868,21 @@ app.get('/api/campaign', (req, res) => {
  * Admin paneli için 10 günlük dönem leaderboard (top 10, Ad Soyad)
  * Query: ?previous=1 → sonlanmış önceki dönem
  */
-app.get('/api/admin/leaderboard', requireAdminAuth, async (req, res) => {
+app.get('/api/admin/leaderboard', requireAdminAuth, customLeaderboardLimiter, async (req, res) => {
     try {
         const previous = req.query.previous === '1' || req.query.previous === 'true';
         const { from, to } = req.query;
 
-        const data = await yandexFleetApi.getAdminLeaderboardData(previous, from, to);
+        const data = await yandexFleetApi.getLeaderboardData(previous, from, to);
 
         res.json({
             success: true,
-            leaderboard: data.top10,
+            leaderboard: data.drivers.map((d, i) => ({
+                id: d.id,
+                fullName: d.fullName,
+                tripCount: d.tripCount,
+                rank: i + 1
+            })),
             periodLabel: data.periodLabel,
             totalOrders: data.totalOrders,
             totalDrivers: data.totalDrivers
