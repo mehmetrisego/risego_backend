@@ -873,11 +873,18 @@ app.get('/api/admin/leaderboard', requireAdminAuth, customLeaderboardLimiter, as
         const previous = req.query.previous === '1' || req.query.previous === 'true';
         const { from, to } = req.query;
 
-        const data = await yandexFleetApi.getLeaderboardData(previous, from, to);
+        // XSS veya hatalı format koruması
+        if ((from && typeof from !== 'string') || (to && typeof to !== 'string')) {
+            return res.status(400).json({ success: false, message: 'Geçersiz tarih formatı.' });
+        }
+
+        const data = await yandexFleetApi.getAdminLeaderboardData(previous, from, to);
+
+        const driversArray = data.top10 || data.drivers || [];
 
         res.json({
             success: true,
-            leaderboard: data.drivers.map((d, i) => ({
+            leaderboard: driversArray.map((d, i) => ({
                 id: d.id,
                 fullName: d.fullName,
                 tripCount: d.tripCount,

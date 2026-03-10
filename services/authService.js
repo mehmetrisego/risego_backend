@@ -109,45 +109,52 @@ class AuthService {
             return;
         }
 
-        try {
-            const driverProfiles = await yandexFleetApi.getDriverProfiles();
-            this.driverCache.clear();
+        if (this._driverRefreshPending) return this._driverRefreshPending;
 
-            for (const profile of driverProfiles) {
-                const dp = profile.driver_profile || {};
-                const car = profile.car || {};
-                const accounts = profile.accounts || [];
-                const account = accounts[0] || {};
-                const phones = dp.phones || [];
+        this._driverRefreshPending = (async () => {
+            try {
+                const driverProfiles = await yandexFleetApi.getDriverProfiles();
+                this.driverCache.clear();
 
-                const rawBalance = parseFloat(account.balance);
-                const driverInfo = {
-                    id: dp.id,
-                    name: `${dp.first_name || ''} ${dp.last_name || ''}`.trim(),
-                    phones: phones,
-                    carId: car.id || null,
-                    carNumber: car.number || null,
-                    car: car.number
-                        ? `${car.brand || ''} ${car.model || ''} (${car.year || ''}) - Plaka: ${car.number}`
-                        : 'Araç atanmamış',
-                    balance: !isNaN(rawBalance)
-                        ? `${Math.round(rawBalance)} ₺`
-                        : '-',
-                    tripCount: 0
-                };
+                for (const profile of driverProfiles) {
+                    const dp = profile.driver_profile || {};
+                    const car = profile.car || {};
+                    const accounts = profile.accounts || [];
+                    const account = accounts[0] || {};
+                    const phones = dp.phones || [];
 
-                // Her telefon numarası için cache'e ekle
-                for (const phone of phones) {
-                    const normalizedPhone = this.normalizePhone(phone);
-                    this.driverCache.set(normalizedPhone, driverInfo);
+                    const rawBalance = parseFloat(account.balance);
+                    const driverInfo = {
+                        id: dp.id,
+                        name: `${dp.first_name || ''} ${dp.last_name || ''}`.trim(),
+                        phones: phones,
+                        carId: car.id || null,
+                        carNumber: car.number || null,
+                        car: car.number
+                            ? `${car.brand || ''} ${car.model || ''} (${car.year || ''}) - Plaka: ${car.number}`
+                            : 'Araç atanmamış',
+                        balance: !isNaN(rawBalance)
+                            ? `${Math.round(rawBalance)} ₺`
+                            : '-',
+                        tripCount: 0
+                    };
+
+                    // Her telefon numarası için cache'e ekle
+                    for (const phone of phones) {
+                        const normalizedPhone = this.normalizePhone(phone);
+                        this.driverCache.set(normalizedPhone, driverInfo);
+                    }
                 }
-            }
 
-            this.cacheExpiry = now + this.cacheTTL;
-        } catch (error) {
-            console.error('[AuthService] Sürücü veritabanı güncelleme hatası:', error.message);
-            throw error;
-        }
+                this.cacheExpiry = now + this.cacheTTL;
+            } catch (error) {
+                console.error('[AuthService] Sürücü veritabanı güncelleme hatası:', error.message);
+                throw error;
+            } finally {
+                this._driverRefreshPending = null;
+            }
+        })();
+        return this._driverRefreshPending;
     }
 
     /**
