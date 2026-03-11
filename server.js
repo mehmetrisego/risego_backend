@@ -8,7 +8,8 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 
 const config = require('./config');
-const yandexFleetApi = require('./services/yandexFleetApi');
+const yandexFleetApi      = require('./services/yandexFleetApi');
+const leaderboardService  = require('./services/leaderboardService');
 const { writeDriversToFile } = require('./services/fileWriter');
 const authService = require('./services/authService');
 
@@ -269,8 +270,8 @@ app.post('/api/drivers/balance', requireAuth, async (req, res) => {
 
 /**
  * GET /api/leaderboard
- * Sıralama tablosu: top 30 + kullanıcının sırası (oturum gerekli)
- * Query: ?from=YYYY-MM-DD&to=YYYY-MM-DD → tarih aralığı (zorunlu, en fazla 31 gün)
+ * Sürücü sıralama tablosu: top 30 + kullanıcının sırası (oturum gerekli)
+ * Query: ?from=YYYY-MM-DD&to=YYYY-MM-DD  (zorunlu, en fazla 31 gün)
  */
 app.get('/api/leaderboard', requireAuth, customLeaderboardLimiter, async (req, res) => {
     try {
@@ -284,69 +285,58 @@ app.get('/api/leaderboard', requireAuth, customLeaderboardLimiter, async (req, r
             });
         }
 
+        // Tarih format validasyonu
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+            return res.status(400).json({ success: false, message: 'Tarih formatı YYYY-MM-DD olmalıdır.' });
+        }
+
         const startDate = new Date(from);
-        const endDate = new Date(to);
+        const endDate   = new Date(to);
         if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
-            return res.status(400).json({
-                success: false,
-                message: 'Geçersiz tarih formatı.'
-            });
+            return res.status(400).json({ success: false, message: 'Geçersiz tarih.' });
         }
         if (startDate > endDate) {
-            return res.status(400).json({
-                success: false,
-                message: 'Başlangıç tarihi bitiş tarihinden sonra olamaz.'
-            });
+            return res.status(400).json({ success: false, message: 'Başlangıç tarihi bitiş tarihinden sonra olamaz.' });
         }
-
-        const diffMs = endDate - startDate;
-        const diffDays = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
+        const diffDays = Math.ceil((endDate - startDate) / (1000 * 60 * 60 * 24));
         if (diffDays > 31) {
-            return res.status(400).json({
-                success: false,
-                message: 'En fazla 1 aylık (31 gün) dönem seçebilirsiniz.'
-            });
+            return res.status(400).json({ success: false, message: 'En fazla 1 aylık (31 gün) dönem seçebilirsiniz.' });
         }
 
-        const data = await yandexFleetApi.getLeaderboardData(false, from, to);
+        const data = await leaderboardService.getLeaderboard(from, to, { adminView: false });
         const { drivers, totalDrivers, totalOrders, periodLabel } = data;
 
+        // Sürücüye yalnızca baş harfler göster (gizlilik)
         const top30 = drivers.slice(0, 30).map(d => ({
-            id: d.id,
-            initials: d.initials,
+            id:        d.id,
+            initials:  d.initials,
             tripCount: d.tripCount,
-            rank: d.rank
+            rank:      d.rank
         }));
 
+        // Mevcut sürücünün sırasını bul
         let currentUser = null;
         const found = drivers.find(d => d.id === driverId);
         if (found) {
             if (found.rank > 30) {
-                currentUser = {
-                    id: found.id,
-                    initials: found.initials,
-                    tripCount: found.tripCount,
-                    rank: found.rank
-                };
+                currentUser = { id: found.id, initials: found.initials, tripCount: found.tripCount, rank: found.rank };
             }
         } else {
             currentUser = { id: driverId, initials: '?', tripCount: 0, rank: drivers.length + 1 };
         }
 
         res.json({
-            success: true,
-            leaderboard: top30,
-            currentUser: currentUser,
+            success:      true,
+            leaderboard:  top30,
+            currentUser:  currentUser,
             totalDrivers: totalDrivers,
-            totalOrders: totalOrders || 0,
-            periodLabel: periodLabel || ''
+            totalOrders:  totalOrders || 0,
+            periodLabel:  periodLabel || '',
+            syncedAt:     data.syncedAt
         });
     } catch (error) {
         console.error('[Server] Leaderboard hatası:', error.message);
-        res.status(500).json({
-            success: false,
-            message: 'Sıralama tablosu yüklenirken hata oluştu.'
-        });
+        res.status(500).json({ success: false, message: 'Sıralama tablosu yüklenirken hata oluştu.' });
     }
 });
 
@@ -708,9 +698,10 @@ app.get('/api/drivers/fetch', async (req, res) => {
  */
 app.get('/api/health', (req, res) => {
     res.json({
-        status: 'ok',
-        service: 'RiseGo Backend - Yandex Fleet Sürücü Bilgi Sistemi',
-        timestamp: new Date().toISOString()
+        status:    'ok',
+        service:   'RiseGo Backend - Yandex Fleet Sürücü Bilgi Sistemi',
+        timestamp: new Date().toISOString(),
+        leaderboard: leaderboardService.getStatus()
     });
 });
 
@@ -865,42 +856,80 @@ app.get('/api/campaign', (req, res) => {
 
 /**
  * GET /api/admin/leaderboard
- * Admin paneli için 10 günlük dönem leaderboard (top 10, Ad Soyad)
- * Query: ?previous=1 → sonlanmış önceki dönem
+ * Admin paneli leaderboard — tam ad + yolculuk sayısı + sıralama
+ * Query:
+ *   ?from=YYYY-MM-DD&to=YYYY-MM-DD  → özel tarih aralığı
+ *   (from/to yoksa: bugün)
  */
 app.get('/api/admin/leaderboard', requireAdminAuth, customLeaderboardLimiter, async (req, res) => {
     try {
-        const previous = req.query.previous === '1' || req.query.previous === 'true';
-        const { from, to } = req.query;
+        let { from, to } = req.query;
 
-        // XSS veya hatalı format koruması
-        if ((from && typeof from !== 'string') || (to && typeof to !== 'string')) {
-            return res.status(400).json({ success: false, message: 'Geçersiz tarih formatı.' });
+        // from/to belirtilmemişse varsayılan: bugün
+        if (!from || !to) {
+            const today = new Date();
+            const yyyy  = today.getFullYear();
+            const mm    = String(today.getMonth() + 1).padStart(2, '0');
+            const dd    = String(today.getDate()).padStart(2, '0');
+            from = `${yyyy}-${mm}-${dd}`;
+            to   = `${yyyy}-${mm}-${dd}`;
         }
 
-        const data = await yandexFleetApi.getAdminLeaderboardData(previous, from, to);
+        // Format validasyonu
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+            return res.status(400).json({ success: false, message: 'Tarih formatı YYYY-MM-DD olmalıdır.' });
+        }
 
-        const driversArray = data.top10 || data.drivers || [];
+        const data         = await leaderboardService.getLeaderboard(from, to, { adminView: true });
+        const driversArray = data.drivers || [];
 
         res.json({
-            success: true,
-            leaderboard: driversArray.map((d, i) => ({
-                id: d.id,
-                fullName: d.fullName,
+            success:      true,
+            leaderboard:  driversArray.map(d => ({
+                id:        d.id,
+                fullName:  d.fullName,
                 tripCount: d.tripCount,
-                rank: i + 1
+                rank:      d.rank
             })),
-            periodLabel: data.periodLabel,
-            totalOrders: data.totalOrders,
-            totalDrivers: data.totalDrivers
+            periodLabel:  data.periodLabel,
+            totalOrders:  data.totalOrders,
+            totalDrivers: data.totalDrivers,
+            syncedAt:     data.syncedAt
         });
     } catch (error) {
         console.error('[Server] Admin leaderboard hatası:', error.message);
-        res.status(500).json({
-            success: false,
-            message: 'Leaderboard verisi yüklenirken hata oluştu.'
-        });
+        res.status(500).json({ success: false, message: 'Leaderboard verisi yüklenirken hata oluştu.' });
     }
+});
+
+/**
+ * POST /api/admin/leaderboard/resync
+ * Tüm leaderboard cache'ini temizler ve Yandex API'den yeniden tam senkronizasyon başlatır.
+ * Hatalı veri / eksik yolculuk durumlarında admin tarafından manuel tetiklenir.
+ */
+app.post('/api/admin/leaderboard/resync', requireAdminAuth, async (req, res) => {
+    try {
+        console.log('[Server] Admin tarafından zorla yeniden senkronizasyon talep edildi.');
+        // Arka planda başlat — cevabı hemen dön
+        leaderboardService.forceResync().catch(err => {
+            console.error('[Server] Yeniden senkronizasyon arka plan hatası:', err.message);
+        });
+        res.json({
+            success: true,
+            message: 'Yeniden senkronizasyon arka planda başlatıldı. 1-5 dakika içinde veriler güncellenecek.'
+        });
+    } catch (error) {
+        console.error('[Server] Resync hatası:', error.message);
+        res.status(500).json({ success: false, message: 'Yeniden senkronizasyon başlatılamadı.' });
+    }
+});
+
+/**
+ * GET /api/admin/leaderboard/status
+ * Leaderboard servisinin mevcut durumunu döner (debug / monitoring için)
+ */
+app.get('/api/admin/leaderboard/status', requireAdminAuth, (req, res) => {
+    res.json({ success: true, status: leaderboardService.getStatus() });
 });
 
 // Ana sayfa - API bilgisi (frontend ayrı repo'da GitHub Pages'te)
@@ -939,8 +968,10 @@ app.listen(PORT, () => {
     console.log(`  GET  http://localhost:${PORT}/api/drivers/fetch   - Hızlı sürücü profilleri`);
     console.log('');
 
-    // Leaderboard önbelleklerini (cache) sunucu başlarken arka planda ısıt
-    yandexFleetApi.initiateCacheWarming();
+    // Leaderboard servisini başlat: ilk tam senkronizasyon + 1 saatlik cron
+    leaderboardService.startCron().catch(err => {
+        console.error('[Server] LeaderboardService başlatma hatası:', err.message);
+    });
 });
 
 
