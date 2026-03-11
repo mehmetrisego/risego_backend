@@ -553,6 +553,50 @@ class LeaderboardService {
     // ════════════════════════════════════════════════════════════
 
     /**
+     * Sürücünün belirli dönemdeki yolculuk sayısını döndürür. (Frontend kartları)
+     * Veriyi doğrudan kendi hazır in-memory önbelleğinden çeker (Çok Hızlı).
+     * @param {string} driverId
+     * @param {string} period - 'daily', 'weekly', 'monthly', 'all'
+     * @returns {Promise<number>}
+     */
+    async getDriverTripCount(driverId, period = 'daily') {
+        // Öncelikli olarak tüm RAM senkronizasyonunun bittiğinden emin ol:
+        if (this._readyPromise) await this._readyPromise;
+
+        const now = new Date();
+        let fromDate;
+
+        switch (period) {
+            case 'daily':
+                fromDate = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+                break;
+            case 'weekly': {
+                const day = now.getDay();
+                const diff = day === 0 ? 6 : day - 1; // Pazartesi anahtarından başlat
+                fromDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() - diff, 0, 0, 0, 0);
+                break;
+            }
+            case 'monthly':
+                fromDate = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
+                break;
+            case 'all':
+            default:
+                fromDate = new Date(2000, 0, 1); // 60 günlük RAM havuzundaki herkesi sayar
+                break;
+        }
+
+        // Direkt RAM'deki saf ._orders verisin üzerinden iterasyon yap
+        const count = this._orders.reduce((sum, order) => {
+            if (order.driverId === driverId && order.bookedAt >= fromDate) {
+                return sum + 1;
+            }
+            return sum;
+        }, 0);
+
+        return count;
+    }
+
+    /**
      * Servis durumu — GET /api/admin/leaderboard/status için
      */
     getStatus() {

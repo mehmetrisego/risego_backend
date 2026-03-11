@@ -221,7 +221,7 @@ app.post('/api/drivers/trip-count', requireAuth, async (req, res) => {
         const validPeriods = ['daily', 'weekly', 'monthly', 'all'];
         const selectedPeriod = validPeriods.includes(period) ? period : 'all';
 
-        const tripCount = await yandexFleetApi.getDriverOrderCount(driverId, selectedPeriod);
+        const tripCount = await leaderboardService.getDriverTripCount(driverId, selectedPeriod);
 
         res.json({
             success: true,
