@@ -10,7 +10,6 @@ const rateLimit = require('express-rate-limit');
 const config = require('./config');
 const yandexFleetApi      = require('./services/yandexFleetApi');
 const leaderboardService  = require('./services/leaderboardService');
-const { writeDriversToFile } = require('./services/fileWriter');
 const authService = require('./services/authService');
 
 const path = require('path');

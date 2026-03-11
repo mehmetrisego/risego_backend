@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const yandexFleetApi = require('./yandexFleetApi');
+const leaderboardService = require('./leaderboardService');
 const netgsmService = require('./netgsmService');
 
 class AuthService {
@@ -325,7 +326,7 @@ class AuthService {
         // Bakiye ve yolculuk sayısını çek (yeni sürücü için 0 olacak)
         try {
             const [tripCount, balanceData] = await Promise.all([
-                yandexFleetApi.getDriverOrderCount(driver.id).catch(() => 0),
+                leaderboardService.getDriverTripCount(driver.id, 'all').catch(() => 0),
                 yandexFleetApi.getDriverBalance(driver.id).catch(() => null)
             ]);
             driver.tripCount = tripCount;
@@ -460,7 +461,7 @@ class AuthService {
 
             // Tüm zamanları çekmek çok ağır, UI'de göstermek için 'daily' (günlük) veya dashboard'un kendi isteği tercih edilmeli.
             // driver.tripCount manuel veya ayrı apiden gelsin. Burada sistemi kilitlemiyoruz.
-            driver.tripCount = await yandexFleetApi.getDriverOrderCount(driver.id, 'all').catch(() => 0);
+            driver.tripCount = await leaderboardService.getDriverTripCount(driver.id, 'all').catch(() => 0);
 
             if (balanceData) {
                 const rawBal = parseFloat(balanceData.balance);
@@ -521,7 +522,7 @@ class AuthService {
             try {
                 const [balanceData, tripCount] = await Promise.all([
                     yandexFleetApi.getDriverBalance(driver.id).catch(() => null),
-                    yandexFleetApi.getDriverOrderCount(driver.id, 'all').catch(() => 0)
+                    leaderboardService.getDriverTripCount(driver.id, 'all').catch(() => 0)
                 ]);
 
                 if (balanceData) {
