@@ -29,6 +29,20 @@ function translateColor(color) {
     return COLOR_MAP[color] || color;
 }
 
+/**
+ * ✅ FIX-5: Savunmacı sürücü ID çıkarımı
+ * Yandex Fleet farklı sipariş yapılarında farklı alan adları kullanabiliyor.
+ * Tüm olası alanları sırayla dener, ilk bulunanı döner.
+ */
+function extractDriverId(order) {
+    return (
+        order.driver?.id ||
+        order.driver_profile?.id ||
+        order.driver_profile?.driver_profile_id ||
+        null
+    );
+}
+
 class YandexFleetApi {
     constructor() {
         this.baseUrl = config.yandexFleet.baseUrl;
@@ -308,6 +322,10 @@ class YandexFleetApi {
                 console.log(`[YandexFleetApi] Paralel Parçalayıcı (x${CONCURRENCY}): ${chunks.length} parçaya bölündü.`);
                 let allResults = [];
 
+                // ✅ FIX-1: Başarısız parça sayacı — sessiz kayıp yerine eşik sistemi
+                let failedChunkCount = 0;
+                const MAX_ALLOWED_FAILURES = 1; // 2+ parça başarısız olursa tüm isteği hatayla fırlat
+
                 for (let i = 0; i < chunks.length; i += CONCURRENCY) {
                     const batch = chunks.slice(i, i + CONCURRENCY);
 
@@ -318,8 +336,13 @@ class YandexFleetApi {
                         }
                         return this._fetchSingleCursorRange(endpoint, chunkPayload, pageLimit)
                             .catch(err => {
-                                console.error(`[YandexFleetApi] Parça atlanıyor (${chunk.from.slice(0, 10)})...`);
-                                return [];
+                                failedChunkCount++;
+                                console.error(`[YandexFleetApi] Parça başarısız (${chunk.from.slice(0, 10)} → ${chunk.to.slice(0, 10)}): ${err.message}. Toplam başarısız: ${failedChunkCount}`);
+                                if (failedChunkCount > MAX_ALLOWED_FAILURES) {
+                                    // Kritik kayıp eşiği aşıldı — tüm isteği hatayla sonlandır
+                                    throw new Error(`[YandexFleetApi] Çok fazla parça başarısız oldu (${failedChunkCount}/${chunks.length}). Leaderboard eski cache'den servis edilecek.`);
+                                }
+                                return []; // İlk hatada tolerans ver, devam et
                             });
                     });
 
@@ -924,7 +947,10 @@ class YandexFleetApi {
 
                 // Eğer zaten önbellekte siparişlerimiz varsa, yalnızca arada eksik kalan saatleri API'den çek
                 if (this._last45DaysOrdersCache && this._last45DaysTo) {
-                    fetchFromDate = this._last45DaysTo;
+                    // ✅ FIX-2: Yandex Fleet'in yazma gecikmesini (5-30 sn) tolere etmek için
+                    // delta başlangıcını 2 dakika geri al. Fazladan gelen kayıtlar
+                    // existingOrderIds Set ile zaten eleniyf, mükerrer kayıt riski yok.
+                    fetchFromDate = new Date(this._last45DaysTo.getTime() - 2 * 60 * 1000);
                     isDeltaUpdate = true;
                 }
 
@@ -1006,8 +1032,8 @@ class YandexFleetApi {
 
         // Cache mevcutsa ve istenen baslangıç tarihi cache'in kapsama alanı içindeyse
         if (this._last45DaysOrdersCache && this._last45DaysFrom && this._last45DaysTo) {
-            // İstenen başlangıç çok eskiyse komple API denebilir, ama 45 gün içindeyse optimize et
-            if (fromDate >= this._last45DaysFrom) {
+            // ✅ FIX-3: 1 dakikalık toleransla karşılaştır — milisaniye hassasiyet sorunlarını önler
+            if (fromDate.getTime() >= this._last45DaysFrom.getTime() - 60 * 1000) {
                 console.log(`[YandexFleetApi] Siparişler bellekten(cache) filtreleniyor (${period.label})`);
 
                 // Cache'den dönen kısmı al
@@ -1020,7 +1046,9 @@ class YandexFleetApi {
                 // İstek, cache'in bitiş süresini aşıyorsa (örn: cache saat 18:00'de alındı, sürücü 23:59 istiyor)
                 // Sadece aradaki saat farkını API'den çek
                 if (toDate > this._last45DaysTo) {
-                    apiFetchFrom = this._toLocalISOString(this._last45DaysTo);
+                    // ✅ FIX-2 uyumu: delta başlangıcını 2 dk geri al (yazma gecikmesi toleransı)
+                    const safeFrom = new Date(this._last45DaysTo.getTime() - 2 * 60 * 1000);
+                    apiFetchFrom = this._toLocalISOString(safeFrom);
                     needApiFetch = true;
                     console.log(`[YandexFleetApi] Eksik zaman dilimi API'den tamamlanıyor: ${apiFetchFrom} - ${period.to}`);
                 } else {
@@ -1030,13 +1058,17 @@ class YandexFleetApi {
         }
 
         if (needApiFetch) {
-            console.log(`[YandexFleetApi] Siparişler API'den çekiliyor (${apiFetchFrom} - ${period.to})`);
+            // ✅ FIX-4: API'ye gelecek tarih göndermeyi engelle — Yandex boş/hatalı dönebilir
+            const now = new Date();
+            const effectiveTo = toDate > now ? this._toLocalISOString(now) : period.to;
+
+            console.log(`[YandexFleetApi] Siparişler API'den çekiliyor (${apiFetchFrom} - ${effectiveTo})`);
             const apiOrders = await this._fetchAllPagesWithCursor('/v1/parks/orders/list', {
                 query: {
                     park: {
                         id: this.parkId,
                         order: {
-                            booked_at: { from: apiFetchFrom, to: period.to },
+                            booked_at: { from: apiFetchFrom, to: effectiveTo },
                             statuses: ['complete']
                         }
                     }
@@ -1138,7 +1170,8 @@ class YandexFleetApi {
 
         const totalOrders = allOrders.length;
         allOrders.forEach(order => {
-            const driverId = order.driver?.id || order.driver_profile?.id;
+            // ✅ FIX-5: Savunmacı sürücü ID çıkarımı
+            const driverId = extractDriverId(order);
             if (driverId && driverMap[driverId]) {
                 driverMap[driverId].tripCount++;
             } else if (driverId) {
@@ -1261,7 +1294,8 @@ class YandexFleetApi {
 
         const totalOrders = allOrders.length;
         allOrders.forEach(order => {
-            const driverId = order.driver?.id || order.driver_profile?.id;
+            // ✅ FIX-5: Savunmacı sürücü ID çıkarımı
+            const driverId = extractDriverId(order);
             if (driverId && driverMap[driverId]) {
                 driverMap[driverId].tripCount++;
             } else if (driverId) {
