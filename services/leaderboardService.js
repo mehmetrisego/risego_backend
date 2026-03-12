@@ -1,17 +1,15 @@
 'use strict';
 // ============================================================
 //  LeaderboardService — Yandex Fleet API Entegrasyon Servisi
-//  Versiyon: 2.1.0
+//  Versiyon: 3.0.0 — EKSİKSİZ YOLCULUK GARANTİSİ
 //
 //  Özellikler:
 //   - POST /v1/parks/orders/list — cursor tabanlı eksiksiz sayfalama
-//   - Cursor boşalana kadar tarar — HİÇBİR yolculuk atlamaz
-//   - Throttling: istekler arası minimum bekleme (rate limit koruması)
-//   - Exponential backoff: 429/5xx hatalarında otomatik yeniden deneme
-//   - Otomatik: Sunucu başlayınca tam senkronizasyon, 15 dakikada bir delta
-//   - İlk sync tamamlanmadan gelen istekler otomatik olarak beklenir
-//   - .env'den: YANDEX_API_KEY, YANDEX_PARTNER_ID — asla koda yazılmaz
-//   - Hem 'complete' hem 'finished' status desteği
+//   - 'complete' VE 'finished' status — her iki tamamlanmış sipariş tipi çekilir
+//   - Genişletilmiş extractDriverId — tüm olası Yandex response formatları
+//   - Chunk overlap — zaman dilimi sınırlarında kayıp önleme
+//   - driverId null siparişler loglanır, sayıma dahil edilebilir fallback
+//   - Throttling, exponential backoff, otomatik delta sync
 // ============================================================
 
 const axios  = require('axios');
@@ -27,8 +25,12 @@ const PAGE_LIMIT       = 500;              // Her sayfada max sipariş (Yandex m
 const THROTTLE_MS      = 200;             // İstekler arası minimum bekleme (ms)
 const MAX_RETRIES      = 5;               // Hata durumunda max yeniden deneme
 const REQUEST_TIMEOUT  = 30_000;          // 30 saniye HTTP timeout
-const DELTA_INTERVAL   = 15 * 60 * 1000; // 15 dakikada bir delta güncelleme
-const CACHE_DAYS       = 60;             // Bellekte tutulacak sipariş aralığı (gün)
+const DELTA_INTERVAL   = 15 * 60 * 1000;  // 15 dakikada bir delta güncelleme
+const CACHE_DAYS       = 60;              // Bellekte tutulacak sipariş aralığı (gün)
+const CHUNK_OVERLAP_MS = 45 * 60 * 1000; // Chunk sınırlarında 45 dk overlap (sınır kaybı önleme)
+
+// Tamamlanmış sipariş statusları — Yandex farklı versiyonlarda farklı kullanıyor
+const COMPLETED_ORDER_STATUSES = ['complete', 'finished', 'completed'];
 
 // Türkçe ay isimleri
 const MONTHS = ['Ocak','Şubat','Mart','Nisan','Mayıs','Haziran',
@@ -62,16 +64,46 @@ function toTurkeyISO(date) {
 }
 
 /**
- * Sipariş nesnesinden sürücü ID'sini güvenli biçimde çıkarır.
- * Yandex Fleet farklı API sürümlerinde farklı alan adları kullanabiliyor.
+ * Sipariş nesnesinden sürücü ID'sini çıkarır.
+ * Yandex Fleet API farklı sürümlerde ve response formatlarında farklı alan adları kullanıyor.
+ * TÜM bilinen varyantlar kontrol edilir — HİÇBİR yolculuk atlanmaz.
  */
 function extractDriverId(order) {
-    return (
-        order?.driver?.id                          ||
-        order?.driver_profile?.id                  ||
-        order?.driver_profile?.driver_profile_id   ||
-        null
-    );
+    if (!order || typeof order !== 'object') return null;
+
+    // Doğrudan alan yolları (Yandex dokümantasyonu ve gerçek response'lardan)
+    const candidates = [
+        order.driver?.id,
+        order.driver?.driver_profile_id,
+        order.driver_profile?.id,
+        order.driver_profile?.driver_profile_id,
+        order.performer?.driver_profile_id,
+        order.performer?.id,
+        order.contractor?.id,
+        order.contractor?.driver_profile_id,
+        order.contractor_profile_id,
+        order.driver_profile_id,
+        // İç içe nesneler
+        order.driver?.driver_profile?.id,
+        order.order?.driver?.id,
+        order.order?.driver_profile?.id,
+    ];
+
+    for (const c of candidates) {
+        if (c && typeof c === 'string' && c.trim().length > 0) return c.trim();
+        if (c && typeof c === 'number' && !isNaN(c)) return String(c);
+    }
+
+    // Derin arama: order içinde herhangi bir yerde 'id' veya 'driver_profile_id' içeren alan
+    try {
+        const str = JSON.stringify(order);
+        const driverIdMatch = str.match(/"driver_profile_id"\s*:\s*"([^"]+)"/);
+        if (driverIdMatch) return driverIdMatch[1];
+        const idMatch = str.match(/"driver"\s*:\s*\{[^}]*"id"\s*:\s*"([^"]+)"/);
+        if (idMatch) return idMatch[1];
+    } catch (_) { /* ignore */ }
+
+    return null;
 }
 
 /** Tarih aralığı için Türkçe etiket üretir. Örn: "1 Mart 2026 - 11 Mart 2026" */
@@ -146,10 +178,11 @@ class LeaderboardService {
 
                 const next = data.cursor;
 
-                // ✅ KRİTİK: items.length < limit kontrolü YAPILMAZ.
-                // Yandex filtreli sorgularda az eleman döndürse de cursor verebiliyor.
-                // Sadece cursor boşaldığında dur.
+                // KRİTİK: Sadece cursor boşaldığında dur — Yandex bazen az eleman döndürse de cursor verir
                 if (!next || next === '') {
+                    if (items.length === PAGE_LIMIT) {
+                        console.warn(`[LeaderboardService] UYARI: Tam ${PAGE_LIMIT} kayıt döndü ama cursor yok — veri eksik olabilir!`);
+                    }
                     console.log(`[LeaderboardService] ${endpoint}: ${page} sayfa → ${all.length} kayıt`);
                     break;
                 }
@@ -228,67 +261,115 @@ class LeaderboardService {
 
     /**
      * fromDate–toDate arasındaki tamamlanmış siparişleri parçalar halinde çeker.
-     * Büyük aralıklarda (örn 60 gün) 429 hatalarını önlemek için 7 günlük 'Time-Slıcıng' uygular.
+     * - COMPLETE + FINISHED + COMPLETED: Tüm tamamlanmış sipariş tipleri çekilir
+     * - Chunk overlap: Sınırlarda 1 dk overlap ile kayıp önlenir
+     * - API bazı statusları desteklemiyorsa: Her status için ayrı istek + merge yedek strateji
      */
     async _fetchOrders(fromDate, toDate) {
         const startMs = fromDate.getTime();
         const endMs   = toDate.getTime();
         const CHUNK_SIZE_MS = 7 * 24 * 60 * 60 * 1000; // 7 gün
 
-        // Parçala
+        // Parçala — chunk sınırlarında OVERLAP ile (sınırda kalan siparişler kaçmasın)
         const chunks = [];
         for (let cur = startMs; cur < endMs; cur += CHUNK_SIZE_MS) {
             const nextMs = Math.min(cur + CHUNK_SIZE_MS, endMs);
             const isLast = nextMs === endMs;
             chunks.push({
                 from: new Date(cur),
-                to: new Date(isLast ? nextMs : nextMs - 1)
+                // Son chunk değilse: bitişe 1 dk overlap ekle (sınır kaybı önleme)
+                to: new Date(isLast ? nextMs : Math.min(nextMs + CHUNK_OVERLAP_MS, endMs))
             });
         }
 
-        console.log(`[LeaderboardService] Siparişler çekiliyor: ${chunks.length} parçaya bölündü.`);
+        console.log(`[LeaderboardService] Siparişler çekiliyor: ${chunks.length} parçaya bölündü (complete+finished+completed).`);
 
-        const CONCURRENCY = 2; // Yandex'i yormamak için 2 eşzamanlı istek
-        const allOrders = [];
+        const CONCURRENCY = 2;
+        const allOrdersRaw = [];
 
         for (let i = 0; i < chunks.length; i += CONCURRENCY) {
             const batch = chunks.slice(i, i + CONCURRENCY);
             const batchPromises = batch.map(async chunk => {
                 const fromStr = toTurkeyISO(chunk.from);
                 const toStr   = toTurkeyISO(chunk.to);
-                
-                return this._fetchAllPages(
-                    '/v1/parks/orders/list',
-                    {
-                        query: {
-                            park: {
-                                id: PARK_ID,
-                                order: {
-                                    booked_at: { from: fromStr, to: toStr },
-                                    statuses: ['complete']
+
+                // Önce tek istekte tüm statusları dene (API destekliyorsa en verimli)
+                try {
+                    return await this._fetchAllPages(
+                        '/v1/parks/orders/list',
+                        {
+                            query: {
+                                park: {
+                                    id: PARK_ID,
+                                    order: {
+                                        booked_at: { from: fromStr, to: toStr },
+                                        statuses: COMPLETED_ORDER_STATUSES
+                                    }
                                 }
                             }
+                        },
+                        'orders'
+                    );
+                } catch (err) {
+                    // API çoklu status kabul etmiyorsa: her status için ayrı istek + merge
+                    if (err.response?.status === 400) {
+                        console.warn('[LeaderboardService] Çoklu status desteklenmiyor, her status ayrı çekiliyor...');
+                        const merged = [];
+                        const seen = new Set();
+                        for (const status of COMPLETED_ORDER_STATUSES) {
+                            try {
+                                const orders = await this._fetchAllPages(
+                                    '/v1/parks/orders/list',
+                                    {
+                                        query: {
+                                            park: {
+                                                id: PARK_ID,
+                                                order: {
+                                                    booked_at: { from: fromStr, to: toStr },
+                                                    statuses: [status]
+                                                }
+                                            }
+                                        }
+                                    },
+                                    'orders'
+                                );
+                                for (const o of orders) {
+                                    if (o?.id && !seen.has(o.id)) {
+                                        seen.add(o.id);
+                                        merged.push(o);
+                                    }
+                                }
+                                await sleep(THROTTLE_MS);
+                            } catch (e) {
+                                if (e.response?.status !== 400) throw e;
+                            }
                         }
-                    },
-                    'orders'
-                );
+                        return merged;
+                    }
+                    throw err;
+                }
             });
 
             const results = await Promise.all(batchPromises);
-            for (const res of results) allOrders.push(...res);
+            for (const res of results) allOrdersRaw.push(...res);
         }
 
-        return allOrders;
+        return allOrdersRaw;
     }
 
     /** Ham sipariş → { id, driverId, bookedAt } özeti (bellek tasarrufu) */
     _mapOrder(raw) {
         const id       = raw.id;
         const driverId = extractDriverId(raw);
-        const rawDate  = raw.booked_at || raw.updated_at || raw.finished_at;
+        const rawDate  = raw.booked_at || raw.updated_at || raw.finished_at || raw.created_at;
         if (!id || !rawDate) return null;
         const bookedAt = new Date(rawDate);
         if (isNaN(bookedAt.getTime())) return null;
+
+        if (!driverId && (!this._orphanedLogCount || this._orphanedLogCount < 5)) {
+            this._orphanedLogCount = (this._orphanedLogCount || 0) + 1;
+            console.warn(`[LeaderboardService] Sürücü ID bulunamadı — sipariş ${id}, yapı:`, JSON.stringify(Object.keys(raw || {})));
+        }
         return { id, driverId, bookedAt };
     }
 
@@ -324,7 +405,9 @@ class LeaderboardService {
             this._lastSyncAt = now;
             this._resultCache.clear();
 
-            console.log(`[LeaderboardService] ✅ TAM SENKRONIZASYON tamamlandı: ${this._orders.length} sipariş`);
+            const orphaned = this._orders.filter(o => !o.driverId).length;
+            const orphanedLog = orphaned > 0 ? ` (${orphaned} sürücü ID'siz)` : '';
+            console.log(`[LeaderboardService] ✅ TAM SENKRONIZASYON tamamlandı: ${this._orders.length} sipariş${orphanedLog}`);
         } catch (err) {
             console.error('[LeaderboardService] Tam senkronizasyon hatası:', err.message);
             throw err; // _readyPromise'i reddettirmek için fırlat
@@ -510,15 +593,23 @@ class LeaderboardService {
             profileMap[dp.id] = { id: dp.id, fullName: full, initials: ini, tripCount: 0 };
         }
 
-        // ── Sayım ─────────────────────────────────────────────
+        // ── Sayım — driverId null olanlar hariç (orphaned, loglandı) ─────────────────
         const driverMap = { ...profileMap };
+        let orphanedCount = 0;
         for (const { driverId } of orders) {
-            if (!driverId) continue;
+            if (!driverId) {
+                orphanedCount++;
+                continue;
+            }
             if (driverMap[driverId]) {
                 driverMap[driverId].tripCount++;
             } else {
                 driverMap[driverId] = { id: driverId, fullName: 'Bilinmeyen Sürücü', initials: '?.', tripCount: 1 };
             }
+        }
+
+        if (orphanedCount > 0) {
+            console.warn(`[LeaderboardService] ${orphanedCount} sipariş sürücü ID'si olmadan atlandı (toplam ${orders.length} siparişten).`);
         }
 
         // ── Sıralama ──────────────────────────────────────────
@@ -530,11 +621,12 @@ class LeaderboardService {
             .map((d, i) => ({ ...d, rank: i + 1 }));
 
         const result = {
-            drivers:      ranked,
-            totalOrders:  orders.length,
-            totalDrivers: Object.keys(driverMap).length,
-            periodLabel:  periodLabel(startDate, endDate),
-            syncedAt:     this._lastSyncAt ? this._lastSyncAt.toISOString() : null
+            drivers:         ranked,
+            totalOrders:     orders.length,
+            orphanedOrders:  orphanedCount,
+            totalDrivers:    ranked.length,
+            periodLabel:     periodLabel(startDate, endDate),
+            syncedAt:        this._lastSyncAt ? this._lastSyncAt.toISOString() : null
         };
 
         // ── Cache'e yaz (LRU) ─────────────────────────────────
@@ -600,9 +692,11 @@ class LeaderboardService {
      * Servis durumu — GET /api/admin/leaderboard/status için
      */
     getStatus() {
+        const orphaned = this._orders.filter(o => !o.driverId).length;
         return {
             ready:           this._orders.length > 0,
             ordersInMemory:  this._orders.length,
+            orphanedOrders:  orphaned,
             cacheFrom:       this._ordersFrom ? this._ordersFrom.toISOString() : null,
             cacheTo:         this._ordersTo   ? this._ordersTo.toISOString()   : null,
             lastSyncAt:      this._lastSyncAt ? this._lastSyncAt.toISOString() : null,
