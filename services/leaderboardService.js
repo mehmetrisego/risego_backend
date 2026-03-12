@@ -29,8 +29,8 @@ const DELTA_INTERVAL   = 15 * 60 * 1000;  // 15 dakikada bir delta güncelleme
 const CACHE_DAYS       = 60;              // Bellekte tutulacak sipariş aralığı (gün)
 const CHUNK_OVERLAP_MS = 45 * 60 * 1000; // Chunk sınırlarında 45 dk overlap (sınır kaybı önleme)
 
-// Tamamlanmış sipariş statusları — Yandex farklı versiyonlarda farklı kullanıyor
-const COMPLETED_ORDER_STATUSES = ['complete', 'finished', 'completed'];
+// Tamamlanmış sipariş statusu — Yandex Fleet API sadece 'complete' kabul ediyor
+const COMPLETED_ORDER_STATUSES = ['complete'];
 
 // Türkçe ay isimleri
 const MONTHS = ['Ocak','Şubat','Mart','Nisan','Mayıs','Haziran',
@@ -261,9 +261,8 @@ class LeaderboardService {
 
     /**
      * fromDate–toDate arasındaki tamamlanmış siparişleri parçalar halinde çeker.
-     * - COMPLETE + FINISHED + COMPLETED: Tüm tamamlanmış sipariş tipleri çekilir
-     * - Chunk overlap: Sınırlarda 1 dk overlap ile kayıp önlenir
-     * - API bazı statusları desteklemiyorsa: Her status için ayrı istek + merge yedek strateji
+     * - Status: 'complete' (Yandex Fleet API'nin kabul ettiği tek tamamlanmış status)
+     * - Chunk overlap: Sınırlarda 45 dk overlap ile kayıp önlenir
      */
     async _fetchOrders(fromDate, toDate) {
         const startMs = fromDate.getTime();
@@ -277,12 +276,12 @@ class LeaderboardService {
             const isLast = nextMs === endMs;
             chunks.push({
                 from: new Date(cur),
-                // Son chunk değilse: bitişe 1 dk overlap ekle (sınır kaybı önleme)
+                // Son chunk değilse: bitişe 45 dk overlap ekle (sınır kaybı önleme)
                 to: new Date(isLast ? nextMs : Math.min(nextMs + CHUNK_OVERLAP_MS, endMs))
             });
         }
 
-        console.log(`[LeaderboardService] Siparişler çekiliyor: ${chunks.length} parçaya bölündü (complete+finished+completed).`);
+        console.log(`[LeaderboardService] Siparişler çekiliyor: ${chunks.length} parçaya bölündü (status: complete).`);
 
         const CONCURRENCY = 2;
         const allOrdersRaw = [];
@@ -418,14 +417,14 @@ class LeaderboardService {
 
     /**
      * DELTA SENKRONIZASYON: Son sync'ten bu yana gelen yeni siparişleri ekler.
-     * Yandex'in yazma gecikmesini (30s) absorbe etmek için 3 dk geriden başlar.
+     * 45 dk geriden başlar — Yandex indeksleme gecikmesi veya sınır kayıplarını önler.
      */
     async _deltaSync() {
         if (this._syncLock) return;
         this._syncLock = true;
         try {
             const now       = new Date();
-            const deltaFrom = new Date(this._ordersTo.getTime() - 3 * 60 * 1000); // 3 dk overlap
+            const deltaFrom = new Date(this._ordersTo.getTime() - CHUNK_OVERLAP_MS); // 45 dk overlap
 
             console.log(`[LeaderboardService] ⏳ DELTA: ${deltaFrom.toLocaleTimeString('tr-TR')} → şimdi`);
 
