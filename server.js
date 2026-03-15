@@ -14,6 +14,7 @@ const authService = require('./services/authService');
 
 const path = require('path');
 const app = express();
+const carBrandsModels = require('./data/carBrandsModels');
 
 // Güvenlik Katmanı 1: Helmet - Başlıkları güvenlik altına alır
 app.use(helmet());
@@ -576,16 +577,11 @@ app.post('/api/drivers/register/verify', async (req, res) => {
 
 /**
  * GET /api/drivers/car-brands
- * Yeni araç kaydı için marka listesi
+ * Yeni araç kaydı için marka ve model listesi (data/carBrandsModels.js)
  */
 app.get('/api/drivers/car-brands', (req, res) => {
-    const brands = [
-        'Toyota', 'Honda', 'Ford', 'Volkswagen', 'Renault', 'Fiat', 'Peugeot',
-        'BMW', 'Mercedes-Benz', 'Audi', 'Hyundai', 'Kia', 'Nissan', 'Mazda',
-        'Opel', 'Skoda', 'Dacia', 'Chevrolet', 'Citroën', 'Seat', 'Volvo',
-        'Togg', 'Diğer'
-    ];
-    res.json({ success: true, brands });
+    const brands = carBrandsModels.map(b => b.brand);
+    res.json({ success: true, brands, brandsWithModels: carBrandsModels });
 });
 
 /**
