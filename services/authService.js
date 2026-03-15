@@ -2,6 +2,9 @@ const crypto = require('crypto');
 const yandexFleetApi = require('./yandexFleetApi');
 const leaderboardService = require('./leaderboardService');
 const netgsmService = require('./netgsmService');
+const dbSessions = require('../db/sessions');
+const dbAdminSessions = require('../db/adminSessions');
+const db = require('../db');
 
 class AuthService {
     constructor() {
@@ -42,19 +45,24 @@ class AuthService {
      * RAM şişmesini önleyen asenkron temizleyici görev
      */
     _startGarbageCollector() {
-        setInterval(() => {
+        setInterval(async () => {
             const now = Date.now();
-            // Süresi dolan oturumları temizle
+            // Süresi dolan oturumları temizle (bellek)
             for (const [token, session] of this.sessions.entries()) {
                 if (now - session.createdAt > this.SESSION_TTL) {
                     this.sessions.delete(token);
                 }
             }
-            // Süresi dolan admin oturumları temizle
+            // Süresi dolan admin oturumları temizle (bellek)
             for (const [token, session] of this.adminSessions.entries()) {
                 if (now - session.createdAt > this.SESSION_TTL) {
                     this.adminSessions.delete(token);
                 }
+            }
+            // DB'deki süresi dolan oturumları temizle
+            if (db.isConfigured()) {
+                dbSessions.deleteExpiredSessions().catch(e => console.error('[AuthService] Expired sessions cleanup:', e.message));
+                dbAdminSessions.deleteExpiredAdminSessions().catch(e => console.error('[AuthService] Expired admin sessions cleanup:', e.message));
             }
             // Süresi dolan (veya patlamış) OTP verilerini temizle
             for (const [phone, otpData] of this.otpStore.entries()) {
@@ -339,11 +347,15 @@ class AuthService {
         }
 
         const sessionToken = crypto.randomBytes(32).toString('hex');
+        const expiresAt = Date.now() + this.SESSION_TTL;
         this.sessions.set(sessionToken, {
             phone: normalizedPhone,
             driverId: driver.id,
             createdAt: Date.now()
         });
+        if (db.isConfigured()) {
+            await dbSessions.createSession(sessionToken, driver.id, normalizedPhone, registrationData.city || '', expiresAt);
+        }
 
         return { success: true, driver, sessionToken };
     }
@@ -384,7 +396,8 @@ class AuthService {
             code: otpCode,
             expiresAt: expiresAt,
             attempts: 0,
-            driver: driver
+            driver: driver,
+            city: city || ''
         });
 
         // 3. NetGSM ile OTP SMS gönder
@@ -473,11 +486,15 @@ class AuthService {
 
         // Session token oluştur
         const sessionToken = crypto.randomBytes(32).toString('hex');
+        const expiresAt = Date.now() + this.SESSION_TTL;
         this.sessions.set(sessionToken, {
             phone: normalizedPhone,
             driverId: driver.id,
             createdAt: Date.now()
         });
+        if (db.isConfigured()) {
+            await dbSessions.createSession(sessionToken, driver.id, normalizedPhone, otpData.city || '', expiresAt);
+        }
 
         return {
             success: true,
@@ -493,11 +510,22 @@ class AuthService {
      * Her sayfa yenilemesinde 2 API isteği atılmasını önler
      */
     async validateSession(token) {
-        const session = this.sessions.get(token);
+        let session = this.sessions.get(token);
+        if (db.isConfigured()) {
+            const dbSession = await dbSessions.getSession(token);
+            if (dbSession) {
+                session = {
+                    phone: dbSession.phone,
+                    driverId: dbSession.driver_id,
+                    createdAt: new Date(dbSession.created_at).getTime()
+                };
+            }
+        }
         if (!session) return null;
 
         if (Date.now() - session.createdAt > this.SESSION_TTL) {
             this.sessions.delete(token);
+            if (db.isConfigured()) await dbSessions.deleteSession(token);
             return null;
         }
 
@@ -506,6 +534,7 @@ class AuthService {
         const driver = this.driverCache.get(session.phone);
         if (!driver) {
             this.sessions.delete(token);
+            if (db.isConfigured()) await dbSessions.deleteSession(token);
             return null;
         }
 
@@ -549,6 +578,7 @@ class AuthService {
      * Session'ı sonlandırır (çıkış)
      */
     destroySession(token) {
+        if (db.isConfigured()) dbSessions.deleteSession(token).catch(err => console.error('[AuthService] Session silme hatası:', err.message));
         return this.sessions.delete(token);
     }
 
@@ -692,10 +722,14 @@ class AuthService {
         console.log(`[Admin OTP] Başarılı giriş: ${normalizedPhone}`);
 
         const adminSessionToken = crypto.randomBytes(32).toString('hex');
+        const expiresAt = Date.now() + this.SESSION_TTL;
         this.adminSessions.set(adminSessionToken, {
             phone: normalizedPhone,
             createdAt: Date.now()
         });
+        if (db.isConfigured()) {
+            await dbAdminSessions.createAdminSession(adminSessionToken, normalizedPhone, expiresAt);
+        }
 
         return {
             success: true,
@@ -707,24 +741,35 @@ class AuthService {
     /**
      * Admin session doğrulama
      */
-    validateAdminSession(token) {
-        const session = this.adminSessions.get(token);
+    async validateAdminSession(token) {
+        let session = this.adminSessions.get(token);
+        if (db.isConfigured()) {
+            const dbSession = await dbAdminSessions.getAdminSession(token);
+            if (dbSession) {
+                session = { phone: dbSession.phone, createdAt: new Date(dbSession.created_at).getTime() };
+            }
+        }
         if (!session) return null;
         if (Date.now() - session.createdAt > this.SESSION_TTL) {
             this.adminSessions.delete(token);
+            if (db.isConfigured()) await dbAdminSessions.deleteAdminSession(token);
             return null;
         }
         return session;
     }
 
     destroyAdminSession(token) {
+        if (db.isConfigured()) dbAdminSessions.deleteAdminSession(token).catch(err => console.error('[AuthService] Admin session silme hatası:', err.message));
         return this.adminSessions.delete(token);
     }
 
     /**
      * Aktif sürücü oturumu sayısını döndürür
      */
-    getActiveDriverSessionCount() {
+    async getActiveDriverSessionCount() {
+        if (db.isConfigured()) {
+            return await dbSessions.getActiveSessionCount();
+        }
         return this.sessions.size;
     }
 }

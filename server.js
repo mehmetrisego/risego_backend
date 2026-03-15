@@ -11,9 +11,19 @@ const config = require('./config');
 const yandexFleetApi      = require('./services/yandexFleetApi');
 const leaderboardService  = require('./services/leaderboardService');
 const authService = require('./services/authService');
+const dbCampaigns = require('./db/campaigns');
+const db = require('./db');
+const { runMigrations } = require('./db/runMigrations');
 
 const path = require('path');
+const fs = require('fs').promises;
 const app = express();
+
+async function writeDriversToFile(driversInfo) {
+    const filePath = path.join(process.cwd(), 'sürücüler.txt');
+    await fs.writeFile(filePath, JSON.stringify(driversInfo, null, 2), 'utf8');
+    return filePath;
+}
 const carBrandsModels = require('./data/carBrandsModels');
 
 // Güvenlik Katmanı 1: Helmet - Başlıkları güvenlik altına alır
@@ -69,14 +79,9 @@ const customLeaderboardLimiter = rateLimit({
 });
 
 // ============================================
-// Kampanya State (in-memory - sunucu yeniden başlatılana kadar kalır)
-// Prodüksiyon ortamında veritabanına taşınmalı
+// Kampanya: DB varsa PostgreSQL, yoksa in-memory fallback
 // ============================================
-let activeCampaign = {
-    text: '',       // Kampanya metni
-    active: false,  // Kampanya aktif mi?
-    updatedAt: null // Son güncelleme tarihi
-};
+let activeCampaignFallback = { text: '', active: false, updatedAt: null };
 
 // ============================================
 // Auth Middleware - Sürücü endpoint'leri için oturum doğrulama
@@ -100,17 +105,22 @@ async function requireAuth(req, res, next) {
 }
 
 // Admin panel oturum doğrulama
-function requireAdminAuth(req, res, next) {
+async function requireAdminAuth(req, res, next) {
     const token = req.headers['x-admin-token'];
     if (!token) {
         return res.status(401).json({ success: false, message: 'Oturum bulunamadı. Lütfen giriş yapın.' });
     }
-    const session = authService.validateAdminSession(token);
-    if (!session) {
-        return res.status(401).json({ success: false, message: 'Oturum geçersiz veya süresi dolmuş. Lütfen tekrar giriş yapın.' });
+    try {
+        const session = await authService.validateAdminSession(token);
+        if (!session) {
+            return res.status(401).json({ success: false, message: 'Oturum geçersiz veya süresi dolmuş. Lütfen tekrar giriş yapın.' });
+        }
+        req.adminSession = session;
+        next();
+    } catch (error) {
+        console.error('[Server] Admin auth middleware hatası:', error.message);
+        res.status(401).json({ success: false, message: 'Oturum doğrulanamadı.' });
     }
-    req.adminSession = session;
-    next();
 }
 
 // ============================================
@@ -744,17 +754,22 @@ app.post('/api/admin/auth/verify-otp', async (req, res) => {
  * GET /api/admin/auth/session
  * Admin oturum kontrolü
  */
-app.get('/api/admin/auth/session', (req, res) => {
-    const token = req.headers['x-admin-token'];
-    if (!token) {
-        return res.json({ success: false, message: 'Oturum bulunamadı.' });
+app.get('/api/admin/auth/session', async (req, res) => {
+    try {
+        const token = req.headers['x-admin-token'];
+        if (!token) {
+            return res.json({ success: false, message: 'Oturum bulunamadı.' });
+        }
+        const session = await authService.validateAdminSession(token);
+        if (!session) {
+            return res.json({ success: false, message: 'Oturum geçersiz.' });
+        }
+        const activeDriverSessions = await authService.getActiveDriverSessionCount();
+        res.json({ success: true, activeDriverSessions });
+    } catch (error) {
+        console.error('[Server] Admin session hatası:', error.message);
+        res.json({ success: false, message: 'Oturum doğrulanamadı.' });
     }
-    const session = authService.validateAdminSession(token);
-    if (!session) {
-        return res.json({ success: false, message: 'Oturum geçersiz.' });
-    }
-    const activeDriverSessions = authService.getActiveDriverSessionCount();
-    res.json({ success: true, activeDriverSessions });
 });
 
 /**
@@ -775,7 +790,7 @@ app.post('/api/admin/auth/logout', (req, res) => {
  * POST /api/admin/campaign
  * Admin panelinden kampanya metni kaydetme
  */
-app.post('/api/admin/campaign', requireAdminAuth, (req, res) => {
+app.post('/api/admin/campaign', requireAdminAuth, async (req, res) => {
     try {
         const { text } = req.body;
 
@@ -786,18 +801,22 @@ app.post('/api/admin/campaign', requireAdminAuth, (req, res) => {
             });
         }
 
-        activeCampaign = {
-            text: text.trim(),
-            active: true,
-            updatedAt: new Date().toISOString()
-        };
-
-        console.log(`[Server] Kampanya güncellendi: "${activeCampaign.text}"`);
-
+        const trimmed = text.trim();
+        if (db.isConfigured()) {
+            const campaign = await dbCampaigns.upsertCampaign(trimmed);
+            console.log(`[Server] Kampanya DB'ye kaydedildi: "${trimmed}"`);
+            return res.json({
+                success: true,
+                message: 'Kampanya başarıyla kaydedildi.',
+                campaign
+            });
+        }
+        activeCampaignFallback = { text: trimmed, active: true, updatedAt: new Date().toISOString() };
+        console.log(`[Server] Kampanya güncellendi (bellek): "${trimmed}"`);
         res.json({
             success: true,
             message: 'Kampanya başarıyla kaydedildi.',
-            campaign: activeCampaign
+            campaign: activeCampaignFallback
         });
     } catch (error) {
         console.error('[Server] Kampanya kaydetme hatası:', error.message);
@@ -812,41 +831,46 @@ app.post('/api/admin/campaign', requireAdminAuth, (req, res) => {
  * GET /api/admin/campaign
  * Admin panelinden aktif kampanyayı okuma
  */
-app.get('/api/admin/campaign', requireAdminAuth, (req, res) => {
-    res.json({
-        success: true,
-        campaign: activeCampaign
-    });
+app.get('/api/admin/campaign', requireAdminAuth, async (req, res) => {
+    try {
+        const campaign = db.isConfigured() ? await dbCampaigns.getCampaign() : activeCampaignFallback;
+        res.json({ success: true, campaign });
+    } catch (error) {
+        console.error('[Server] Kampanya okuma hatası:', error.message);
+        res.json({ success: true, campaign: activeCampaignFallback });
+    }
 });
 
 /**
  * DELETE /api/admin/campaign
  * Admin panelinden kampanyayı silme
  */
-app.delete('/api/admin/campaign', requireAdminAuth, (req, res) => {
-    activeCampaign = {
-        text: '',
-        active: false,
-        updatedAt: new Date().toISOString()
-    };
-
-    console.log('[Server] Kampanya silindi.');
-
-    res.json({
-        success: true,
-        message: 'Kampanya başarıyla silindi.'
-    });
+app.delete('/api/admin/campaign', requireAdminAuth, async (req, res) => {
+    try {
+        if (db.isConfigured()) {
+            await dbCampaigns.deactivateCampaign();
+        }
+        activeCampaignFallback = { text: '', active: false, updatedAt: new Date().toISOString() };
+        console.log('[Server] Kampanya silindi.');
+        res.json({ success: true, message: 'Kampanya başarıyla silindi.' });
+    } catch (error) {
+        console.error('[Server] Kampanya silme hatası:', error.message);
+        res.status(500).json({ success: false, message: 'Kampanya silinirken hata oluştu.' });
+    }
 });
 
 /**
  * GET /api/campaign
  * Sürücü frontend'i için aktif kampanyayı okuma (public endpoint)
  */
-app.get('/api/campaign', (req, res) => {
-    res.json({
-        success: true,
-        campaign: activeCampaign
-    });
+app.get('/api/campaign', async (req, res) => {
+    try {
+        const campaign = db.isConfigured() ? await dbCampaigns.getCampaign() : activeCampaignFallback;
+        res.json({ success: true, campaign });
+    } catch (error) {
+        console.error('[Server] Kampanya okuma hatası:', error.message);
+        res.json({ success: true, campaign: activeCampaignFallback });
+    }
 });
 
 /**
@@ -945,28 +969,42 @@ app.get('/', (req, res) => {
     });
 });
 
-// Sunucuyu başlat
+// Sunucuyu başlat (DB migration sonrası)
 const PORT = config.server.port;
-app.listen(PORT, () => {
-    console.log('='.repeat(50));
-    console.log(`  RiseGo Backend - Yandex Fleet Sürücü Sistemi`);
-    console.log(`  Sunucu http://localhost:${PORT} adresinde çalışıyor`);
-    console.log(`  Uygulama: http://localhost:${PORT} adresinden açın`);
-    console.log('='.repeat(50));
-    console.log('\nKullanılabilir endpointler:');
-    console.log(`  GET  http://localhost:${PORT}/                    - API bilgisi`);
-    console.log(`  GET  http://localhost:${PORT}/api/health          - Sunucu durumu`);
-    console.log(`  POST http://localhost:${PORT}/api/auth/login      - Giriş (telefon + şehir)`);
-    console.log(`  POST http://localhost:${PORT}/api/auth/verify-otp - OTP doğrulama`);
-    console.log(`  POST http://localhost:${PORT}/api/drivers/trip-count - Dönem bazlı yolculuk sayısı`);
-    console.log(`  GET  http://localhost:${PORT}/api/drivers         - Detaylı sürücü bilgileri`);
-    console.log(`  GET  http://localhost:${PORT}/api/drivers/fetch   - Hızlı sürücü profilleri`);
-    console.log('');
 
-    // Leaderboard servisini başlat: ilk tam senkronizasyon + 1 saatlik cron
-    leaderboardService.startCron().catch(err => {
-        console.error('[Server] LeaderboardService başlatma hatası:', err.message);
+async function startServer() {
+    if (db.isConfigured()) {
+        const connected = await db.testConnection();
+        if (connected) {
+            await runMigrations();
+        }
+    }
+
+    app.listen(PORT, () => {
+        console.log('='.repeat(50));
+        console.log(`  RiseGo Backend - Yandex Fleet Sürücü Sistemi`);
+        console.log(`  Sunucu http://localhost:${PORT} adresinde çalışıyor`);
+        console.log(`  Veritabanı: ${db.isConfigured() ? 'PostgreSQL (aktif)' : 'Bellek (fallback)'}`);
+        console.log('='.repeat(50));
+        console.log('\nKullanılabilir endpointler:');
+        console.log(`  GET  http://localhost:${PORT}/                    - API bilgisi`);
+        console.log(`  GET  http://localhost:${PORT}/api/health          - Sunucu durumu`);
+        console.log(`  POST http://localhost:${PORT}/api/auth/login      - Giriş (telefon + şehir)`);
+        console.log(`  POST http://localhost:${PORT}/api/auth/verify-otp - OTP doğrulama`);
+        console.log(`  POST http://localhost:${PORT}/api/drivers/trip-count - Dönem bazlı yolculuk sayısı`);
+        console.log(`  GET  http://localhost:${PORT}/api/drivers         - Detaylı sürücü bilgileri`);
+        console.log(`  GET  http://localhost:${PORT}/api/drivers/fetch   - Hızlı sürücü profilleri`);
+        console.log('');
+
+        leaderboardService.startCron().catch(err => {
+            console.error('[Server] LeaderboardService başlatma hatası:', err.message);
+        });
     });
+}
+
+startServer().catch(err => {
+    console.error('[Server] Başlatma hatası:', err);
+    process.exit(1);
 });
 
 
