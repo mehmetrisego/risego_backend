@@ -14,6 +14,8 @@
 
 const axios  = require('axios');
 const config = require('../config');
+const db = require('../db');
+const dbOrders = require('../db/orders');
 
 // ─── Sabitler ──────────────────────────────────────────────────────────
 const BASE_URL     = config.yandexFleet.baseUrl;    // .env → YANDEX_BASE_URL
@@ -378,7 +380,7 @@ class LeaderboardService {
 
     /**
      * TAM SENKRONIZASYON: Son CACHE_DAYS günlük tüm siparişleri çeker.
-     * Sunucu başlayışında çalışır; sonuç ready olana kadar getLeaderboard() bekler.
+     * DB varsa PostgreSQL'e yazar, yoksa bellekte tutar.
      */
     async _fullSync() {
         if (this._syncLock) {
@@ -397,19 +399,26 @@ class LeaderboardService {
 
             const map = new Map();
             mapped.forEach(o => map.set(o.id, o));
+            const uniqueOrders = Array.from(map.values());
 
-            this._orders     = Array.from(map.values());
+            if (db.isConfigured()) {
+                const count = await dbOrders.upsertOrders(uniqueOrders);
+                await dbOrders.pruneOldOrders(fromDate);
+                console.log(`[LeaderboardService] ✅ TAM SENKRONIZASYON tamamlandı: ${count} sipariş DB'ye yazıldı`);
+            } else {
+                this._orders = uniqueOrders;
+                const orphaned = this._orders.filter(o => !o.driverId).length;
+                const orphanedLog = orphaned > 0 ? ` (${orphaned} sürücü ID'siz)` : '';
+                console.log(`[LeaderboardService] ✅ TAM SENKRONIZASYON tamamlandı: ${this._orders.length} sipariş${orphanedLog} (bellek)`);
+            }
+
             this._ordersFrom = fromDate;
             this._ordersTo   = now;
             this._lastSyncAt = now;
             this._resultCache.clear();
-
-            const orphaned = this._orders.filter(o => !o.driverId).length;
-            const orphanedLog = orphaned > 0 ? ` (${orphaned} sürücü ID'siz)` : '';
-            console.log(`[LeaderboardService] ✅ TAM SENKRONIZASYON tamamlandı: ${this._orders.length} sipariş${orphanedLog}`);
         } catch (err) {
             console.error('[LeaderboardService] Tam senkronizasyon hatası:', err.message);
-            throw err; // _readyPromise'i reddettirmek için fırlat
+            throw err;
         } finally {
             this._syncLock = false;
         }
@@ -423,8 +432,19 @@ class LeaderboardService {
         if (this._syncLock) return;
         this._syncLock = true;
         try {
-            const now       = new Date();
-            const deltaFrom = new Date(this._ordersTo.getTime() - CHUNK_OVERLAP_MS); // 45 dk overlap
+            const now = new Date();
+            let deltaFrom;
+
+            if (db.isConfigured()) {
+                const lastBooked = await dbOrders.getLatestBookedAt();
+                deltaFrom = lastBooked
+                    ? new Date(lastBooked.getTime() - CHUNK_OVERLAP_MS)
+                    : new Date(now.getFullYear(), now.getMonth(), now.getDate() - CACHE_DAYS, 0, 0, 0, 0);
+            } else {
+                deltaFrom = this._ordersTo
+                    ? new Date(this._ordersTo.getTime() - CHUNK_OVERLAP_MS)
+                    : new Date(now.getFullYear(), now.getMonth(), now.getDate() - CACHE_DAYS, 0, 0, 0, 0);
+            }
 
             console.log(`[LeaderboardService] ⏳ DELTA: ${deltaFrom.toLocaleTimeString('tr-TR')} → şimdi`);
 
@@ -432,26 +452,32 @@ class LeaderboardService {
             const mapped = raw.map(o => this._mapOrder(o)).filter(Boolean);
 
             if (mapped.length > 0) {
-                const map = new Map(this._orders.map(o => [o.id, o]));
-                let added = 0;
-                for (const o of mapped) {
-                    if (!map.has(o.id)) { map.set(o.id, o); added++; }
+                if (db.isConfigured()) {
+                    const count = await dbOrders.upsertOrders(mapped);
+                    const cutoff = new Date(now.getFullYear(), now.getMonth(), now.getDate() - CACHE_DAYS, 0, 0, 0, 0);
+                    const pruned = await dbOrders.pruneOldOrders(cutoff);
+                    const total = await dbOrders.getOrderCount();
+                    console.log(`[LeaderboardService] ✅ Delta: +${count} yeni, -${pruned} budandı. Toplam DB: ${total}`);
+                } else {
+                    const map = new Map(this._orders.map(o => [o.id, o]));
+                    let added = 0;
+                    for (const o of mapped) {
+                        if (!map.has(o.id)) { map.set(o.id, o); added++; }
+                    }
+                    const cutoff = new Date(now.getFullYear(), now.getMonth(), now.getDate() - CACHE_DAYS, 0, 0, 0, 0);
+                    const before = map.size;
+                    for (const [id, o] of map) { if (o.bookedAt < cutoff) map.delete(id); }
+                    const pruned = before - map.size;
+                    this._orders = Array.from(map.values());
+                    console.log(`[LeaderboardService] ✅ Delta: +${added} yeni, -${pruned} budandı. Toplam: ${this._orders.length}`);
                 }
-                // Eski kayıtları belekten buda
-                const cutoff = new Date(now.getFullYear(), now.getMonth(), now.getDate() - CACHE_DAYS, 0, 0, 0, 0);
-                const before = map.size;
-                for (const [id, o] of map) { if (o.bookedAt < cutoff) map.delete(id); }
-                const pruned = before - map.size;
-
-                this._orders = Array.from(map.values());
-                console.log(`[LeaderboardService] ✅ Delta: +${added} yeni, -${pruned} budandı. Toplam: ${this._orders.length}`);
             } else {
                 console.log('[LeaderboardService] Delta: Yeni sipariş yok.');
             }
 
             this._ordersTo   = now;
             this._lastSyncAt = now;
-            this._resultCache.clear(); // son veriler için cache temizle
+            this._resultCache.clear();
         } catch (err) {
             console.error('[LeaderboardService] Delta senkronizasyon hatası:', err.message);
         } finally {
@@ -475,8 +501,18 @@ class LeaderboardService {
     async startCron() {
         console.log('[LeaderboardService] Cron başlatılıyor...');
 
-        // İlk tam senkronizasyon — promise'i kaydet, getLeaderboard() bunu bekleyecek
-        this._readyPromise = this._fullSync();
+        // İlk senkronizasyon: DB doluysa delta, boşsa full sync
+        const initSync = async () => {
+            if (db.isConfigured() && (await dbOrders.getOrderCount()) > 0) {
+                this._ordersFrom = new Date(Date.now() - CACHE_DAYS * 24 * 60 * 60 * 1000);
+                this._ordersTo = await dbOrders.getLatestBookedAt() || new Date();
+                this._lastSyncAt = new Date();
+                await this._deltaSync(); // Sadece yeni siparişleri çek
+            } else {
+                await this._fullSync();
+            }
+        };
+        this._readyPromise = initSync();
 
         // Hata olsa bile sunucuyu durdurmayalım
         this._readyPromise.catch(err => {
@@ -492,7 +528,10 @@ class LeaderboardService {
         this._cronHandle = setInterval(async () => {
             console.log('[LeaderboardService] ⏰ Periyodik senkronizasyon...');
             try {
-                if (this._orders.length === 0 || !this._ordersTo) {
+                const needsFullSync = db.isConfigured()
+                    ? (await dbOrders.getOrderCount()) === 0
+                    : (this._orders.length === 0 || !this._ordersTo);
+                if (needsFullSync) {
                     await this._fullSync();
                 } else {
                     await this._deltaSync();
@@ -560,21 +599,43 @@ class LeaderboardService {
         }
 
         // ── Veri kaynağı seçimi ───────────────────────────────
-        let orders;
-        const cacheCoversRequest =
-            this._orders.length > 0 &&
-            this._ordersFrom     &&
-            this._ordersTo       &&
-            startDate >= new Date(this._ordersFrom.getTime() - 60_000); // 1 dk tolerans
+        let tripCountsByDriver;
+        let totalOrders;
+        let orphanedCount;
 
-        if (cacheCoversRequest) {
-            orders = this._orders.filter(o => o.bookedAt >= startDate && o.bookedAt <= endDate);
-            console.log(`[LeaderboardService] Cache'den filtrelendi: ${orders.length} sipariş (${fromStr}→${toStr})`);
+        if (db.isConfigured()) {
+            const [counts, stats] = await Promise.all([
+                dbOrders.getTripCountsByDriver(startDate, endDate),
+                dbOrders.getOrderStatsInRange(startDate, endDate)
+            ]);
+            tripCountsByDriver = counts;
+            totalOrders = stats.total;
+            orphanedCount = stats.orphaned;
+            console.log(`[LeaderboardService] DB'den: ${totalOrders} sipariş (${fromStr}→${toStr})`);
         } else {
-            // Cache yoksa (örn. ilk sync başarısız) doğrudan API'den çek
-            console.log('[LeaderboardService] Cache yetersiz, API\'den çekiliyor...');
-            const raw = await this._fetchOrders(startDate, endDate);
-            orders = raw.map(o => this._mapOrder(o)).filter(Boolean);
+            const cacheCoversRequest =
+                this._orders.length > 0 &&
+                this._ordersFrom &&
+                this._ordersTo &&
+                startDate >= new Date(this._ordersFrom.getTime() - 60_000);
+
+            let orders;
+            if (cacheCoversRequest) {
+                orders = this._orders.filter(o => o.bookedAt >= startDate && o.bookedAt <= endDate);
+                console.log(`[LeaderboardService] Cache'den filtrelendi: ${orders.length} sipariş (${fromStr}→${toStr})`);
+            } else {
+                console.log('[LeaderboardService] Cache yetersiz, API\'den çekiliyor...');
+                const raw = await this._fetchOrders(startDate, endDate);
+                orders = raw.map(o => this._mapOrder(o)).filter(Boolean);
+            }
+            totalOrders = orders.length;
+            orphanedCount = orders.filter(o => !o.driverId).length;
+            const driverMap = {};
+            for (const { driverId } of orders) {
+                if (!driverId) continue;
+                driverMap[driverId] = (driverMap[driverId] || 0) + 1;
+            }
+            tripCountsByDriver = Object.entries(driverMap).map(([driverId, tripCount]) => ({ driverId, tripCount }));
         }
 
         // ── Profil haritası ───────────────────────────────────
@@ -592,23 +653,18 @@ class LeaderboardService {
             profileMap[dp.id] = { id: dp.id, fullName: full, initials: ini, tripCount: 0 };
         }
 
-        // ── Sayım — driverId null olanlar hariç (orphaned, loglandı) ─────────────────
+        // ── Sayım — tripCountsByDriver ile driverMap oluştur ─────────────────
         const driverMap = { ...profileMap };
-        let orphanedCount = 0;
-        for (const { driverId } of orders) {
-            if (!driverId) {
-                orphanedCount++;
-                continue;
-            }
+        for (const { driverId, tripCount } of tripCountsByDriver) {
             if (driverMap[driverId]) {
-                driverMap[driverId].tripCount++;
+                driverMap[driverId].tripCount = tripCount;
             } else {
-                driverMap[driverId] = { id: driverId, fullName: 'Bilinmeyen Sürücü', initials: '?.', tripCount: 1 };
+                driverMap[driverId] = { id: driverId, fullName: 'Bilinmeyen Sürücü', initials: '?.', tripCount };
             }
         }
 
         if (orphanedCount > 0) {
-            console.warn(`[LeaderboardService] ${orphanedCount} sipariş sürücü ID'si olmadan atlandı (toplam ${orders.length} siparişten).`);
+            console.warn(`[LeaderboardService] ${orphanedCount} sipariş sürücü ID'si olmadan atlandı (toplam ${totalOrders} siparişten).`);
         }
 
         // ── Sıralama ──────────────────────────────────────────
@@ -621,7 +677,7 @@ class LeaderboardService {
 
         const result = {
             drivers:         ranked,
-            totalOrders:     orders.length,
+            totalOrders:     totalOrders,
             orphanedOrders:  orphanedCount,
             totalDrivers:    ranked.length,
             periodLabel:     periodLabel(startDate, endDate),
@@ -651,7 +707,6 @@ class LeaderboardService {
      * @returns {Promise<number>}
      */
     async getDriverTripCount(driverId, period = 'daily') {
-        // Öncelikli olarak tüm RAM senkronizasyonunun bittiğinden emin ol:
         if (this._readyPromise) await this._readyPromise;
 
         const now = new Date();
@@ -663,7 +718,7 @@ class LeaderboardService {
                 break;
             case 'weekly': {
                 const day = now.getDay();
-                const diff = day === 0 ? 6 : day - 1; // Pazartesi anahtarından başlat
+                const diff = day === 0 ? 6 : day - 1;
                 fromDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() - diff, 0, 0, 0, 0);
                 break;
             }
@@ -672,29 +727,30 @@ class LeaderboardService {
                 break;
             case 'all':
             default:
-                fromDate = new Date(2000, 0, 1); // 60 günlük RAM havuzundaki herkesi sayar
+                fromDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() - CACHE_DAYS, 0, 0, 0, 0);
                 break;
         }
 
-        // Direkt RAM'deki saf ._orders verisin üzerinden iterasyon yap
-        const count = this._orders.reduce((sum, order) => {
-            if (order.driverId === driverId && order.bookedAt >= fromDate) {
-                return sum + 1;
-            }
+        if (db.isConfigured()) {
+            return await dbOrders.getDriverTripCountInRange(driverId, fromDate);
+        }
+
+        return this._orders.reduce((sum, order) => {
+            if (order.driverId === driverId && order.bookedAt >= fromDate) return sum + 1;
             return sum;
         }, 0);
-
-        return count;
     }
 
     /**
      * Servis durumu — GET /api/admin/leaderboard/status için
      */
-    getStatus() {
-        const orphaned = this._orders.filter(o => !o.driverId).length;
+    async getStatus() {
+        const ordersCount = db.isConfigured() ? await dbOrders.getOrderCount() : this._orders.length;
+        const orphaned = db.isConfigured() ? 0 : this._orders.filter(o => !o.driverId).length;
         return {
-            ready:           this._orders.length > 0,
+            ready:           ordersCount > 0,
             ordersInMemory:  this._orders.length,
+            ordersInDb:      db.isConfigured() ? ordersCount : null,
             orphanedOrders:  orphaned,
             cacheFrom:       this._ordersFrom ? this._ordersFrom.toISOString() : null,
             cacheTo:         this._ordersTo   ? this._ordersTo.toISOString()   : null,
@@ -717,7 +773,10 @@ class LeaderboardService {
         this._resultCache.clear();
         this._profilesCache       = null;
         this._profilesCacheExpiry = 0;
-        this._readyPromise        = this._fullSync();
+        if (db.isConfigured()) {
+            await dbOrders.clearAllOrders();
+        }
+        this._readyPromise = this._fullSync();
         await this._readyPromise;
     }
 }

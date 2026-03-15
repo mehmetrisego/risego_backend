@@ -701,13 +701,23 @@ app.get('/api/drivers/fetch', async (req, res) => {
  * GET /api/health
  * Sunucu durumunu kontrol eder
  */
-app.get('/api/health', (req, res) => {
-    res.json({
-        status:    'ok',
-        service:   'RiseGo Backend - Yandex Fleet Sürücü Bilgi Sistemi',
-        timestamp: new Date().toISOString(),
-        leaderboard: leaderboardService.getStatus()
-    });
+app.get('/api/health', async (req, res) => {
+    try {
+        const leaderboardStatus = await leaderboardService.getStatus();
+        res.json({
+            status:    'ok',
+            service:   'RiseGo Backend - Yandex Fleet Sürücü Bilgi Sistemi',
+            timestamp: new Date().toISOString(),
+            leaderboard: leaderboardStatus
+        });
+    } catch (err) {
+        res.json({
+            status:    'ok',
+            service:   'RiseGo Backend - Yandex Fleet Sürücü Bilgi Sistemi',
+            timestamp: new Date().toISOString(),
+            leaderboard: { ready: false, error: err.message }
+        });
+    }
 });
 
 // ============================================
@@ -947,8 +957,13 @@ app.post('/api/admin/leaderboard/resync', requireAdminAuth, async (req, res) => 
  * GET /api/admin/leaderboard/status
  * Leaderboard servisinin mevcut durumunu döner (debug / monitoring için)
  */
-app.get('/api/admin/leaderboard/status', requireAdminAuth, (req, res) => {
-    res.json({ success: true, status: leaderboardService.getStatus() });
+app.get('/api/admin/leaderboard/status', requireAdminAuth, async (req, res) => {
+    try {
+        const status = await leaderboardService.getStatus();
+        res.json({ success: true, status });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
 });
 
 // Ana sayfa - API bilgisi (frontend ayrı repo'da GitHub Pages'te)
