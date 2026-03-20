@@ -17,6 +17,7 @@ const { runMigrations } = require('./db/runMigrations');
 
 const path = require('path');
 const fs = require('fs').promises;
+const fsSync = require('fs');
 const app = express();
 
 async function writeDriversToFile(driversInfo) {
@@ -24,7 +25,6 @@ async function writeDriversToFile(driversInfo) {
     await fs.writeFile(filePath, JSON.stringify(driversInfo, null, 2), 'utf8');
     return filePath;
 }
-const carBrandsModels = require('./data/carBrandsModels');
 
 // Güvenlik Katmanı 1: Helmet - Başlıkları güvenlik altına alır
 app.use(helmet());
@@ -587,11 +587,32 @@ app.post('/api/drivers/register/verify', async (req, res) => {
 
 /**
  * GET /api/drivers/car-brands
- * Yeni araç kaydı için marka ve model listesi (data/carBrandsModels.js)
+ * Zorunlu: data/yandexVehicleReference.json (brandsWithModels dolu olmalı)
  */
+function getCarBrandsPayload() {
+    const refPath = path.join(__dirname, 'data', 'yandexVehicleReference.json');
+    try {
+        if (fsSync.existsSync(refPath)) {
+            const raw = JSON.parse(fsSync.readFileSync(refPath, 'utf8'));
+            if (raw.brandsWithModels && Array.isArray(raw.brandsWithModels) && raw.brandsWithModels.length > 0) {
+                const brands = raw.brandsWithModels.map(b => b.brand);
+                return { success: true, brands, brandsWithModels: raw.brandsWithModels };
+            }
+        }
+    } catch (e) {
+        console.error('[Server] yandexVehicleReference.json okunamadı:', e.message);
+    }
+    return {
+        success: false,
+        message:
+            'Araç marka/model listesi yüklenemedi. Sunucuda data/yandexVehicleReference.json dosyası olmalı ve brandsWithModels dolu olmalı.',
+        brands: [],
+        brandsWithModels: []
+    };
+}
+
 app.get('/api/drivers/car-brands', (req, res) => {
-    const brands = carBrandsModels.map(b => b.brand);
-    res.json({ success: true, brands, brandsWithModels: carBrandsModels });
+    res.json(getCarBrandsPayload());
 });
 
 /**

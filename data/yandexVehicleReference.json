@@ -1,0 +1,161 @@
+{
+  "syncedAt": "2026-03-20T16:13:25.245Z",
+  "source": "park_cars_list",
+  "documentation": "https://fleet.yandex.com/docs/api/en/",
+  "parkId": "7c42e863b87d4894866993d54798bc67",
+  "totalCarsFetched": 1034,
+  "uniqueBrandModelPairs": 44,
+  "brandsWithModels": [
+    {
+      "brand": "Citroen",
+      "models": [
+        "C-Elysee",
+        "Jumpy"
+      ]
+    },
+    {
+      "brand": "Dacia",
+      "models": [
+        "1300",
+        "1410",
+        "Duster",
+        "Jogger",
+        "Lodgy",
+        "Logan",
+        "Sandero"
+      ]
+    },
+    {
+      "brand": "Eagle",
+      "models": [
+        "Premier"
+      ]
+    },
+    {
+      "brand": "Fiat",
+      "models": [
+        "Doblo",
+        "Egea",
+        "Fiorino",
+        "Linea",
+        "Punto"
+      ]
+    },
+    {
+      "brand": "Ford",
+      "models": [
+        "Contour",
+        "Focus",
+        "Tourneo Courier"
+      ]
+    },
+    {
+      "brand": "Honda",
+      "models": [
+        "Civic",
+        "Civic Ferio"
+      ]
+    },
+    {
+      "brand": "Hyundai",
+      "models": [
+        "Accent",
+        "Aslan",
+        "i10",
+        "i30"
+      ]
+    },
+    {
+      "brand": "Mercedes-Benz",
+      "models": [
+        "Vito"
+      ]
+    },
+    {
+      "brand": "MG",
+      "models": [
+        "ZS EV"
+      ]
+    },
+    {
+      "brand": "Opel",
+      "models": [
+        "Astra",
+        "Vectra"
+      ]
+    },
+    {
+      "brand": "Peugeot",
+      "models": [
+        "301",
+        "Bipper"
+      ]
+    },
+    {
+      "brand": "Renault",
+      "models": [
+        "10",
+        "12",
+        "17",
+        "18",
+        "Clio",
+        "Logan",
+        "Megane",
+        "Symbol",
+        "Taliant"
+      ]
+    },
+    {
+      "brand": "SEAT",
+      "models": [
+        "Toledo"
+      ]
+    },
+    {
+      "brand": "Sym",
+      "models": [
+        "Moto"
+      ]
+    },
+    {
+      "brand": "Toyota",
+      "models": [
+        "Altezza",
+        "Avensis",
+        "Corolla"
+      ]
+    }
+  ],
+  "optionalEndpointProbes": [
+    {
+      "method": "GET",
+      "path": "/v1/parks/vehicles/references",
+      "status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/v1/references/vehicles",
+      "status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/v2/parks/vehicles/brands",
+      "status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/v1/parks/cars/references/brands",
+      "status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/v1/parks/vehicle-references",
+      "status": 404
+    }
+  ],
+  "notes": [
+    "Liste, parkınızdaki mevcut araç kayıtlarından türetilmiştir; Yandex'in tüm kabul edilebilir modelleri burada olmayabilir.",
+    "Yeni model eklemek için önce Yandex ortamında veya destek ile doğrulayın; ardından gerekirse bu dosyaya elle satır ekleyin.",
+    "Tam katalog için api-taxi@yandex-team.ru veya Fleet iş ortağı desteğine danışılabilir."
+  ]
+}

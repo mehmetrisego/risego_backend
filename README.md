@@ -29,6 +29,10 @@ Uygulama `http://localhost:3000` adresinde çalışır.
 - `NETGSM_USERNAME`, `NETGSM_USERCODE` – OTP SMS (NetGSM)
 - `PORT` – Sunucu portu (varsayılan: 3000)
 
+## Yandex marka/model (yeni araç)
+
+`GET /api/drivers/car-brands` yalnızca `data/yandexVehicleReference.json` kullanır (`brandsWithModels` dolu olmalı). Listeyi bu dosyadan düzenleyerek güncellersiniz.
+
 ## API Endpointleri
 
 - `POST /api/auth/login` – Giriş (OTP gönderir)

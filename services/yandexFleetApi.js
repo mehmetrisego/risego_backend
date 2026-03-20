@@ -29,6 +29,9 @@ function translateColor(color) {
     return COLOR_MAP[color] || color;
 }
 
+/** Yandex POST /v2/parks/vehicles/car — vehicle_specifications.color (Rusça sabit isim) */
+const DEFAULT_NEW_CAR_COLOR = 'Желтый'; // Sarı
+
 /**
  * ✅ FIX-5: Savunmacı sürücü ID çıkarımı
  * Yandex Fleet farklı sipariş yapılarında farklı alan adları kullanabiliyor.
@@ -408,7 +411,7 @@ class YandexFleetApi {
                 brand: (brand || '').trim(),
                 model: (model || '').trim(),
                 year: parseInt(year, 10) || new Date().getFullYear(),
-                color: 'Черный',
+                color: DEFAULT_NEW_CAR_COLOR,
                 transmission: 'automatic',
                 vin: trimmedPlate.replace(/\D/g, '').padEnd(17, '0').substring(0, 17) || '0'.repeat(17),
                 body_number: trimmedPlate,
