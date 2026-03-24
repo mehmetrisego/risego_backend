@@ -18,11 +18,6 @@ const db = require('../db');
 const dbOrders = require('../db/orders');
 
 // ─── Sabitler ──────────────────────────────────────────────────────────
-const BASE_URL     = config.yandexFleet.baseUrl;    // .env → YANDEX_BASE_URL
-const PARK_ID      = config.yandexFleet.partnerId;  // .env → YANDEX_PARTNER_ID
-const CLIENT_ID    = config.yandexFleet.clientId;   // .env → YANDEX_CLIENT_ID
-const API_KEY      = config.yandexFleet.apiKey;     // .env → YANDEX_API_KEY
-
 const PAGE_LIMIT       = 500;              // Her sayfada max sipariş (Yandex max 1000, 500 güvenli)
 const THROTTLE_MS      = 200;             // İstekler arası minimum bekleme (ms)
 const MAX_RETRIES      = 5;               // Hata durumunda max yeniden deneme
@@ -38,17 +33,25 @@ const COMPLETED_ORDER_STATUSES = ['complete'];
 const MONTHS = ['Ocak','Şubat','Mart','Nisan','Mayıs','Haziran',
                  'Temmuz','Ağustos','Eylül','Ekim','Kasım','Aralık'];
 
-// ─── HTTP İstemcisi ────────────────────────────────────────────────────
-const http = axios.create({
-    baseURL: BASE_URL,
-    timeout: REQUEST_TIMEOUT,
-    headers: {
-        'X-Client-ID':    CLIENT_ID,
-        'X-API-Key':      API_KEY,
-        'Content-Type':   'application/json',
-        'Accept-Language':'tr'
+/** Park başına axios (çoklu şehir API anahtarı) */
+const parkHttpClients = new Map();
+
+function getAxiosForPark(parkSource) {
+    const pid = parkSource.partnerId;
+    if (!parkHttpClients.has(pid)) {
+        parkHttpClients.set(pid, axios.create({
+            baseURL: parkSource.baseUrl || config.yandexFleet.baseUrl,
+            timeout: REQUEST_TIMEOUT,
+            headers: {
+                'X-Client-ID': parkSource.clientId,
+                'X-API-Key': parkSource.apiKey,
+                'Content-Type': 'application/json',
+                'Accept-Language': 'tr'
+            }
+        }));
     }
-});
+    return parkHttpClients.get(pid);
+}
 
 // ─── Yardımcı Fonksiyonlar ─────────────────────────────────────────────
 
@@ -123,9 +126,8 @@ class LeaderboardService {
         this._ordersTo   = null; // cache bitiş tarihi
         this._lastSyncAt = null;
 
-        /** Sürücü profil cache'i (5 dk TTL) */
-        this._profilesCache       = null;
-        this._profilesCacheExpiry = 0;
+        /** Sürücü profil cache'i — partnerId -> { data, expiry } */
+        this._profilesCacheByPark = new Map();
 
         /** Leaderboard sonuç cache'i (key: "admin|driver:from:to") */
         this._resultCache    = new Map();
@@ -158,7 +160,9 @@ class LeaderboardService {
      * @param {string} [dataKey='orders']
      * @returns {Promise<Array>}
      */
-    async _fetchAllPages(endpoint, payload, dataKey = 'orders') {
+    async _fetchAllPages(endpoint, payload, dataKey = 'orders', parkSource) {
+        const http = getAxiosForPark(parkSource);
+        const parkId = parkSource.partnerId;
         const all    = [];
         let cursor   = undefined;
         let retries  = 0;
@@ -171,7 +175,7 @@ class LeaderboardService {
             const body = { ...payload, limit: PAGE_LIMIT, ...(cursor ? { cursor } : {}) };
 
             try {
-                const res  = await http.post(endpoint, body, { headers: { 'X-Park-ID': PARK_ID } });
+                const res  = await http.post(endpoint, body, { headers: { 'X-Park-ID': parkId } });
                 const data = res.data;
                 const items = data[dataKey] || [];
 
@@ -216,13 +220,17 @@ class LeaderboardService {
     //  SÜRÜCÜ PROFİLLERİ (5 dk cache)
     // ════════════════════════════════════════════════════════════
 
-    async _getDriverProfiles() {
+    async _getDriverProfiles(parkSource) {
+        const pid = parkSource.partnerId;
         const now = Date.now();
-        if (this._profilesCache && now < this._profilesCacheExpiry) {
-            return this._profilesCache;
+        const hit = this._profilesCacheByPark.get(pid);
+        if (hit && now < hit.expiry) {
+            return hit.data;
         }
 
-        console.log('[LeaderboardService] Sürücü profilleri çekiliyor...');
+        const http = getAxiosForPark(parkSource);
+        const parkId = parkSource.partnerId;
+        console.log(`[LeaderboardService] Sürücü profilleri çekiliyor (${parkSource.label || pid})...`);
         const all    = [];
         let offset   = 0;
         const limit  = 1000;
@@ -231,12 +239,12 @@ class LeaderboardService {
             const res      = await http.post(
                 '/v1/parks/driver-profiles/list',
                 {
-                    query: { park: { id: PARK_ID } },
+                    query: { park: { id: parkId } },
                     fields: { driver_profile: ['first_name', 'last_name', 'id'] },
                     limit, offset,
                     sort_order: [{ direction: 'asc', field: 'driver_profile.created_date' }]
                 },
-                { headers: { 'X-Park-ID': PARK_ID } }
+                { headers: { 'X-Park-ID': parkId } }
             );
             const profiles = res.data.driver_profiles || [];
             all.push(...profiles);
@@ -245,16 +253,14 @@ class LeaderboardService {
             await sleep(THROTTLE_MS);
         }
 
-        this._profilesCache       = all;
-        this._profilesCacheExpiry = now + 5 * 60 * 1000;
-        console.log(`[LeaderboardService] ${all.length} sürücü profili yüklendi.`);
+        this._profilesCacheByPark.set(pid, { data: all, expiry: now + 5 * 60 * 1000 });
+        console.log(`[LeaderboardService] ${all.length} sürücü profili yüklendi (${parkSource.label || pid}).`);
         return all;
     }
 
     /** Yeni sürücü oluşturulduğunda profil cache'ini temizler */
     invalidateProfileCache() {
-        this._profilesCache       = null;
-        this._profilesCacheExpiry = 0;
+        this._profilesCacheByPark.clear();
     }
 
     // ════════════════════════════════════════════════════════════
@@ -266,7 +272,8 @@ class LeaderboardService {
      * - Status: 'complete' (Yandex Fleet API'nin kabul ettiği tek tamamlanmış status)
      * - Chunk overlap: Sınırlarda 45 dk overlap ile kayıp önlenir
      */
-    async _fetchOrders(fromDate, toDate) {
+    async _fetchOrders(fromDate, toDate, parkSource) {
+        const parkId = parkSource.partnerId;
         const startMs = fromDate.getTime();
         const endMs   = toDate.getTime();
         const CHUNK_SIZE_MS = 7 * 24 * 60 * 60 * 1000; // 7 gün
@@ -301,7 +308,7 @@ class LeaderboardService {
                         {
                             query: {
                                 park: {
-                                    id: PARK_ID,
+                                    id: parkId,
                                     order: {
                                         booked_at: { from: fromStr, to: toStr },
                                         statuses: COMPLETED_ORDER_STATUSES
@@ -309,7 +316,8 @@ class LeaderboardService {
                                 }
                             }
                         },
-                        'orders'
+                        'orders',
+                        parkSource
                     );
                 } catch (err) {
                     // API çoklu status kabul etmiyorsa: her status için ayrı istek + merge
@@ -324,7 +332,7 @@ class LeaderboardService {
                                     {
                                         query: {
                                             park: {
-                                                id: PARK_ID,
+                                                id: parkId,
                                                 order: {
                                                     booked_at: { from: fromStr, to: toStr },
                                                     statuses: [status]
@@ -332,7 +340,8 @@ class LeaderboardService {
                                             }
                                         }
                                     },
-                                    'orders'
+                                    'orders',
+                                    parkSource
                                 );
                                 for (const o of orders) {
                                     if (o?.id && !seen.has(o.id)) {
@@ -358,8 +367,8 @@ class LeaderboardService {
         return allOrdersRaw;
     }
 
-    /** Ham sipariş → { id, driverId, bookedAt } özeti (bellek tasarrufu) */
-    _mapOrder(raw) {
+    /** Ham sipariş → { id, driverId, bookedAt, parkPartnerId } özeti (bellek tasarrufu) */
+    _mapOrder(raw, parkPartnerId) {
         const id       = raw.id;
         const driverId = extractDriverId(raw);
         const rawDate  = raw.booked_at || raw.updated_at || raw.finished_at || raw.created_at;
@@ -371,7 +380,7 @@ class LeaderboardService {
             this._orphanedLogCount = (this._orphanedLogCount || 0) + 1;
             console.warn(`[LeaderboardService] Sürücü ID bulunamadı — sipariş ${id}, yapı:`, JSON.stringify(Object.keys(raw || {})));
         }
-        return { id, driverId, bookedAt };
+        return { id, driverId, bookedAt, parkPartnerId };
     }
 
     // ════════════════════════════════════════════════════════════
@@ -389,31 +398,48 @@ class LeaderboardService {
         }
         this._syncLock = true;
         try {
-            const now      = new Date();
+            const now = new Date();
             const fromDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() - CACHE_DAYS, 0, 0, 0, 0);
+            const sources = config.getYandexParkSources();
+            if (!sources.length) {
+                throw new Error('Yandex park tanımlı değil (.env YANDEX_PARK_* veya YANDEX_*).');
+            }
 
-            console.log(`[LeaderboardService] ▶ TAM SENKRONIZASYON başladı (${fromDate.toLocaleDateString('tr-TR')} → bugün)`);
+            console.log(`[LeaderboardService] ▶ TAM SENKRONIZASYON (${sources.length} park) ${fromDate.toLocaleDateString('tr-TR')} → bugün`);
 
-            const raw    = await this._fetchOrders(fromDate, now);
-            const mapped = raw.map(o => this._mapOrder(o)).filter(Boolean);
+            let totalWritten = 0;
+            const memoryAccum = [];
 
-            const map = new Map();
-            mapped.forEach(o => map.set(o.id, o));
-            const uniqueOrders = Array.from(map.values());
+            for (const park of sources) {
+                const raw = await this._fetchOrders(fromDate, now, park);
+                const mapped = raw.map(o => this._mapOrder(o, park.partnerId)).filter(Boolean);
+                const dedupe = new Map();
+                mapped.forEach(o => dedupe.set(`${o.id}|${o.parkPartnerId}`, o));
+                const uniqueOrders = Array.from(dedupe.values());
+
+                if (db.isConfigured()) {
+                    const count = await dbOrders.upsertOrders(uniqueOrders);
+                    totalWritten += count;
+                    console.log(`[LeaderboardService]   ${park.label}: ${uniqueOrders.length} sipariş işlendi (upsert)`);
+                } else {
+                    memoryAccum.push(...uniqueOrders);
+                }
+            }
 
             if (db.isConfigured()) {
-                const count = await dbOrders.upsertOrders(uniqueOrders);
                 await dbOrders.pruneOldOrders(fromDate);
-                console.log(`[LeaderboardService] ✅ TAM SENKRONIZASYON tamamlandı: ${count} sipariş DB'ye yazıldı`);
+                console.log(`[LeaderboardService] ✅ TAM SENKRONIZASYON tamamlandı: ~${totalWritten} upsert, tüm parklar`);
             } else {
-                this._orders = uniqueOrders;
+                const map = new Map();
+                for (const o of memoryAccum) map.set(`${o.id}|${o.parkPartnerId}`, o);
+                this._orders = Array.from(map.values());
                 const orphaned = this._orders.filter(o => !o.driverId).length;
                 const orphanedLog = orphaned > 0 ? ` (${orphaned} sürücü ID'siz)` : '';
                 console.log(`[LeaderboardService] ✅ TAM SENKRONIZASYON tamamlandı: ${this._orders.length} sipariş${orphanedLog} (bellek)`);
             }
 
             this._ordersFrom = fromDate;
-            this._ordersTo   = now;
+            this._ordersTo = now;
             this._lastSyncAt = now;
             this._resultCache.clear();
         } catch (err) {
@@ -425,57 +451,70 @@ class LeaderboardService {
     }
 
     /**
-     * DELTA SENKRONIZASYON: Son sync'ten bu yana gelen yeni siparişleri ekler.
-     * 45 dk geriden başlar — Yandex indeksleme gecikmesi veya sınır kayıplarını önler.
+     * DELTA: Her park için ayrı — son kayıttan bugüne (45 dk overlap)
      */
     async _deltaSync() {
         if (this._syncLock) return;
         this._syncLock = true;
         try {
             const now = new Date();
-            let deltaFrom;
+            const sources = config.getYandexParkSources();
+            if (!sources.length) return;
 
-            if (db.isConfigured()) {
-                const lastBooked = await dbOrders.getLatestBookedAt();
-                deltaFrom = lastBooked
-                    ? new Date(lastBooked.getTime() - CHUNK_OVERLAP_MS)
-                    : new Date(now.getFullYear(), now.getMonth(), now.getDate() - CACHE_DAYS, 0, 0, 0, 0);
-            } else {
-                deltaFrom = this._ordersTo
-                    ? new Date(this._ordersTo.getTime() - CHUNK_OVERLAP_MS)
-                    : new Date(now.getFullYear(), now.getMonth(), now.getDate() - CACHE_DAYS, 0, 0, 0, 0);
-            }
+            let anyNew = false;
 
-            console.log(`[LeaderboardService] ⏳ DELTA: ${deltaFrom.toLocaleTimeString('tr-TR')} → şimdi`);
+            for (const park of sources) {
+                let deltaFrom;
+                if (db.isConfigured()) {
+                    const lastBooked = await dbOrders.getLatestBookedAtForPark(park.partnerId);
+                    deltaFrom = lastBooked
+                        ? new Date(lastBooked.getTime() - CHUNK_OVERLAP_MS)
+                        : new Date(now.getFullYear(), now.getMonth(), now.getDate() - CACHE_DAYS, 0, 0, 0, 0);
+                } else {
+                    const parkOrders = (this._orders || []).filter(o => o.parkPartnerId === park.partnerId);
+                    const maxBooked = parkOrders.reduce(
+                        (mx, o) => (o.bookedAt > mx ? o.bookedAt : mx),
+                        new Date(0)
+                    );
+                    deltaFrom = maxBooked.getTime() > 0
+                        ? new Date(maxBooked.getTime() - CHUNK_OVERLAP_MS)
+                        : new Date(now.getFullYear(), now.getMonth(), now.getDate() - CACHE_DAYS, 0, 0, 0, 0);
+                }
 
-            const raw    = await this._fetchOrders(deltaFrom, now);
-            const mapped = raw.map(o => this._mapOrder(o)).filter(Boolean);
+                console.log(`[LeaderboardService] ⏳ DELTA (${park.label}): ${deltaFrom.toLocaleTimeString('tr-TR')} → şimdi`);
 
-            if (mapped.length > 0) {
+                const raw = await this._fetchOrders(deltaFrom, now, park);
+                const mapped = raw.map(o => this._mapOrder(o, park.partnerId)).filter(Boolean);
+
+                if (mapped.length === 0) continue;
+                anyNew = true;
+
                 if (db.isConfigured()) {
                     const count = await dbOrders.upsertOrders(mapped);
-                    const cutoff = new Date(now.getFullYear(), now.getMonth(), now.getDate() - CACHE_DAYS, 0, 0, 0, 0);
-                    const pruned = await dbOrders.pruneOldOrders(cutoff);
-                    const total = await dbOrders.getOrderCount();
-                    console.log(`[LeaderboardService] ✅ Delta: +${count} yeni, -${pruned} budandı. Toplam DB: ${total}`);
+                    console.log(`[LeaderboardService]   ${park.label}: +${count} upsert`);
                 } else {
-                    const map = new Map(this._orders.map(o => [o.id, o]));
-                    let added = 0;
-                    for (const o of mapped) {
-                        if (!map.has(o.id)) { map.set(o.id, o); added++; }
-                    }
-                    const cutoff = new Date(now.getFullYear(), now.getMonth(), now.getDate() - CACHE_DAYS, 0, 0, 0, 0);
-                    const before = map.size;
-                    for (const [id, o] of map) { if (o.bookedAt < cutoff) map.delete(id); }
-                    const pruned = before - map.size;
+                    const map = new Map((this._orders || []).map(o => [`${o.id}|${o.parkPartnerId}`, o]));
+                    for (const o of mapped) map.set(`${o.id}|${o.parkPartnerId}`, o);
                     this._orders = Array.from(map.values());
-                    console.log(`[LeaderboardService] ✅ Delta: +${added} yeni, -${pruned} budandı. Toplam: ${this._orders.length}`);
                 }
+            }
+
+            if (db.isConfigured()) {
+                const cutoff = new Date(now.getFullYear(), now.getMonth(), now.getDate() - CACHE_DAYS, 0, 0, 0, 0);
+                const pruned = await dbOrders.pruneOldOrders(cutoff);
+                const total = await dbOrders.getOrderCount();
+                console.log(`[LeaderboardService] ✅ Delta: budanmış ${pruned} | Toplam DB: ${total}`);
+            } else if (anyNew) {
+                const cutoff = new Date(now.getFullYear(), now.getMonth(), now.getDate() - CACHE_DAYS, 0, 0, 0, 0);
+                const before = this._orders.length;
+                this._orders = this._orders.filter(o => o.bookedAt >= cutoff);
+                console.log(`[LeaderboardService] ✅ Delta: bellek budandı ${before - this._orders.length}`);
+
             } else {
                 console.log('[LeaderboardService] Delta: Yeni sipariş yok.');
             }
 
-            this._ordersTo   = now;
+            this._ordersTo = now;
             this._lastSyncAt = now;
             this._resultCache.clear();
         } catch (err) {
@@ -503,11 +542,17 @@ class LeaderboardService {
 
         // İlk senkronizasyon: DB doluysa delta, boşsa full sync
         const initSync = async () => {
+            if (db.isConfigured()) {
+                const n = await dbOrders.backfillLegacyParkToPrimary(config.yandexFleet.partnerId);
+                if (n > 0) {
+                    console.log(`[LeaderboardService] Eski siparişler birincil parka taşındı: ${n} satır`);
+                }
+            }
             if (db.isConfigured() && (await dbOrders.getOrderCount()) > 0) {
                 this._ordersFrom = new Date(Date.now() - CACHE_DAYS * 24 * 60 * 60 * 1000);
                 this._ordersTo = await dbOrders.getLatestBookedAt() || new Date();
                 this._lastSyncAt = new Date();
-                await this._deltaSync(); // Sadece yeni siparişleri çek
+                await this._deltaSync();
             } else {
                 await this._fullSync();
             }
@@ -568,9 +613,16 @@ class LeaderboardService {
      * @param {string} toStr    - "YYYY-MM-DD"
      * @param {Object} [opts]
      * @param {boolean} [opts.adminView=false] - true → tam ad, false → baş harfler
+     * @param {string} [opts.parkPartnerId] - Yandex park UUID (oturumdaki şehir); yoksa birincil park
      * @returns {Promise<Object>}
      */
-    async getLeaderboard(fromStr, toStr, { adminView = false } = {}) {
+    async getLeaderboard(fromStr, toStr, { adminView = false, parkPartnerId } = {}) {
+        const pid = parkPartnerId || config.yandexFleet.partnerId;
+        const parkSource = config.findYandexParkByPartnerId(pid);
+        if (!parkSource) {
+            throw new Error('Geçersiz veya tanımsız park (parkPartnerId).');
+        }
+
         // ── İlk sync tamamlanana kadar bekle ──────────────────
         if (this._readyPromise) {
             try {
@@ -590,7 +642,7 @@ class LeaderboardService {
         if (startDate > endDate)                          throw new Error('Başlangıç tarihi bitiş tarihinden sonra olamaz.');
 
         // ── Result cache ──────────────────────────────────────
-        const cacheKey = `${adminView ? 'a' : 'd'}:${fromStr}:${toStr}`;
+        const cacheKey = `${adminView ? 'a' : 'd'}:${pid}:${fromStr}:${toStr}`;
         const nowMs    = Date.now();
         const hit      = this._resultCache.get(cacheKey);
         if (hit && nowMs < hit.expiry) {
@@ -605,13 +657,13 @@ class LeaderboardService {
 
         if (db.isConfigured()) {
             const [counts, stats] = await Promise.all([
-                dbOrders.getTripCountsByDriver(startDate, endDate),
-                dbOrders.getOrderStatsInRange(startDate, endDate)
+                dbOrders.getTripCountsByDriver(startDate, endDate, pid),
+                dbOrders.getOrderStatsInRange(startDate, endDate, pid)
             ]);
             tripCountsByDriver = counts;
             totalOrders = stats.total;
             orphanedCount = stats.orphaned;
-            console.log(`[LeaderboardService] DB'den: ${totalOrders} sipariş (${fromStr}→${toStr})`);
+            console.log(`[LeaderboardService] DB'den (${parkSource.label}): ${totalOrders} sipariş (${fromStr}→${toStr})`);
         } else {
             const cacheCoversRequest =
                 this._orders.length > 0 &&
@@ -621,12 +673,17 @@ class LeaderboardService {
 
             let orders;
             if (cacheCoversRequest) {
-                orders = this._orders.filter(o => o.bookedAt >= startDate && o.bookedAt <= endDate);
+                orders = this._orders.filter(
+                    o =>
+                        o.parkPartnerId === pid &&
+                        o.bookedAt >= startDate &&
+                        o.bookedAt <= endDate
+                );
                 console.log(`[LeaderboardService] Cache'den filtrelendi: ${orders.length} sipariş (${fromStr}→${toStr})`);
             } else {
                 console.log('[LeaderboardService] Cache yetersiz, API\'den çekiliyor...');
-                const raw = await this._fetchOrders(startDate, endDate);
-                orders = raw.map(o => this._mapOrder(o)).filter(Boolean);
+                const raw = await this._fetchOrders(startDate, endDate, parkSource);
+                orders = raw.map(o => this._mapOrder(o, pid)).filter(Boolean);
             }
             totalOrders = orders.length;
             orphanedCount = orders.filter(o => !o.driverId).length;
@@ -639,7 +696,7 @@ class LeaderboardService {
         }
 
         // ── Profil haritası ───────────────────────────────────
-        const profiles   = await this._getDriverProfiles();
+        const profiles   = await this._getDriverProfiles(parkSource);
         const profileMap = {};
         for (const p of profiles) {
             const dp  = p.driver_profile || {};
@@ -704,10 +761,13 @@ class LeaderboardService {
      * Veriyi doğrudan kendi hazır in-memory önbelleğinden çeker (Çok Hızlı).
      * @param {string} driverId
      * @param {string} period - 'daily', 'weekly', 'monthly', 'all'
+     * @param {string} [parkPartnerId] - oturum parkı (Yandex UUID)
      * @returns {Promise<number>}
      */
-    async getDriverTripCount(driverId, period = 'daily') {
+    async getDriverTripCount(driverId, period = 'daily', parkPartnerId) {
         if (this._readyPromise) await this._readyPromise;
+
+        const pid = parkPartnerId || config.yandexFleet.partnerId;
 
         const now = new Date();
         let fromDate;
@@ -732,11 +792,15 @@ class LeaderboardService {
         }
 
         if (db.isConfigured()) {
-            return await dbOrders.getDriverTripCountInRange(driverId, fromDate);
+            return await dbOrders.getDriverTripCountInRange(driverId, fromDate, pid);
         }
 
         return this._orders.reduce((sum, order) => {
-            if (order.driverId === driverId && order.bookedAt >= fromDate) return sum + 1;
+            if (
+                order.parkPartnerId === pid &&
+                order.driverId === driverId &&
+                order.bookedAt >= fromDate
+            ) return sum + 1;
             return sum;
         }, 0);
     }
@@ -771,8 +835,7 @@ class LeaderboardService {
         this._ordersFrom          = null;
         this._ordersTo            = null;
         this._resultCache.clear();
-        this._profilesCache       = null;
-        this._profilesCacheExpiry = 0;
+        this._profilesCacheByPark.clear();
         if (db.isConfigured()) {
             await dbOrders.clearAllOrders();
         }

@@ -69,6 +69,80 @@ class YandexFleetApi {
         this._profilesCacheExpiry = 0;
         this._profilesPending = null;
         this.PROFILES_TTL = 5 * 60 * 1000; // 5 dakika
+        /** Çoklu şehir: partnerId -> axios (X-Client-ID / X-API-Key parka özel) */
+        this._partnerHttpClients = new Map();
+    }
+
+    /**
+     * @param {string} [parkPartnerId] - boş / yoksa birinci park (config.yandexFleet)
+     * @returns {{ http: import('axios').AxiosInstance, parkId: string }}
+     */
+    _resolveParkContext(parkPartnerId) {
+        const defaultPid = this.parkId;
+        if (!parkPartnerId || parkPartnerId === defaultPid) {
+            return { http: this.httpClient, parkId: defaultPid };
+        }
+        const src = config.findYandexParkByPartnerId(parkPartnerId);
+        if (!src) {
+            console.warn('[YandexFleetApi] Bilinmeyen park_partner_id:', parkPartnerId);
+            return { http: this.httpClient, parkId: defaultPid };
+        }
+        if (!this._partnerHttpClients.has(parkPartnerId)) {
+            this._partnerHttpClients.set(
+                parkPartnerId,
+                axios.create({
+                    baseURL: src.baseUrl || config.yandexFleet.baseUrl,
+                    timeout: 30000,
+                    headers: {
+                        'X-Client-ID': src.clientId,
+                        'X-API-Key': src.apiKey,
+                        'Content-Type': 'application/json',
+                        'Accept-Language': 'tr'
+                    }
+                })
+            );
+        }
+        return { http: this._partnerHttpClients.get(parkPartnerId), parkId: src.partnerId };
+    }
+
+    /**
+     * Tek park için sürücü listesi (telefon doğrulama; önbellek authService'te)
+     */
+    async fetchDriverProfilesForParkSource(parkSource) {
+        const { http, parkId } = this._resolveParkContext(parkSource.partnerId);
+        const allDrivers = [];
+        let offset = 0;
+        const limit = 1000;
+        let hasMore = true;
+
+        while (hasMore) {
+            const response = await http.post(
+                '/v1/parks/driver-profiles/list',
+                {
+                    query: { park: { id: parkId } },
+                    fields: {
+                        account: ['balance'],
+                        car: ['brand', 'model', 'number', 'year', 'color', 'id'],
+                        driver_profile: ['first_name', 'last_name', 'phones', 'id']
+                    },
+                    limit,
+                    offset,
+                    sort_order: [{ direction: 'asc', field: 'driver_profile.created_date' }]
+                }
+            );
+
+            const data = response.data;
+            const drivers = data.driver_profiles || [];
+            allDrivers.push(...drivers);
+
+            if (offset + limit >= (data.total || 0) || drivers.length === 0) {
+                hasMore = false;
+            } else {
+                offset += limit;
+            }
+        }
+
+        return allDrivers;
     }
 
     /**
@@ -99,6 +173,7 @@ class YandexFleetApi {
      * POST /v1/parks/driver-profiles/list
      */
     async _fetchDriverProfilesFromAPI() {
+        const { http, parkId } = this._resolveParkContext();
         const allDrivers = [];
         let offset = 0;
         const limit = 1000;
@@ -106,11 +181,11 @@ class YandexFleetApi {
 
         while (hasMore) {
             try {
-                const response = await this.httpClient.post(
+                const response = await http.post(
                     '/v1/parks/driver-profiles/list',
                     {
                         query: {
-                            park: { id: this.parkId }
+                            park: { id: parkId }
                         },
                         fields: {
                             account: ['balance'],
@@ -168,13 +243,14 @@ class YandexFleetApi {
      * Sürücünün bakiyesini getirir
      * GET /v1/parks/contractors/blocked-balance
      */
-    async getDriverBalance(driverId) {
+    async getDriverBalance(driverId, parkPartnerId) {
+        const { http, parkId } = this._resolveParkContext(parkPartnerId);
         try {
-            const response = await this.httpClient.get(
+            const response = await http.get(
                 '/v1/parks/contractors/blocked-balance',
                 {
                     params: { contractor_id: driverId },
-                    headers: { 'X-Park-ID': this.parkId }
+                    headers: { 'X-Park-ID': parkId }
                 }
             );
             return {
@@ -191,13 +267,14 @@ class YandexFleetApi {
      * Araç detaylarını getirir
      * GET /v2/parks/vehicles/car
      */
-    async getCarDetails(vehicleId) {
+    async getCarDetails(vehicleId, parkPartnerId) {
+        const { http, parkId } = this._resolveParkContext(parkPartnerId);
         try {
-            const response = await this.httpClient.get(
+            const response = await http.get(
                 '/v2/parks/vehicles/car',
                 {
                     params: { vehicle_id: vehicleId },
-                    headers: { 'X-Park-ID': this.parkId }
+                    headers: { 'X-Park-ID': parkId }
                 }
             );
             return response.data;
@@ -211,7 +288,8 @@ class YandexFleetApi {
      * Parktaki araç listesini getirir
      * POST /v1/parks/cars/list
      */
-    async getCarsList(textSearch = '') {
+    async getCarsList(textSearch = '', parkPartnerId) {
+        const { http, parkId } = this._resolveParkContext(parkPartnerId);
         const allCars = [];
         let offset = 0;
         const limit = 1000;
@@ -220,7 +298,7 @@ class YandexFleetApi {
             while (true) {
                 const body = {
                     query: {
-                        park: { id: this.parkId },
+                        park: { id: parkId },
                         text: (textSearch || '').trim()
                     },
                     fields: {
@@ -230,10 +308,10 @@ class YandexFleetApi {
                     offset
                 };
 
-                const response = await this.httpClient.post(
+                const response = await http.post(
                     '/v1/parks/cars/list',
                     body,
-                    { headers: { 'X-Park-ID': this.parkId } }
+                    { headers: { 'X-Park-ID': parkId } }
                 );
 
                 const data = response.data;
@@ -255,11 +333,11 @@ class YandexFleetApi {
     /**
      * Plaka ile araç arar
      */
-    async findCarByPlate(plate) {
+    async findCarByPlate(plate, parkPartnerId) {
         const trimmed = (plate || '').trim().toUpperCase().replace(/\s/g, '');
         if (!trimmed || trimmed.length < 3) return null;
 
-        const cars = await this.getCarsList(trimmed);
+        const cars = await this.getCarsList(trimmed, parkPartnerId);
 
         const found = cars.find(c => {
             const carPlate = (c.number || '').trim().toUpperCase().replace(/\s/g, '');
@@ -283,11 +361,12 @@ class YandexFleetApi {
      * Çalışma kurallarını getirir
      * GET /v1/parks/driver-work-rules
      */
-    async getDriverWorkRules() {
+    async getDriverWorkRules(parkPartnerId) {
+        const { http, parkId } = this._resolveParkContext(parkPartnerId);
         try {
-            const response = await this.httpClient.get(
+            const response = await http.get(
                 '/v1/parks/driver-work-rules',
-                { params: { park_id: this.parkId } }
+                { params: { park_id: parkId } }
             );
             const rules = response.data?.rules || [];
             return rules.filter(r => r.is_enabled).map(r => r.id);
@@ -301,10 +380,11 @@ class YandexFleetApi {
      * Yeni taksi sürücüsü profili oluşturur
      * POST /v2/parks/contractors/driver-profile
      */
-    async createDriverProfile(data) {
+    async createDriverProfile(data, parkPartnerId) {
+        const { http, parkId } = this._resolveParkContext(parkPartnerId);
         let workRuleId = config.yandexFleet.workRuleId;
         if (!workRuleId) {
-            const rules = await this.getDriverWorkRules();
+            const rules = await this.getDriverWorkRules(parkPartnerId);
             workRuleId = rules[0];
         }
         if (!workRuleId) {
@@ -345,12 +425,12 @@ class YandexFleetApi {
         const idempotencyToken = crypto.randomBytes(16).toString('hex');
 
         try {
-            const response = await this.httpClient.post(
+            const response = await http.post(
                 '/v2/parks/contractors/driver-profile',
                 body,
                 {
                     headers: {
-                        'X-Park-ID': this.parkId,
+                        'X-Park-ID': parkId,
                         'X-Idempotency-Token': idempotencyToken
                     }
                 }
@@ -376,18 +456,19 @@ class YandexFleetApi {
      * Araçı sürücüye bağlar
      * PUT /v1/parks/driver-profiles/car-bindings
      */
-    async bindCarToDriver(driverId, carId) {
+    async bindCarToDriver(driverId, carId, parkPartnerId) {
+        const { http, parkId } = this._resolveParkContext(parkPartnerId);
         try {
-            await this.httpClient.put(
+            await http.put(
                 '/v1/parks/driver-profiles/car-bindings',
                 {},
                 {
                     params: {
-                        park_id: this.parkId,
+                        park_id: parkId,
                         driver_profile_id: driverId,
                         car_id: carId
                     },
-                    headers: { 'X-Park-ID': this.parkId }
+                    headers: { 'X-Park-ID': parkId }
                 }
             );
             return true;
@@ -404,7 +485,7 @@ class YandexFleetApi {
      * Yeni araç oluşturur ve sürücüye bağlar
      * POST /v2/parks/vehicles/car
      */
-    async createCarAndBind(plate, brand, model, year, driverId) {
+    async createCarAndBind(plate, brand, model, year, driverId, parkPartnerId) {
         const trimmedPlate = (plate || '').trim().toUpperCase();
         const body = {
             vehicle_specifications: {
@@ -430,13 +511,14 @@ class YandexFleetApi {
             }
         };
 
+        const { http, parkId } = this._resolveParkContext(parkPartnerId);
         try {
-            const response = await this.httpClient.post(
+            const response = await http.post(
                 '/v2/parks/vehicles/car',
                 body,
                 {
                     headers: {
-                        'X-Park-ID': this.parkId,
+                        'X-Park-ID': parkId,
                         // ✅ OPT-5: crypto top-level
                         'X-Idempotency-Token': crypto.randomBytes(16).toString('hex')
                     }
@@ -448,7 +530,7 @@ class YandexFleetApi {
                 throw new Error('Araç oluşturuldu ancak ID alınamadı.');
             }
 
-            await this.bindCarToDriver(driverId, vehicleId);
+            await this.bindCarToDriver(driverId, vehicleId, parkPartnerId);
             return { vehicleId, plate: trimmedPlate, brand, model, year };
         } catch (error) {
             const msg = error.response?.data?.message || error.message;
@@ -461,8 +543,8 @@ class YandexFleetApi {
      * Araç plakasını günceller
      * PUT /v2/parks/vehicles/car
      */
-    async updateCarPlate(vehicleId, newPlate) {
-        const carData = await this.getCarDetails(vehicleId);
+    async updateCarPlate(vehicleId, newPlate, parkPartnerId) {
+        const carData = await this.getCarDetails(vehicleId, parkPartnerId);
         if (!carData) {
             throw new Error('Araç bilgileri alınamadı.');
         }
@@ -476,13 +558,14 @@ class YandexFleetApi {
             park_profile: carData.park_profile || {}
         };
 
+        const { http, parkId } = this._resolveParkContext(parkPartnerId);
         try {
-            await this.httpClient.put(
+            await http.put(
                 '/v2/parks/vehicles/car',
                 updateBody,
                 {
                     params: { vehicle_id: vehicleId },
-                    headers: { 'X-Park-ID': this.parkId }
+                    headers: { 'X-Park-ID': parkId }
                 }
             );
             return true;

@@ -48,7 +48,7 @@ app.use(cors({
         callback(null, false);  // İzin verilmedi
     },
     methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'x-session-token', 'x-admin-token'],
+    allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'x-session-token', 'x-park-partner-id', 'x-admin-token', 'x-dev-secret'],
     credentials: true
 }));
 
@@ -79,9 +79,65 @@ const customLeaderboardLimiter = rateLimit({
 });
 
 // ============================================
-// Kampanya: DB varsa PostgreSQL, yoksa in-memory fallback
+// Kampanya: DB varsa PostgreSQL, yoksa in-memory fallback (park_partner_id anahtarı)
 // ============================================
-let activeCampaignFallback = { text: '', active: false, updatedAt: null };
+const activeCampaignFallbackByPark = Object.create(null);
+
+function getCampaignMemory(parkPartnerId) {
+    const key = parkPartnerId || config.yandexFleet.partnerId;
+    return activeCampaignFallbackByPark[key] || { text: '', active: false, updatedAt: null };
+}
+
+function setCampaignMemory(parkPartnerId, campaign) {
+    const key = parkPartnerId || config.yandexFleet.partnerId;
+    activeCampaignFallbackByPark[key] = campaign;
+}
+
+async function loadCampaignForPark(parkPid) {
+    return db.isConfigured()
+        ? await dbCampaigns.getCampaign(parkPid)
+        : getCampaignMemory(parkPid);
+}
+
+/** Admin: query veya body'den parkPartnerId — yoksa birincil park */
+function resolveAdminCampaignPark(req, res) {
+    const fromQuery = (req.query.parkPartnerId || '').trim();
+    const fromBody = req.body && req.body.parkPartnerId != null ? String(req.body.parkPartnerId).trim() : '';
+    const raw = fromQuery || fromBody;
+    if (raw && !config.findYandexParkByPartnerId(raw)) {
+        res.status(400).json({ success: false, message: 'Geçersiz park (şehir) seçimi.' });
+        return null;
+    }
+    const pid = raw || config.yandexFleet.partnerId;
+    if (!pid || !config.findYandexParkByPartnerId(pid)) {
+        res.status(400).json({ success: false, message: 'Park yapılandırması bulunamadı.' });
+        return null;
+    }
+    return pid;
+}
+
+/** Public GET /api/campaign için park UUID (token → DB/RAM; yoksa query/header; son çare birincil park) */
+async function resolvePublicCampaignPark(req) {
+    const token = req.headers['x-session-token'];
+    if (token) {
+        try {
+            const parkPid = await authService.getSessionParkPartnerId(token);
+            if (parkPid && String(parkPid).trim().length > 0) {
+                return String(parkPid).trim();
+            }
+        } catch (_) { /* yoksay */ }
+    }
+    const q = (req.query.parkPartnerId || '').trim();
+    if (q && config.findYandexParkByPartnerId(q)) return q;
+    const cityParam = (req.query.city || '').trim();
+    if (cityParam) {
+        const src = config.findYandexParkByCity(cityParam);
+        if (src) return src.partnerId;
+    }
+    const hdrPark = (req.headers['x-park-partner-id'] || '').trim();
+    if (hdrPark && config.findYandexParkByPartnerId(hdrPark)) return hdrPark;
+    return config.yandexFleet.partnerId;
+}
 
 // ============================================
 // Auth Middleware - Sürücü endpoint'leri için oturum doğrulama
@@ -102,6 +158,11 @@ async function requireAuth(req, res, next) {
         console.error('[Server] Auth middleware hatası:', error.message);
         res.status(401).json({ success: false, message: 'Oturum doğrulanamadı.' });
     }
+}
+
+/** Oturumdaki sürücünün Yandex park kimliği (çoklu şehir API anahtarları) */
+function sessionParkPartnerId(req) {
+    return (req.sessionDriver && req.sessionDriver.parkPartnerId) || config.yandexFleet.partnerId;
 }
 
 // Admin panel oturum doğrulama
@@ -180,6 +241,55 @@ app.post('/api/auth/verify-otp', async (req, res) => {
 });
 
 /**
+ * POST /api/auth/dev-session
+ * Sadece DEV_DRIVER_SESSION=true ve güçlü DEV_SESSION_SECRET ile: SMS olmadan sürücü oturumu (local geliştirme)
+ * Header: X-Dev-Secret: <DEV_SESSION_SECRET>  veya body.devSecret
+ */
+app.post('/api/auth/dev-session', async (req, res) => {
+    try {
+        if (!config.isDevDriverSessionEnabled()) {
+            return res.status(404).json({ success: false, message: 'Not found' });
+        }
+
+        const { phone, city } = req.body || {};
+        const providedSecret = req.headers['x-dev-secret'] || req.body?.devSecret;
+
+        if (!phone || !city) {
+            return res.status(400).json({
+                success: false,
+                message: 'Telefon numarası ve şehir gereklidir.'
+            });
+        }
+        if (!providedSecret || typeof providedSecret !== 'string') {
+            return res.status(401).json({ success: false, message: 'Unauthorized' });
+        }
+
+        const result = await authService.createDevSession(phone, city, providedSecret.trim());
+
+        if (!result.success) {
+            const status = result.forbidden ? 401 : 400;
+            return res.status(status).json({
+                success: false,
+                message: result.message
+            });
+        }
+
+        res.json({
+            success: true,
+            message: result.message,
+            driver: result.driver,
+            sessionToken: result.sessionToken
+        });
+    } catch (error) {
+        console.error('[Server] Dev session hatası:', error.message);
+        res.status(500).json({
+            success: false,
+            message: 'Sunucu hatası oluştu.'
+        });
+    }
+});
+
+/**
  * GET /api/auth/session
  * Kayıtlı oturumu doğrular, geçerliyse sürücü verilerini döner
  */
@@ -231,7 +341,11 @@ app.post('/api/drivers/trip-count', requireAuth, async (req, res) => {
         const validPeriods = ['daily', 'weekly', 'monthly', 'all'];
         const selectedPeriod = validPeriods.includes(period) ? period : 'all';
 
-        const tripCount = await leaderboardService.getDriverTripCount(driverId, selectedPeriod);
+        const tripCount = await leaderboardService.getDriverTripCount(
+            driverId,
+            selectedPeriod,
+            sessionParkPartnerId(req)
+        );
 
         res.json({
             success: true,
@@ -248,6 +362,20 @@ app.post('/api/drivers/trip-count', requireAuth, async (req, res) => {
 });
 
 /**
+ * GET /api/drivers/campaign — oturum zorunlu; profil ile aynı park (sessionParkPartnerId)
+ */
+app.get('/api/drivers/campaign', requireAuth, async (req, res) => {
+    try {
+        const parkPid = sessionParkPartnerId(req);
+        const campaign = await loadCampaignForPark(parkPid);
+        res.json({ success: true, campaign, parkPartnerId: parkPid });
+    } catch (error) {
+        console.error('[Server] Sürücü kampanya hatası:', error.message);
+        res.status(500).json({ success: false, message: 'Kampanya yüklenemedi.' });
+    }
+});
+
+/**
  * POST /api/drivers/balance
  * Belirli bir sürücünün bakiyesini döner (oturum gerekli)
  */
@@ -255,7 +383,7 @@ app.post('/api/drivers/balance', requireAuth, async (req, res) => {
     try {
         const driverId = req.sessionDriver.id;
 
-        const balanceData = await yandexFleetApi.getDriverBalance(driverId);
+        const balanceData = await yandexFleetApi.getDriverBalance(driverId, sessionParkPartnerId(req));
 
         if (balanceData) {
             res.json({
@@ -313,7 +441,10 @@ app.get('/api/leaderboard', requireAuth, customLeaderboardLimiter, async (req, r
             return res.status(400).json({ success: false, message: 'En fazla 1 aylık (31 gün) dönem seçebilirsiniz.' });
         }
 
-        const data = await leaderboardService.getLeaderboard(from, to, { adminView: false });
+        const data = await leaderboardService.getLeaderboard(from, to, {
+            adminView: false,
+            parkPartnerId: sessionParkPartnerId(req)
+        });
         const { drivers, totalDrivers, totalOrders, periodLabel } = data;
 
         // Sürücüye yalnızca baş harfler göster (gizlilik)
@@ -373,7 +504,7 @@ app.post('/api/drivers/check-plate', requireAuth, async (req, res) => {
             });
         }
 
-        const car = await yandexFleetApi.findCarByPlate(trimmed);
+        const car = await yandexFleetApi.findCarByPlate(trimmed, sessionParkPartnerId(req));
 
         if (car) {
             res.json({
@@ -420,13 +551,15 @@ app.post('/api/drivers/change-car', requireAuth, async (req, res) => {
             });
         }
 
+        const parkPid = sessionParkPartnerId(req);
+
         if (carId) {
-            await yandexFleetApi.bindCarToDriver(driverId, carId);
+            await yandexFleetApi.bindCarToDriver(driverId, carId, parkPid);
 
             // Araç bilgilerini plaka ile ara (findCarByPlate düz formatta döner)
             let car = null;
             try {
-                car = await yandexFleetApi.findCarByPlate(trimmedPlate);
+                car = await yandexFleetApi.findCarByPlate(trimmedPlate, parkPid);
             } catch (findErr) {
                 console.warn('[Server] Araç bilgisi alınamadı:', findErr.message);
             }
@@ -457,7 +590,7 @@ app.post('/api/drivers/change-car', requireAuth, async (req, res) => {
                     message: 'Yeni araç için marka, model ve yıl gereklidir.'
                 });
             }
-            const result = await yandexFleetApi.createCarAndBind(trimmedPlate, brand, model, year, driverId);
+            const result = await yandexFleetApi.createCarAndBind(trimmedPlate, brand, model, year, driverId, parkPid);
             res.json({
                 success: true,
                 message: 'Yeni araç kaydedildi ve size atandı.',
@@ -647,7 +780,7 @@ app.post('/api/drivers/update-car', requireAuth, async (req, res) => {
             });
         }
 
-        await yandexFleetApi.updateCarPlate(carId, trimmedPlate);
+        await yandexFleetApi.updateCarPlate(carId, trimmedPlate, sessionParkPartnerId(req));
 
         res.json({
             success: true,
@@ -820,9 +953,13 @@ app.post('/api/admin/auth/logout', (req, res) => {
 /**
  * POST /api/admin/campaign
  * Admin panelinden kampanya metni kaydetme
+ * Body: { text, parkPartnerId? } — park yoksa birincil park
  */
 app.post('/api/admin/campaign', requireAdminAuth, async (req, res) => {
     try {
+        const parkPid = resolveAdminCampaignPark(req, res);
+        if (!parkPid) return;
+
         const { text } = req.body;
 
         if (!text || typeof text !== 'string' || text.trim().length === 0) {
@@ -834,20 +971,21 @@ app.post('/api/admin/campaign', requireAdminAuth, async (req, res) => {
 
         const trimmed = text.trim();
         if (db.isConfigured()) {
-            const campaign = await dbCampaigns.upsertCampaign(trimmed);
-            console.log(`[Server] Kampanya DB'ye kaydedildi: "${trimmed}"`);
+            const campaign = await dbCampaigns.upsertCampaign(trimmed, parkPid);
+            console.log(`[Server] Kampanya DB'ye kaydedildi (${parkPid}): "${trimmed}"`);
             return res.json({
                 success: true,
                 message: 'Kampanya başarıyla kaydedildi.',
                 campaign
             });
         }
-        activeCampaignFallback = { text: trimmed, active: true, updatedAt: new Date().toISOString() };
-        console.log(`[Server] Kampanya güncellendi (bellek): "${trimmed}"`);
+        const campaign = { text: trimmed, active: true, updatedAt: new Date().toISOString() };
+        setCampaignMemory(parkPid, campaign);
+        console.log(`[Server] Kampanya güncellendi (bellek, ${parkPid}): "${trimmed}"`);
         res.json({
             success: true,
             message: 'Kampanya başarıyla kaydedildi.',
-            campaign: activeCampaignFallback
+            campaign
         });
     } catch (error) {
         console.error('[Server] Kampanya kaydetme hatası:', error.message);
@@ -861,28 +999,39 @@ app.post('/api/admin/campaign', requireAdminAuth, async (req, res) => {
 /**
  * GET /api/admin/campaign
  * Admin panelinden aktif kampanyayı okuma
+ * Query: ?parkPartnerId=... (yoksa birincil park)
  */
 app.get('/api/admin/campaign', requireAdminAuth, async (req, res) => {
     try {
-        const campaign = db.isConfigured() ? await dbCampaigns.getCampaign() : activeCampaignFallback;
+        const parkPid = resolveAdminCampaignPark(req, res);
+        if (!parkPid) return;
+
+        const campaign = db.isConfigured()
+            ? await dbCampaigns.getCampaign(parkPid)
+            : getCampaignMemory(parkPid);
         res.json({ success: true, campaign });
     } catch (error) {
         console.error('[Server] Kampanya okuma hatası:', error.message);
-        res.json({ success: true, campaign: activeCampaignFallback });
+        const fallback = getCampaignMemory(config.yandexFleet.partnerId);
+        res.json({ success: true, campaign: fallback });
     }
 });
 
 /**
  * DELETE /api/admin/campaign
  * Admin panelinden kampanyayı silme
+ * Query: ?parkPartnerId=... (yoksa birincil park)
  */
 app.delete('/api/admin/campaign', requireAdminAuth, async (req, res) => {
     try {
+        const parkPid = resolveAdminCampaignPark(req, res);
+        if (!parkPid) return;
+
         if (db.isConfigured()) {
-            await dbCampaigns.deactivateCampaign();
+            await dbCampaigns.deactivateCampaign(parkPid);
         }
-        activeCampaignFallback = { text: '', active: false, updatedAt: new Date().toISOString() };
-        console.log('[Server] Kampanya silindi.');
+        setCampaignMemory(parkPid, { text: '', active: false, updatedAt: new Date().toISOString() });
+        console.log(`[Server] Kampanya silindi (${parkPid}).`);
         res.json({ success: true, message: 'Kampanya başarıyla silindi.' });
     } catch (error) {
         console.error('[Server] Kampanya silme hatası:', error.message);
@@ -890,17 +1039,35 @@ app.delete('/api/admin/campaign', requireAdminAuth, async (req, res) => {
     }
 });
 
-/**
- * GET /api/campaign
- * Sürücü frontend'i için aktif kampanyayı okuma (public endpoint)
- */
+/** GET /api/campaign — public; token veya ?parkPartnerId / ?city / X-Park-Partner-Id */
 app.get('/api/campaign', async (req, res) => {
     try {
-        const campaign = db.isConfigured() ? await dbCampaigns.getCampaign() : activeCampaignFallback;
+        const parkPid = await resolvePublicCampaignPark(req);
+        const campaign = await loadCampaignForPark(parkPid);
         res.json({ success: true, campaign });
     } catch (error) {
         console.error('[Server] Kampanya okuma hatası:', error.message);
-        res.json({ success: true, campaign: activeCampaignFallback });
+        res.json({
+            success: true,
+            campaign: { text: '', active: false, updatedAt: null }
+        });
+    }
+});
+
+/**
+ * GET /api/admin/parks
+ * Yandex parkları (şehir etiketi + partnerId) — admin paneli şehir filtresi için
+ */
+app.get('/api/admin/parks', requireAdminAuth, async (req, res) => {
+    try {
+        const parks = config.getYandexParkSources().map(s => ({
+            label: s.label,
+            partnerId: s.partnerId
+        }));
+        res.json({ success: true, parks });
+    } catch (error) {
+        console.error('[Server] Admin parks hatası:', error.message);
+        res.status(500).json({ success: false, message: 'Park listesi alınamadı.' });
     }
 });
 
@@ -909,6 +1076,7 @@ app.get('/api/campaign', async (req, res) => {
  * Admin paneli leaderboard — tam ad + yolculuk sayısı + sıralama
  * Query:
  *   ?from=YYYY-MM-DD&to=YYYY-MM-DD  → özel tarih aralığı
+ *   ?parkPartnerId=<uuid>  → şehir/park (belirtilmezse varsayılan ilk park)
  *   (from/to yoksa: bugün)
  */
 app.get('/api/admin/leaderboard', requireAdminAuth, customLeaderboardLimiter, async (req, res) => {
@@ -930,7 +1098,11 @@ app.get('/api/admin/leaderboard', requireAdminAuth, customLeaderboardLimiter, as
             return res.status(400).json({ success: false, message: 'Tarih formatı YYYY-MM-DD olmalıdır.' });
         }
 
-        const data         = await leaderboardService.getLeaderboard(from, to, { adminView: true });
+        const parkPid = (req.query.parkPartnerId || '').trim() || config.yandexFleet.partnerId;
+        const data = await leaderboardService.getLeaderboard(from, to, {
+            adminView: true,
+            parkPartnerId: parkPid
+        });
         const driversArray = data.drivers || [];
 
         res.json({
@@ -995,11 +1167,14 @@ app.get('/', (req, res) => {
             health: 'GET /api/health',
             login: 'POST /api/auth/login',
             verifyOtp: 'POST /api/auth/verify-otp',
+            devSession: 'POST /api/auth/dev-session (yalnızca local, DEV_DRIVER_SESSION + X-Dev-Secret)',
             session: 'GET /api/auth/session',
             tripCount: 'POST /api/drivers/trip-count',
             leaderboard: 'GET /api/leaderboard',
             campaign: 'GET /api/campaign',
-            adminCampaign: 'POST|GET|DELETE /api/admin/campaign',
+            driverCampaign: 'GET /api/drivers/campaign (oturum — profil ile aynı şehir/park)',
+            adminCampaign: 'POST|GET|DELETE /api/admin/campaign (?parkPartnerId & body.parkPartnerId)',
+            adminParks: 'GET /api/admin/parks',
             adminLeaderboard: 'GET /api/admin/leaderboard'
         }
     });
@@ -1013,6 +1188,17 @@ async function startServer() {
         const connected = await db.testConnection();
         if (connected) {
             await runMigrations();
+            try {
+                const mainPid = config.yandexFleet.partnerId;
+                if (mainPid) {
+                    await db.query(
+                        `UPDATE campaigns SET park_partner_id = $1 WHERE park_partner_id IS NULL`,
+                        [mainPid]
+                    );
+                }
+            } catch (e) {
+                console.warn('[DB] campaigns park_partner_id backfill:', e.message);
+            }
         }
     }
 
@@ -1027,6 +1213,9 @@ async function startServer() {
         console.log(`  GET  http://localhost:${PORT}/api/health          - Sunucu durumu`);
         console.log(`  POST http://localhost:${PORT}/api/auth/login      - Giriş (telefon + şehir)`);
         console.log(`  POST http://localhost:${PORT}/api/auth/verify-otp - OTP doğrulama`);
+        if (config.isDevDriverSessionEnabled()) {
+            console.log(`  POST http://localhost:${PORT}/api/auth/dev-session - Dev oturum (SMS yok, X-Dev-Secret)`);
+        }
         console.log(`  POST http://localhost:${PORT}/api/drivers/trip-count - Dönem bazlı yolculuk sayısı`);
         console.log(`  GET  http://localhost:${PORT}/api/drivers         - Detaylı sürücü bilgileri`);
         console.log(`  GET  http://localhost:${PORT}/api/drivers/fetch   - Hızlı sürücü profilleri`);

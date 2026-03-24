@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const config = require('../config');
 const yandexFleetApi = require('./yandexFleetApi');
 const leaderboardService = require('./leaderboardService');
 const netgsmService = require('./netgsmService');
@@ -19,10 +20,13 @@ class AuthService {
         this.otpLastSentAt = new Map();
         this.OTP_RATE_LIMIT_MS = 60 * 1000; // 1 dakikada 1 OTP
 
-        // Sürücü cache (telefon -> profil)
+        // Sürücü cache (telefon -> profil) — birincil park ile uyumluluk
         this.driverCache = new Map();
         this.cacheExpiry = null;
         this.cacheTTL = 10 * 60 * 1000; // ✅ 10 dakika (eskiden 5'ti)
+        /** partnerId -> { expiry, phoneMap } — şehir/park bazlı giriş doğrulama */
+        this.parkDriverCaches = new Map();
+        this._parkRefreshPending = Object.create(null);
 
         // ✅ OPT-7: Sürücü başına bakiye+trip mini-cache (2 dakika)
         // validateSession her çağrıda 2 API isteği atmaması için
@@ -104,66 +108,128 @@ class AuthService {
     invalidateDriverCache() {
         this.cacheExpiry = null;
         this.driverCache.clear();
+        this.parkDriverCaches.clear();
         this._driverLiveCache.clear();
-        // ✅ OPT: Yandex profil cache'ini de sıfırla
         yandexFleetApi.invalidateProfileCache();
     }
 
+    profileToDriverInfo(profile, parkPartnerId) {
+        const dp = profile.driver_profile || {};
+        const car = profile.car || {};
+        const accounts = profile.accounts || [];
+        const account = accounts[0] || {};
+        const phones = dp.phones || [];
+        const rawBalance = parseFloat(account.balance);
+        return {
+            id: dp.id,
+            name: `${dp.first_name || ''} ${dp.last_name || ''}`.trim(),
+            phones,
+            carId: car.id || null,
+            carNumber: car.number || null,
+            car: car.number
+                ? `${car.brand || ''} ${car.model || ''} (${car.year || ''}) - Plaka: ${car.number}`
+                : 'Araç atanmamış',
+            balance: !isNaN(rawBalance) ? `${Math.round(rawBalance)} ₺` : '-',
+            tripCount: 0,
+            parkPartnerId
+        };
+    }
+
     /**
-     * Sürücü veritabanını günceller/cache'ler
+     * Tek Yandex parkı için sürücü listesini önbelleğe alır (TTL: cacheTTL)
      */
-    async refreshDriverCache() {
+    async refreshParkDriverCache(parkSource) {
+        const partnerId = parkSource.partnerId;
         const now = Date.now();
-        if (this.driverCache.size > 0 && this.cacheExpiry && now < this.cacheExpiry) {
-            return;
+        const cached = this.parkDriverCaches.get(partnerId);
+        if (cached && now < cached.expiry) return;
+
+        if (this._parkRefreshPending[partnerId]) {
+            return this._parkRefreshPending[partnerId];
         }
 
-        if (this._driverRefreshPending) return this._driverRefreshPending;
-
-        this._driverRefreshPending = (async () => {
+        const task = (async () => {
             try {
-                const driverProfiles = await yandexFleetApi.getDriverProfiles();
-                this.driverCache.clear();
-
-                for (const profile of driverProfiles) {
-                    const dp = profile.driver_profile || {};
-                    const car = profile.car || {};
-                    const accounts = profile.accounts || [];
-                    const account = accounts[0] || {};
-                    const phones = dp.phones || [];
-
-                    const rawBalance = parseFloat(account.balance);
-                    const driverInfo = {
-                        id: dp.id,
-                        name: `${dp.first_name || ''} ${dp.last_name || ''}`.trim(),
-                        phones: phones,
-                        carId: car.id || null,
-                        carNumber: car.number || null,
-                        car: car.number
-                            ? `${car.brand || ''} ${car.model || ''} (${car.year || ''}) - Plaka: ${car.number}`
-                            : 'Araç atanmamış',
-                        balance: !isNaN(rawBalance)
-                            ? `${Math.round(rawBalance)} ₺`
-                            : '-',
-                        tripCount: 0
-                    };
-
-                    // Her telefon numarası için cache'e ekle
-                    for (const phone of phones) {
-                        const normalizedPhone = this.normalizePhone(phone);
-                        this.driverCache.set(normalizedPhone, driverInfo);
+                const profiles = await yandexFleetApi.fetchDriverProfilesForParkSource(parkSource);
+                const phoneMap = new Map();
+                for (const profile of profiles) {
+                    const driverInfo = this.profileToDriverInfo(profile, partnerId);
+                    for (const ph of driverInfo.phones || []) {
+                        phoneMap.set(this.normalizePhone(ph), driverInfo);
                     }
                 }
-
-                this.cacheExpiry = now + this.cacheTTL;
+                this.parkDriverCaches.set(partnerId, {
+                    expiry: Date.now() + this.cacheTTL,
+                    phoneMap
+                });
+                if (partnerId === config.yandexFleet.partnerId) {
+                    this.driverCache.clear();
+                    for (const [k, v] of phoneMap.entries()) {
+                        this.driverCache.set(k, v);
+                    }
+                    this.cacheExpiry = Date.now() + this.cacheTTL;
+                }
             } catch (error) {
-                console.error('[AuthService] Sürücü veritabanı güncelleme hatası:', error.message);
+                console.error('[AuthService] Park sürücü önbelleği hatası:', partnerId, error.message);
                 throw error;
             } finally {
-                this._driverRefreshPending = null;
+                delete this._parkRefreshPending[partnerId];
             }
         })();
-        return this._driverRefreshPending;
+
+        this._parkRefreshPending[partnerId] = task;
+        return task;
+    }
+
+    lookupPhoneInParkCache(phone, partnerId) {
+        const entry = this.parkDriverCaches.get(partnerId);
+        if (!entry) return null;
+        const normalizedPhone = this.normalizePhone(phone);
+        const map = entry.phoneMap;
+        if (map.has(normalizedPhone)) return map.get(normalizedPhone);
+        const digits = normalizedPhone.replace(/\D/g, '');
+        for (const [key, value] of map.entries()) {
+            const keyDigits = key.replace(/\D/g, '');
+            if (keyDigits === digits || keyDigits.endsWith(digits.slice(-10))) {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    async findDriverByPhoneInPark(phone, parkSource) {
+        await this.refreshParkDriverCache(parkSource);
+        return this.lookupPhoneInParkCache(phone, parkSource.partnerId);
+    }
+
+    /** Kayıt: telefon herhangi bir filoda var mı */
+    async findDriverByPhoneInAnyPark(phone) {
+        const sources = config.getYandexParkSources();
+        if (sources.length === 0) return null;
+        await Promise.all(sources.map(s => this.refreshParkDriverCache(s)));
+        const normalized = this.normalizePhone(phone);
+        for (const src of sources) {
+            const d = this.lookupPhoneInParkCache(normalized, src.partnerId);
+            if (d) return d;
+        }
+        return null;
+    }
+
+    /**
+     * Birincil park profilleri (leaderboard vb. ile uyum)
+     */
+    async refreshDriverCache() {
+        const sources = config.getYandexParkSources();
+        if (sources.length === 0) return;
+        await this.refreshParkDriverCache(sources[0]);
+    }
+
+    async getDriverForSession(phone, parkPartnerId) {
+        const pid = parkPartnerId || config.yandexFleet.partnerId;
+        const src = config.findYandexParkByPartnerId(pid);
+        if (!src) return null;
+        await this.refreshParkDriverCache(src);
+        return this.lookupPhoneInParkCache(phone, pid);
     }
 
     /**
@@ -197,25 +263,7 @@ class AuthService {
      * @returns {object|null} Sürücü bilgisi veya null
      */
     async findDriverByPhone(phone) {
-        await this.refreshDriverCache();
-
-        const normalizedPhone = this.normalizePhone(phone);
-
-        // Exact match
-        if (this.driverCache.has(normalizedPhone)) {
-            return this.driverCache.get(normalizedPhone);
-        }
-
-        // Try different formats
-        const digits = normalizedPhone.replace(/\D/g, '');
-        for (const [key, value] of this.driverCache.entries()) {
-            const keyDigits = key.replace(/\D/g, '');
-            if (keyDigits === digits || keyDigits.endsWith(digits.slice(-10))) {
-                return value;
-            }
-        }
-
-        return null;
+        return this.findDriverByPhoneInAnyPark(phone);
     }
 
     /**
@@ -229,8 +277,12 @@ class AuthService {
     async sendRegistrationOTP(phone, city, registrationData) {
         const normalizedPhone = this.normalizePhone(phone);
 
-        // Telefon zaten sistemde kayıtlı mı?
-        const existingDriver = await this.findDriverByPhone(normalizedPhone);
+        if (!config.findYandexParkByCity(city)) {
+            return { success: false, message: 'Geçersiz şehir seçimi veya bu şehirde kayıt kabul edilmiyor.' };
+        }
+
+        // Telefon zaten herhangi bir filoda kayıtlı mı?
+        const existingDriver = await this.findDriverByPhoneInAnyPark(normalizedPhone);
         if (existingDriver) {
             return { success: false, message: 'Bu telefon numarası zaten kayıtlıdır.' };
         }
@@ -242,8 +294,9 @@ class AuthService {
             return { success: false, message: `Yeni kod göndermek için ${waitSec} saniye bekleyin.` };
         }
 
-        const otpCode = this.generateOTP();
         const expiresAt = Date.now() + 5 * 60 * 1000; // 5 dakika
+        const devBypass = config.isDevDriverSessionEnabled();
+        const otpCode = devBypass ? '000000' : this.generateOTP();
 
         this.registerOtpStore.set(normalizedPhone, {
             code: otpCode,
@@ -251,6 +304,16 @@ class AuthService {
             attempts: 0,
             registrationData: { ...registrationData, city }
         });
+
+        if (devBypass) {
+            console.warn('[AuthService] DEV: kayıt OTP SMS atlandı. Kod: 000000');
+            this.registerOtpLastSentAt.set(normalizedPhone, Date.now());
+            return {
+                success: true,
+                message: 'Geliştirme modu: SMS gönderilmedi. OTP: 000000',
+                devMode: true
+            };
+        }
 
         const smsMessage = `RiseGo kayıt doğrulama kodunuz: ${otpCode}. Bu kod 5 dakika geçerlidir.`;
         const smsResult = await netgsmService.sendOtpSms(normalizedPhone, smsMessage);
@@ -300,20 +363,27 @@ class AuthService {
         const { registrationData } = data;
         this.registerOtpStore.delete(normalizedPhone);
 
-        // Sürücü oluştur (yandexFleetApi.createDriverProfile)
+        const parkForRegistration = config.findYandexParkByCity(registrationData.city);
+        if (!parkForRegistration) {
+            return { success: false, message: 'Geçersiz şehir seçimi veya bu şehirde kayıt kabul edilmiyor.' };
+        }
+
         let result;
         try {
-            result = await yandexFleetApi.createDriverProfile({
-                firstName: registrationData.firstName,
-                lastName: registrationData.lastName,
-                phone: normalizedPhone,
-                taxIdentificationNumber: registrationData.taxIdentificationNumber,
-                driverLicenseNumber: registrationData.driverLicenseNumber,
-                driverLicenseIssueDate: registrationData.driverLicenseIssueDate,
-                driverLicenseExpiryDate: registrationData.driverLicenseExpiryDate,
-                birthDate: registrationData.birthDate,
-                country: registrationData.country || 'tur'
-            });
+            result = await yandexFleetApi.createDriverProfile(
+                {
+                    firstName: registrationData.firstName,
+                    lastName: registrationData.lastName,
+                    phone: normalizedPhone,
+                    taxIdentificationNumber: registrationData.taxIdentificationNumber,
+                    driverLicenseNumber: registrationData.driverLicenseNumber,
+                    driverLicenseIssueDate: registrationData.driverLicenseIssueDate,
+                    driverLicenseExpiryDate: registrationData.driverLicenseExpiryDate,
+                    birthDate: registrationData.birthDate,
+                    country: registrationData.country || 'tur'
+                },
+                parkForRegistration.partnerId
+            );
         } catch (err) {
             console.error('[AuthService] Sürücü oluşturma hatası:', err.message);
             return { success: false, message: err.message || 'Sürücü oluşturulurken hata oluştu.' };
@@ -328,14 +398,15 @@ class AuthService {
             balance: '-',
             tripCount: 0,
             carId: null,
-            carNumber: null
+            carNumber: null,
+            parkPartnerId: parkForRegistration.partnerId
         };
 
         // Bakiye ve yolculuk sayısını çek (yeni sürücü için 0 olacak)
         try {
             const [tripCount, balanceData] = await Promise.all([
-                leaderboardService.getDriverTripCount(driver.id, 'all').catch(() => 0),
-                yandexFleetApi.getDriverBalance(driver.id).catch(() => null)
+                leaderboardService.getDriverTripCount(driver.id, 'all', driver.parkPartnerId).catch(() => 0),
+                yandexFleetApi.getDriverBalance(driver.id, parkForRegistration.partnerId).catch(() => null)
             ]);
             driver.tripCount = tripCount;
             if (balanceData) {
@@ -351,10 +422,18 @@ class AuthService {
         this.sessions.set(sessionToken, {
             phone: normalizedPhone,
             driverId: driver.id,
-            createdAt: Date.now()
+            createdAt: Date.now(),
+            parkPartnerId: parkForRegistration.partnerId
         });
         if (db.isConfigured()) {
-            await dbSessions.createSession(sessionToken, driver.id, normalizedPhone, registrationData.city || '', expiresAt);
+            await dbSessions.createSession(
+                sessionToken,
+                driver.id,
+                normalizedPhone,
+                registrationData.city || '',
+                expiresAt,
+                parkForRegistration.partnerId
+            );
         }
 
         return { success: true, driver, sessionToken };
@@ -367,12 +446,19 @@ class AuthService {
      * @returns {object} İşlem sonucu
      */
     async login(phone, city) {
-        // 1. Sürücüyü bul
-        const driver = await this.findDriverByPhone(phone);
+        const parkSource = config.findYandexParkByCity(city);
+        if (!parkSource) {
+            return {
+                success: false,
+                message: 'Geçersiz şehir seçimi veya bu şehirde hizmet bulunmuyor.'
+            };
+        }
+
+        const driver = await this.findDriverByPhoneInPark(phone, parkSource);
         if (!driver) {
             return {
                 success: false,
-                message: 'Bu telefon numarasına kayıtlı bir sürücü bulunamadı.'
+                message: 'Bu telefon numarası seçtiğiniz şehirdeki filomuzda kayıtlı değil.'
             };
         }
 
@@ -388,19 +474,29 @@ class AuthService {
             };
         }
 
-        // 2. OTP oluştur
-        const otpCode = this.generateOTP();
         const expiresAt = Date.now() + 5 * 60 * 1000; // 5 dakika geçerli
+        const devBypass = config.isDevDriverSessionEnabled();
+        const otpCode = devBypass ? '000000' : this.generateOTP();
 
         this.otpStore.set(normalizedPhone, {
             code: otpCode,
             expiresAt: expiresAt,
             attempts: 0,
             driver: driver,
-            city: city || ''
+            city: city || '',
+            parkPartnerId: parkSource.partnerId
         });
 
-        // 3. NetGSM ile OTP SMS gönder
+        if (devBypass) {
+            console.warn('[AuthService] DEV: giriş OTP SMS atlandı. Bu numara için kod: 000000');
+            this.otpLastSentAt.set(normalizedPhone, Date.now());
+            return {
+                success: true,
+                message: 'Geliştirme modu: SMS gönderilmedi. OTP: 000000',
+                devMode: true
+            };
+        }
+
         const smsMessage = `RiseGo doğrulama kodunuz: ${otpCode}. Bu kod 5 dakika geçerlidir.`;
         const smsResult = await netgsmService.sendOtpSms(normalizedPhone, smsMessage);
 
@@ -464,17 +560,16 @@ class AuthService {
             };
         }
 
-        // Başarılı - OTP'yi temizle
-        const driver = otpData.driver;
+        const driver = { ...otpData.driver, parkPartnerId: otpData.parkPartnerId };
         this.otpStore.delete(normalizedPhone);
 
-        // Bakiye ve yolculuk (Sadece giriş anında bakiyeye ve günlük yolculuğa odaklanıldı, sistemi boğmamak için)
+        const parkPid = otpData.parkPartnerId;
         try {
-            const balanceData = await yandexFleetApi.getDriverBalance(driver.id).catch(err => null);
+            const balanceData = await yandexFleetApi.getDriverBalance(driver.id, parkPid).catch(err => null);
 
             // Tüm zamanları çekmek çok ağır, UI'de göstermek için 'daily' (günlük) veya dashboard'un kendi isteği tercih edilmeli.
             // driver.tripCount manuel veya ayrı apiden gelsin. Burada sistemi kilitlemiyoruz.
-            driver.tripCount = await leaderboardService.getDriverTripCount(driver.id, 'all').catch(() => 0);
+            driver.tripCount = await leaderboardService.getDriverTripCount(driver.id, 'all', driver.parkPartnerId).catch(() => 0);
 
             if (balanceData) {
                 const rawBal = parseFloat(balanceData.balance);
@@ -490,10 +585,18 @@ class AuthService {
         this.sessions.set(sessionToken, {
             phone: normalizedPhone,
             driverId: driver.id,
-            createdAt: Date.now()
+            createdAt: Date.now(),
+            parkPartnerId: parkPid
         });
         if (db.isConfigured()) {
-            await dbSessions.createSession(sessionToken, driver.id, normalizedPhone, otpData.city || '', expiresAt);
+            await dbSessions.createSession(
+                sessionToken,
+                driver.id,
+                normalizedPhone,
+                otpData.city || '',
+                expiresAt,
+                parkPid
+            );
         }
 
         return {
@@ -505,19 +608,132 @@ class AuthService {
     }
 
     /**
-     * Session token ile oturum doğrulama
-     * ✅ OPT-7: Bakiye ve tripCount sürücü başına 2 dakika cache'lenir
-     * Her sayfa yenilemesinde 2 API isteği atılmasını önler
+     * DEV_SESSION_SECRET ile zamanlamaya duyarlı karşılaştırma
+     */
+    _compareDevSecret(provided) {
+        const expected = config.devDriverSession.secret;
+        if (!provided || typeof provided !== 'string' || !expected) return false;
+        try {
+            const a = Buffer.from(provided, 'utf8');
+            const b = Buffer.from(expected, 'utf8');
+            if (a.length !== b.length) return false;
+            return crypto.timingSafeEqual(a, b);
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * Sadece local: SMS yok; X-Dev-Secret + DEV_DRIVER_SESSION ile doğrudan sürücü oturumu
+     */
+    async createDevSession(phone, city, providedSecret) {
+        if (!config.isDevDriverSessionEnabled()) {
+            return { success: false, message: 'Dev oturum kullanılamıyor.' };
+        }
+        if (!this._compareDevSecret(providedSecret || '')) {
+            return { success: false, message: 'Yetkisiz.', forbidden: true };
+        }
+
+        const parkSource = config.findYandexParkByCity(city);
+        if (!parkSource) {
+            return {
+                success: false,
+                message: 'Geçersiz şehir seçimi veya bu şehirde hizmet bulunmuyor.'
+            };
+        }
+
+        const driver = await this.findDriverByPhoneInPark(phone, parkSource);
+        if (!driver) {
+            return {
+                success: false,
+                message: 'Bu telefon numarası seçtiğiniz şehirdeki filomuzda kayıtlı değil.'
+            };
+        }
+
+        const normalizedPhone = this.normalizePhone(phone);
+        const parkPid = parkSource.partnerId;
+        const d = { ...driver, parkPartnerId: parkPid };
+
+        try {
+            const balanceData = await yandexFleetApi.getDriverBalance(d.id, parkPid).catch(() => null);
+            d.tripCount = await leaderboardService.getDriverTripCount(d.id, 'all', d.parkPartnerId).catch(() => 0);
+            if (balanceData) {
+                const rawBal = parseFloat(balanceData.balance);
+                d.balance = !isNaN(rawBal) ? `${Math.round(rawBal)} ₺` : d.balance;
+            }
+        } catch (error) {
+            console.error('[AuthService] Dev oturum veri hatası:', error.message);
+        }
+
+        const sessionToken = crypto.randomBytes(32).toString('hex');
+        const expiresAt = Date.now() + this.SESSION_TTL;
+        this.sessions.set(sessionToken, {
+            phone: normalizedPhone,
+            driverId: d.id,
+            createdAt: Date.now(),
+            parkPartnerId: parkPid
+        });
+        if (db.isConfigured()) {
+            await dbSessions.createSession(sessionToken, d.id, normalizedPhone, city || '', expiresAt, parkPid);
+        }
+
+        console.warn('[AuthService] DEV oturum:', { driverId: d.id, city: parkSource.label });
+
+        return {
+            success: true,
+            message: 'Dev oturumu oluşturuldu (SMS gönderilmedi).',
+            driver: d,
+            sessionToken
+        };
+    }
+
+    /** DB oturum satırından park UUID (city → findYandexParkByCity) */
+    _resolveParkPartnerIdFromDbSession(dbSession, memorySession) {
+        let parkPid = (dbSession.park_partner_id || '').trim();
+        if (!parkPid && dbSession.city) {
+            const byCity = config.findYandexParkByCity(dbSession.city);
+            if (byCity) parkPid = byCity.partnerId;
+        }
+        if (!parkPid && memorySession && memorySession.parkPartnerId) {
+            parkPid = String(memorySession.parkPartnerId).trim();
+        }
+        if (!parkPid) parkPid = config.yandexFleet.partnerId;
+        return parkPid;
+    }
+
+    /** Token → park UUID (DB/RAM; Yandex çağrısı yok) — GET /api/campaign için */
+    async getSessionParkPartnerId(token) {
+        if (!token) return null;
+        const memSession = this.sessions.get(token);
+        if (db.isConfigured()) {
+            try {
+                const dbSession = await dbSessions.getSession(token);
+                if (dbSession) {
+                    return this._resolveParkPartnerIdFromDbSession(dbSession, memSession);
+                }
+            } catch (_) { /* DB hatası — RAM'e düş */ }
+        }
+        if (memSession) {
+            if (Date.now() - memSession.createdAt > this.SESSION_TTL) return null;
+            return memSession.parkPartnerId || config.yandexFleet.partnerId;
+        }
+        return null;
+    }
+
+    /**
+     * Oturum doğrulama; bakiye ve tripCount 2 dk cache
      */
     async validateSession(token) {
         let session = this.sessions.get(token);
         if (db.isConfigured()) {
             const dbSession = await dbSessions.getSession(token);
             if (dbSession) {
+                const parkPartnerId = this._resolveParkPartnerIdFromDbSession(dbSession, session);
                 session = {
                     phone: dbSession.phone,
                     driverId: dbSession.driver_id,
-                    createdAt: new Date(dbSession.created_at).getTime()
+                    createdAt: new Date(dbSession.created_at).getTime(),
+                    parkPartnerId
                 };
             }
         }
@@ -529,14 +745,14 @@ class AuthService {
             return null;
         }
 
-        // Sürücü bilgilerini cache'den veya API'den çek
-        await this.refreshDriverCache();
-        const driver = this.driverCache.get(session.phone);
+        const parkPid = session.parkPartnerId || config.yandexFleet.partnerId;
+        const driver = await this.getDriverForSession(session.phone, parkPid);
         if (!driver) {
             this.sessions.delete(token);
             if (db.isConfigured()) await dbSessions.deleteSession(token);
             return null;
         }
+        driver.parkPartnerId = parkPid;
 
         const now = Date.now();
         const LIVE_TTL = 2 * 60 * 1000; // 2 dakika
@@ -550,8 +766,8 @@ class AuthService {
             // Cache süresi dolmuş veya yok — taze çek
             try {
                 const [balanceData, tripCount] = await Promise.all([
-                    yandexFleetApi.getDriverBalance(driver.id).catch(() => null),
-                    leaderboardService.getDriverTripCount(driver.id, 'all').catch(() => 0)
+                    yandexFleetApi.getDriverBalance(driver.id, parkPid).catch(() => null),
+                    leaderboardService.getDriverTripCount(driver.id, 'all', driver.parkPartnerId).catch(() => 0)
                 ]);
 
                 if (balanceData) {

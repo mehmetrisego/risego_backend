@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RiseGo Yönetim Paneli</title>
+    <meta name="description" content="RiseGo Yönetim Paneli - Kampanya yönetimi ve sürücü sıralama tablosu">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="css/admin.css">
+</head>
+<body>
+    <!-- Ambient Background -->
+    <div class="ambient-bg"></div>
+
+    <!-- Login Screen (OTP - sadece yetkili numaralar) -->
+    <div class="login-screen" id="loginScreen">
+        <div class="login-card">
+            <div class="login-header">
+                <div class="logo-icon">
+                    <svg width="28" height="28" viewBox="0 0 24 24" fill="none">
+                        <path d="M12 2L2 7L12 12L22 7L12 2Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        <path d="M2 17L12 22L22 17" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        <path d="M2 12L12 17L22 12" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                </div>
+                <h1 class="login-title">RiseGo Admin Panel</h1>
+                <p class="login-subtitle">Yetkili telefon numaranızla giriş yapın</p>
+            </div>
+
+            <!-- Adım 1: Telefon girişi -->
+            <div class="login-step" id="loginStepPhone">
+                <label class="input-label" for="loginPhone">Telefon Numarası</label>
+                <input type="tel" id="loginPhone" class="login-input" placeholder="05XX XXX XX XX" maxlength="14" autocomplete="tel" onkeydown="if(event.key==='Enter')sendAdminOtp()">
+                <p class="login-error" id="loginError"></p>
+                <button class="btn-login" id="btnSendOtp" onclick="sendAdminOtp()">
+                    <span class="btn-text">Doğrulama Kodu Gönder</span>
+                    <span class="btn-loader" style="display:none"><div class="spinner"></div></span>
+                </button>
+            </div>
+
+            <!-- Adım 2: OTP girişi -->
+            <div class="login-step" id="loginStepOtp" style="display:none">
+                <p class="otp-sent-text">SMS ile gönderilen 6 haneli kodu girin</p>
+                <input type="text" id="loginOtp" class="login-input otp-input" placeholder="000000" maxlength="6" pattern="[0-9]*" inputmode="numeric" autocomplete="one-time-code" onkeydown="if(event.key==='Enter')verifyAdminOtp()">
+                <p class="login-error" id="otpError"></p>
+                <button class="btn-login" id="btnVerifyOtp" onclick="verifyAdminOtp()">
+                    <span class="btn-text">Giriş Yap</span>
+                    <span class="btn-loader" style="display:none"><div class="spinner"></div></span>
+                </button>
+                <button class="btn-back" onclick="backToPhoneStep()">Farklı numara dene</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="admin-container" id="adminContainer" style="display:none">
+        <!-- Header -->
+        <header class="admin-header" id="adminHeader">
+            <div class="header-left">
+                <div class="logo">
+                    <div class="logo-icon">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+                            <path d="M12 2L2 7L12 12L22 7L12 2Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                            <path d="M2 17L12 22L22 17" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                            <path d="M2 12L12 17L22 12" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                    </div>
+                    <div>
+                        <h1 class="logo-text">RiseGo</h1>
+                        <span class="logo-badge">Admin Panel</span>
+                    </div>
+                </div>
+            </div>
+            <div class="header-right" style="display: flex; gap: 15px; align-items: center;">
+                <div class="header-status" id="serverStatus">
+                    <span class="status-dot"></span>
+                    <span class="status-text">Bağlanıyor...</span>
+                </div>
+                <div class="header-status session-badge" id="driverSessionStatus" style="background: rgba(14, 165, 233, 0.1); border: 1px solid rgba(14, 165, 233, 0.2); color: #0ea5e9;">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" style="margin-right: 6px;">
+                        <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        <circle cx="12" cy="7" r="4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                    Güncel oturumu açık sürücü: <span id="activeSessionsCount" style="font-weight: bold; margin-left: 5px;">0</span>
+                </div>
+                <button class="btn-logout" id="btnLogout" onclick="adminLogout()" title="Çıkış yap">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+                        <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        <path d="M16 17l5-5-5-5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        <path d="M21 12H9" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                    Çıkış
+                </button>
+            </div>
+        </header>
+
+        <!-- Dashboard Grid -->
+        <div class="dashboard-grid">
+            <!-- Kampanya Yönetim Kartı -->
+            <div class="admin-card campaign-card" id="campaignCard">
+                <div class="card-header">
+                    <div class="card-icon campaign-icon">
+                        <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+                            <path d="M21 15V19C21 19.5304 20.7893 20.0391 20.4142 20.4142C20.0391 20.7893 19.5304 21 19 21H5C4.46957 21 3.96086 20.7893 3.58579 20.4142C3.21071 20.0391 3 19.5304 3 19V15" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                            <path d="M17 8L12 3L7 8" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                            <path d="M12 3V15" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                    </div>
+                    <div>
+                        <h2 class="card-title">Kampanya Yönetimi</h2>
+                        <p class="card-subtitle">Şehir seçin; her şehir için ayrı kampanya metni</p>
+                    </div>
+                </div>
+
+                <div class="campaign-body">
+                    <div class="campaign-city-row">
+                        <label class="input-label" for="campaignCity">Şehir</label>
+                        <select id="campaignCity" class="campaign-select" aria-label="Kampanya şehri">
+                            <option value="">Yükleniyor...</option>
+                        </select>
+                    </div>
+
+                    <!-- Mevcut Kampanya Durumu -->
+                    <div class="campaign-status" id="campaignStatus">
+                        <div class="status-badge inactive" id="campaignBadge">
+                            <span class="badge-dot"></span>
+                            <span id="campaignBadgeText">Aktif Kampanya Yok</span>
+                        </div>
+                        <p class="current-campaign-text" id="currentCampaignText">Henüz bir kampanya oluşturulmamış.</p>
+                        <p class="campaign-date" id="campaignDate"></p>
+                    </div>
+
+                    <!-- Kampanya Input -->
+                    <div class="campaign-input-group">
+                        <label class="input-label" for="campaignInput">Kampanya Metni</label>
+                        <textarea 
+                            id="campaignInput" 
+                            class="campaign-textarea" 
+                            placeholder="Sürücülere gösterilecek kampanya metnini buraya giriniz..."
+                            rows="3"
+                        ></textarea>
+                        <div class="char-counter">
+                            <span id="charCount">0</span> karakter
+                        </div>
+                    </div>
+
+                    <!-- Action Buttons -->
+                    <div class="campaign-actions">
+                        <button class="btn-approve" id="approveBtn" onclick="saveCampaign()" disabled>
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+                                <path d="M20 6L9 17L4 12" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+                            </svg>
+                            <span class="btn-text">Onayla</span>
+                            <span class="btn-loader" style="display:none"><div class="spinner"></div></span>
+                        </button>
+                        <button class="btn-delete" id="deleteBtn" onclick="deleteCampaign()" disabled>
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+                                <path d="M3 6H5H21" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                                <path d="M8 6V4C8 3.46957 8.21071 2.96086 8.58579 2.58579C8.96086 2.21071 9.46957 2 10 2H14C14.5304 2 15.0391 2.21071 15.4142 2.58579C15.7893 2.96086 16 3.46957 16 4V6M19 6V20C19 20.5304 18.7893 21.0391 18.4142 21.4142C18.0391 21.7893 17.5304 22 17 22H7C6.46957 22 5.96086 21.7893 5.58579 21.4142C5.21071 21.0391 5 20.5304 5 20V6H19Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                            </svg>
+                            <span class="btn-text">Sil</span>
+                            <span class="btn-loader" style="display:none"><div class="spinner"></div></span>
+                        </button>
+                    </div>
+
+                    <!-- Toast Mesajı -->
+                    <div class="toast" id="campaignToast">
+                        <span class="toast-icon"></span>
+                        <span class="toast-text" id="campaignToastText"></span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Dinamik Leaderboard Kartı -->
+            <div class="admin-card leaderboard-card" id="leaderboardCard">
+                <div class="card-header">
+                    <div class="card-icon leaderboard-icon">
+                        <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+                            <path d="M6 9H4.5a2.5 2.5 0 0 1 0-5H6M18 9h1.5a2.5 2.5 0 0 0 0-5H18M6 9v4a6 6 0 0 0 12 0V9M6 9h12M9 21h6M12 17v4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                    </div>
+                    <div>
+                        <h2 class="card-title">Sürücü Sıralama Tablosu</h2>
+                        <p class="card-subtitle" id="leaderboardPeriod">Yükleniyor...</p>
+                    </div>
+                </div>
+
+                <div class="leaderboard-body">
+                    <!-- Tarih Filtreleme -->
+                    <div class="leaderboard-filter">
+                        <div class="filter-group">
+                            <label for="startDate">Başlangıç</label>
+                            <input type="date" id="startDate" class="filter-input">
+                        </div>
+                        <div class="filter-group">
+                            <label for="endDate">Bitiş</label>
+                            <input type="date" id="endDate" class="filter-input">
+                        </div>
+                        <div class="filter-group filter-group-city">
+                            <label for="leaderboardCity">Şehir</label>
+                            <select id="leaderboardCity" class="filter-input" aria-label="Şehir">
+                                <option value="">Yükleniyor...</option>
+                            </select>
+                        </div>
+                        <button class="btn-filter" id="filterBtn" onclick="filterLeaderboard()">
+                            Filtrele
+                        </button>
+                    </div>
+
+                    <!-- Bilgilendirme Başlığı -->
+                    <div class="period-info" id="periodInfo">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                            <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2"/>
+                            <path d="M12 16V12M12 8H12.01" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                        </svg>
+                        <span id="periodInfoText">Dönem verisi yükleniyor...</span>
+                    </div>
+
+                    <!-- Leaderboard İçerik -->
+                    <div class="leaderboard-content" id="leaderboardContent">
+                        <div class="leaderboard-loading">
+                            <div class="spinner-large"></div>
+                            <p>Sıralama tablosu yükleniyor...</p>
+                            <p class="loading-hint">İlk yükleme biraz zaman alabilir</p>
+                        </div>
+                    </div>
+
+                    <!-- View Toggle & Reload -->
+                    <div class="leaderboard-actions">
+                        <div class="leaderboard-tabs">
+                            <button class="btn-tab active" id="btnCurrent" onclick="loadLeaderboard(false)">Mevcut sıralama</button>
+                            <button class="btn-tab" id="btnPrevious" onclick="loadLeaderboard(true)" title="Sonlanmış önceki 10 günlük kampanya">Önceki sıralama</button>
+                        </div>
+                        <button class="btn-reload" id="reloadBtn" onclick="reloadCurrentLeaderboard()">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                                <path d="M23 4V10H17" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                                <path d="M1 20V14H7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                                <path d="M3.51 9A9 9 0 0 1 14.85 3.5L23 10M1 14L9.15 20.5A9 9 0 0 0 20.49 15" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                            </svg>
+                            Yenile
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Footer -->
+        <footer class="admin-footer">
+            <p>© 2026 RiseGo. Yönetim Paneli — Tüm hakları saklıdır.</p>
+        </footer>
+    </div>
+
+    <script src="js/admin.js"></script>
+</body>
+</html>
