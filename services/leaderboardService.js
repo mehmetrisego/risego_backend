@@ -485,12 +485,15 @@ class LeaderboardService {
 
                 const raw = await this._fetchOrders(deltaFrom, now, park);
                 const mapped = raw.map(o => this._mapOrder(o, park.partnerId)).filter(Boolean);
+                const dedupe = new Map();
+                mapped.forEach(o => dedupe.set(`${o.id}|${o.parkPartnerId}`, o));
+                const uniqueDelta = Array.from(dedupe.values());
 
-                if (mapped.length === 0) continue;
+                if (uniqueDelta.length === 0) continue;
                 anyNew = true;
 
                 if (db.isConfigured()) {
-                    const count = await dbOrders.upsertOrders(mapped);
+                    const count = await dbOrders.upsertOrders(uniqueDelta);
                     console.log(`[LeaderboardService]   ${park.label}: +${count} upsert`);
                 } else {
                     const map = new Map((this._orders || []).map(o => [`${o.id}|${o.parkPartnerId}`, o]));

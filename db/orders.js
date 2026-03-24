@@ -7,15 +7,30 @@ const db = require('./index');
 const BATCH_SIZE = 500;
 
 /**
+ * Aynı (id, park_partner_id) birden fazla kez gelirse Postgres
+ * "ON CONFLICT DO UPDATE command cannot affect row a second time" verir; tek satırda birleştirir.
+ */
+function dedupeOrders(orders) {
+    const map = new Map();
+    for (const o of orders) {
+        if (!o || !o.id) continue;
+        const key = `${o.id}|${o.parkPartnerId || ''}`;
+        map.set(key, o);
+    }
+    return Array.from(map.values());
+}
+
+/**
  * Siparişleri toplu olarak DB'ye yazar (upsert)
  * @param {Array<{id: string, driverId: string|null, bookedAt: Date, parkPartnerId: string}>} orders
  */
 async function upsertOrders(orders) {
     if (!db.isConfigured() || !orders.length) return 0;
 
+    const deduped = dedupeOrders(orders);
     let inserted = 0;
-    for (let i = 0; i < orders.length; i += BATCH_SIZE) {
-        const batch = orders.slice(i, i + BATCH_SIZE);
+    for (let i = 0; i < deduped.length; i += BATCH_SIZE) {
+        const batch = deduped.slice(i, i + BATCH_SIZE);
         const values = batch.map((o, idx) => {
             const base = idx * 4;
             return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4})`;
