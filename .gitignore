@@ -9,6 +9,7 @@ node_modules/
 # Frontend ve Admin Panel (ayrı repo'larda push ediliyor)
 risego_frontend/
 risego_adminpanel/
+mehmetrisego-risego_adminpanel-main/
 
 # Oluşturulan dosyalar
 sürücüler.txt
