@@ -34,6 +34,7 @@ const allowedOrigins = [
     'https://risegodriver.com',
     'https://www.risegodriver.com',
     'https://mehmetrisego.github.io',
+    'https://risegobackend-production-2e58.up.railway.app',
     'http://localhost:3000',
     'http://127.0.0.1:3000',
     'http://127.0.0.1:5500',
