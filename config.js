@@ -150,28 +150,8 @@ const config = {
         username: process.env.NETGSM_USERNAME,
         usercode: process.env.NETGSM_USERCODE,
         msgheader: process.env.NETGSM_MSGHEADER || 'RISE LTD'
-    },
-    /**
-     * Sadece local geliştirme: SMS olmadan sürücü oturumu (POST /api/auth/dev-session)
-     * DEV_DRIVER_SESSION=true ve DEV_SESSION_SECRET (en az 16 karakter) gerekir.
-     */
-    devDriverSession: {
-        enabled: process.env.DEV_DRIVER_SESSION === 'true',
-        secret: (process.env.DEV_SESSION_SECRET || '').trim()
     }
 };
-
-/**
- * @returns {boolean}
- */
-function isDevDriverSessionEnabled() {
-    return (
-        config.devDriverSession.enabled &&
-        config.devDriverSession.secret.length >= 16
-    );
-}
-
-config.isDevDriverSessionEnabled = isDevDriverSessionEnabled;
 
 // Geliştirme ortamında eksik değişkenleri kontrol et
 if (!config.yandexFleet.clientId || !config.yandexFleet.apiKey || !config.yandexFleet.partnerId) {
@@ -181,14 +161,6 @@ if (!config.yandexFleet.clientId || !config.yandexFleet.apiKey || !config.yandex
 }
 if (!config.netgsm.username || !config.netgsm.usercode) {
     console.warn('[Config] UYARI: NETGSM_USERNAME veya NETGSM_USERCODE tanımlı değil. OTP SMS gönderilemeyecek.');
-}
-if (config.devDriverSession.enabled && config.devDriverSession.secret.length < 16) {
-    console.warn(
-        '[Config] DEV_DRIVER_SESSION açık ancak DEV_SESSION_SECRET en az 16 karakter olmalı. Dev oturum endpoint\'i devre dışı.'
-    );
-}
-if (isDevDriverSessionEnabled()) {
-    console.warn('[Config] DEV_DRIVER_SESSION aktif — yalnızca güvenilir ortamlarda kullanın. Üretimde kapatın.');
 }
 
 module.exports = config;

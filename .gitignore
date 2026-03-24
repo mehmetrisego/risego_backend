@@ -5,6 +5,7 @@ node_modules/
 .env
 .env.local
 .env.*.local
+railway-variables.json
 
 # Frontend ve Admin Panel (ayrı repo'larda push ediliyor)
 risego_frontend/

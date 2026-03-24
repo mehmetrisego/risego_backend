@@ -48,7 +48,7 @@ app.use(cors({
         callback(null, false);  // İzin verilmedi
     },
     methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'x-session-token', 'x-park-partner-id', 'x-admin-token', 'x-dev-secret'],
+    allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'x-session-token', 'x-park-partner-id', 'x-admin-token'],
     credentials: true
 }));
 
@@ -236,55 +236,6 @@ app.post('/api/auth/verify-otp', async (req, res) => {
         res.status(500).json({
             success: false,
             message: 'Sunucu hatası oluştu. Lütfen tekrar deneyin.'
-        });
-    }
-});
-
-/**
- * POST /api/auth/dev-session
- * Sadece DEV_DRIVER_SESSION=true ve güçlü DEV_SESSION_SECRET ile: SMS olmadan sürücü oturumu (local geliştirme)
- * Header: X-Dev-Secret: <DEV_SESSION_SECRET>  veya body.devSecret
- */
-app.post('/api/auth/dev-session', async (req, res) => {
-    try {
-        if (!config.isDevDriverSessionEnabled()) {
-            return res.status(404).json({ success: false, message: 'Not found' });
-        }
-
-        const { phone, city } = req.body || {};
-        const providedSecret = req.headers['x-dev-secret'] || req.body?.devSecret;
-
-        if (!phone || !city) {
-            return res.status(400).json({
-                success: false,
-                message: 'Telefon numarası ve şehir gereklidir.'
-            });
-        }
-        if (!providedSecret || typeof providedSecret !== 'string') {
-            return res.status(401).json({ success: false, message: 'Unauthorized' });
-        }
-
-        const result = await authService.createDevSession(phone, city, providedSecret.trim());
-
-        if (!result.success) {
-            const status = result.forbidden ? 401 : 400;
-            return res.status(status).json({
-                success: false,
-                message: result.message
-            });
-        }
-
-        res.json({
-            success: true,
-            message: result.message,
-            driver: result.driver,
-            sessionToken: result.sessionToken
-        });
-    } catch (error) {
-        console.error('[Server] Dev session hatası:', error.message);
-        res.status(500).json({
-            success: false,
-            message: 'Sunucu hatası oluştu.'
         });
     }
 });
@@ -1167,7 +1118,6 @@ app.get('/', (req, res) => {
             health: 'GET /api/health',
             login: 'POST /api/auth/login',
             verifyOtp: 'POST /api/auth/verify-otp',
-            devSession: 'POST /api/auth/dev-session (yalnızca local, DEV_DRIVER_SESSION + X-Dev-Secret)',
             session: 'GET /api/auth/session',
             tripCount: 'POST /api/drivers/trip-count',
             leaderboard: 'GET /api/leaderboard',
@@ -1213,9 +1163,6 @@ async function startServer() {
         console.log(`  GET  http://localhost:${PORT}/api/health          - Sunucu durumu`);
         console.log(`  POST http://localhost:${PORT}/api/auth/login      - Giriş (telefon + şehir)`);
         console.log(`  POST http://localhost:${PORT}/api/auth/verify-otp - OTP doğrulama`);
-        if (config.isDevDriverSessionEnabled()) {
-            console.log(`  POST http://localhost:${PORT}/api/auth/dev-session - Dev oturum (SMS yok, X-Dev-Secret)`);
-        }
         console.log(`  POST http://localhost:${PORT}/api/drivers/trip-count - Dönem bazlı yolculuk sayısı`);
         console.log(`  GET  http://localhost:${PORT}/api/drivers         - Detaylı sürücü bilgileri`);
         console.log(`  GET  http://localhost:${PORT}/api/drivers/fetch   - Hızlı sürücü profilleri`);
