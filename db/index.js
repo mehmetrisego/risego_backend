@@ -6,10 +6,18 @@ const { Pool } = require('pg');
 
 const connectionString = process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL;
 
+/** Railway public proxy (rlwy.net) ve üretim ortamı genelde TLS ister; localhost Postgres için ssl kapalı kalır */
+function poolSslOption(connStr) {
+    if (!connStr) return false;
+    if (process.env.NODE_ENV === 'production') return { rejectUnauthorized: false };
+    if (/rlwy\.net|proxy\.rlwy/i.test(connStr)) return { rejectUnauthorized: false };
+    return false;
+}
+
 const pool = connectionString
     ? new Pool({
           connectionString,
-          ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+          ssl: poolSslOption(connectionString),
           max: 10,
           idleTimeoutMillis: 30000,
           connectionTimeoutMillis: 10000
