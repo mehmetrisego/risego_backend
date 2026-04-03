@@ -33,6 +33,7 @@ app.use(helmet());
 const allowedOrigins = [
     'https://risegodriver.com',
     'https://www.risegodriver.com',
+    'https://admin.risegodriver.com',
     'https://mehmetrisego.github.io',
     'https://risegobackend-production-2e58.up.railway.app',
     'http://localhost:3000',
