@@ -469,7 +469,7 @@ class LeaderboardService {
                     const lastBooked = await dbOrders.getLatestBookedAtForPark(park.partnerId);
                     deltaFrom = lastBooked
                         ? new Date(lastBooked.getTime() - CHUNK_OVERLAP_MS)
-                        : new Date(now.getFullYear(), now.getMonth(), now.getDate() - CACHE_DAYS, 0, 0, 0, 0);
+                        : new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, 0, 0, 0, 0); // null ise sadece dünden bugüne çek
                 } else {
                     const parkOrders = (this._orders || []).filter(o => o.parkPartnerId === park.partnerId);
                     const maxBooked = parkOrders.reduce(
