@@ -20,4 +20,5 @@ jobs:
             cd risego_backend
             git pull origin main
             npm install
-            pm2 restart risego-backend
+            pm2 startOrRestart ecosystem.config.js --update-env
+            pm2 save
