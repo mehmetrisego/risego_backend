@@ -19,11 +19,11 @@ const dbOrders = require('../db/orders');
 
 // ─── Sabitler ──────────────────────────────────────────────────────────
 const PAGE_LIMIT       = 500;              // Her sayfada max sipariş (Yandex max 1000, 500 güvenli)
-const THROTTLE_MS      = 200;             // İstekler arası minimum bekleme (ms)
+const THROTTLE_MS      = 500;             // İstekler arası minimum bekleme (ms) — 512MB RAM için artırıldı
 const MAX_RETRIES      = 5;               // Hata durumunda max yeniden deneme
 const REQUEST_TIMEOUT  = 30_000;          // 30 saniye HTTP timeout
 const DELTA_INTERVAL   = 15 * 60 * 1000;  // 15 dakikada bir delta güncelleme
-const CACHE_DAYS       = 60;              // Bellekte tutulacak sipariş aralığı (gün)
+const CACHE_DAYS       = 31;              // Bellekte tutulacak sipariş aralığı (gün) — 512MB RAM için düşürüldü
 const CHUNK_OVERLAP_MS = 45 * 60 * 1000; // Chunk sınırlarında 45 dk overlap (sınır kaybı önleme)
 
 // Tamamlanmış sipariş statusu — Yandex Fleet API sadece 'complete' kabul ediyor
