@@ -466,10 +466,17 @@ class LeaderboardService {
             for (const park of sources) {
                 let deltaFrom;
                 if (db.isConfigured()) {
-                    const lastBooked = await dbOrders.getLatestBookedAtForPark(park.partnerId);
+                    let lastBooked;
+                    try {
+                        lastBooked = await dbOrders.getLatestBookedAtForPark(park.partnerId);
+                    } catch (dbErr) {
+                        // DB geçici olarak erişilemez (ör: EAI_AGAIN) — sadece son 24 saati çek
+                        console.warn(`[LeaderboardService] ${park.label} DB hatası, sadece dün çekiliyor:`, dbErr.message);
+                        lastBooked = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+                    }
                     deltaFrom = lastBooked
                         ? new Date(lastBooked.getTime() - CHUNK_OVERLAP_MS)
-                        : new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, 0, 0, 0, 0); // null ise sadece dünden bugüne çek
+                        : new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, 0, 0, 0, 0);
                 } else {
                     const parkOrders = (this._orders || []).filter(o => o.parkPartnerId === park.partnerId);
                     const maxBooked = parkOrders.reduce(
