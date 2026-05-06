@@ -12,9 +12,6 @@ risego_frontend/
 risego_adminpanel/
 mehmetrisego-risego_adminpanel-main/
 
-# Oluşturulan dosyalar
-sürücüler.txt
-
 # Log dosyaları
 *.log
 npm-debug.log*

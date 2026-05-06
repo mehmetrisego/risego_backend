@@ -775,7 +775,12 @@ class LeaderboardService {
      * @returns {Promise<number>}
      */
     async getDriverTripCount(driverId, period = 'daily', parkPartnerId) {
-        if (this._readyPromise) await this._readyPromise;
+        // Veritabanı aktifse senkronizasyonu beklemeden direkt DB'ye sorgula.
+        // Bu sayede sunucu başlangıcındaki Yandex sync gecikmesi (429 hataları vb.)
+        // sürücünün giriş hızını etkilemez.
+        if (!db.isConfigured() && this._readyPromise) {
+            await this._readyPromise;
+        }
 
         const pid = parkPartnerId || config.yandexFleet.partnerId;
 

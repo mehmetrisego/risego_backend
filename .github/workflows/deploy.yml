@@ -17,8 +17,18 @@ jobs:
           username: ${{ secrets.USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            cd risego_backend
-            git pull origin main
-            npm install
+            set -e
+            # SSH ile bazen cwd / olur; $HOME ile kesin yol (klasör adınız farklıysa düzeltin)
+            APP_DIR="${{ secrets.DEPLOY_PATH }}"
+            if [ -z "$APP_DIR" ]; then APP_DIR="$HOME/risego_backend"; fi
+            echo ">>> Deploy dizini: $APP_DIR"
+            cd "$APP_DIR"
+            echo ">>> Önceki commit: $(git rev-parse HEAD 2>/dev/null || echo 'git yok')"
+            git fetch origin
+            git checkout main
+            # Sunucu ile GitHub ayrıştıysa pull conflict verebilir; tek doğruluk kaynağı origin/main yap
+            git reset --hard origin/main
+            npm ci --omit=dev 2>/dev/null || npm install --omit=dev
             pm2 startOrRestart ecosystem.config.js --update-env
             pm2 save
+            echo ">>> Güncel commit: $(git rev-parse HEAD)"

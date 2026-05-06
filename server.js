@@ -11,7 +11,13 @@ const config = require('./config');
 const yandexFleetApi      = require('./services/yandexFleetApi');
 const leaderboardService  = require('./services/leaderboardService');
 const authService = require('./services/authService');
+const paymentService = require('./services/paymentService');
+const uptService     = require('./services/uptService');
+
+// Çekim cooldown artık DB'de tutulur (driver_profiles.last_withdraw_at)
+// RAM map kaldırıldı — restart sonrası da korunur
 const dbCampaigns = require('./db/campaigns');
+const dbDriverBankAccounts = require('./db/driverBankAccounts');
 const db = require('./db');
 const { runMigrations } = require('./db/runMigrations');
 
@@ -25,6 +31,50 @@ async function writeDriversToFile(driversInfo) {
     await fs.writeFile(filePath, JSON.stringify(driversInfo, null, 2), 'utf8');
     return filePath;
 }
+
+// ─── KILLSWITCH (ACİL DURUM ANAHTARI) ──────────────────────────────────────
+let isKillswitchActive = false;
+// Durum başlangıçta startServer() içinde veritabanından yüklenecek.
+// ──────────────────────────────────────────────────────────────────────────
+
+
+// ─── CANLI ORTAM İYİLEŞTİRMELERİ (Stability & Error Handling) ──────────────
+
+// 1. Beklenmedik hata yakalayıcılar (Unhandled Rejections / Uncaught Exceptions)
+// Sunucunun herhangi bir asenkron hata yüzünden aniden kapanmasını engeller.
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('[CRITICAL] Yakalanamayan Asenkron Hata (Unhandled Rejection):', reason);
+});
+
+process.on('uncaughtException', (error) => {
+    console.error('[CRITICAL] Yakalanamayan İstisna (Uncaught Exception):', error);
+    // Ciddi hatalarda sunucuyu kapatıp PM2/Railway gibi araçların restart atmasını sağlamak gerekebilir.
+    // Ancak basit hatalarda sistemi ayakta tutmak için sadece logluyoruz.
+});
+
+// 2. Nazik Kapanış (Graceful Shutdown)
+// Sunucu kapatılırken (deployment veya manuel stop) DB bağlantılarını ve cronları kapatır.
+async function gracefulShutdown(signal) {
+    console.log(`\n[Server] ${signal} sinyali alındı. Sunucu kapatılıyor...`);
+    
+    // Cron görevlerini durdur
+    if (leaderboardService && typeof leaderboardService.stopCron === 'function') {
+        leaderboardService.stopCron();
+    }
+
+    // Veritabanı bağlantı havuzunu kapat
+    if (db && typeof db.closePool === 'function') {
+        await db.closePool();
+    }
+
+    console.log('[Server] Güvenli bir şekilde kapatıldı. Hoşça kalın!');
+    process.exit(0);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 // Güvenlik Katmanı 1: Helmet - Başlıkları güvenlik altına alır
 app.use(helmet());
@@ -356,6 +406,279 @@ app.post('/api/drivers/balance', requireAuth, async (req, res) => {
             success: false,
             message: 'Bakiye alınırken hata oluştu.'
         });
+    }
+});
+
+/**
+ * GET /api/drivers/bank-account
+ * Oturumdaki sürücünün kayıtlı banka hesap bilgilerini döner.
+ */
+app.get('/api/drivers/bank-account', requireAuth, async (req, res) => {
+    try {
+        if (!db.isConfigured()) {
+            return res.status(503).json({
+                success: false,
+                message: 'Veritabanı yapılandırılmamış.'
+            });
+        }
+
+        const account = await dbDriverBankAccounts.getDriverBankAccount(req.sessionDriver.id);
+        res.json({
+            success: true,
+            account
+        });
+    } catch (error) {
+        console.error('[Server] Banka hesabı getirme hatası:', error.message);
+        res.status(500).json({
+            success: false,
+            message: 'Banka hesap bilgileri alınırken hata oluştu.'
+        });
+    }
+});
+
+/**
+ * POST /api/drivers/bank-account
+ * Oturumdaki sürücünün IBAN + hesap sahibi ad-soyad bilgilerini kaydeder/günceller.
+ */
+app.post('/api/drivers/bank-account', requireAuth, async (req, res) => {
+    try {
+        if (!db.isConfigured()) {
+            return res.status(503).json({
+                success: false,
+                message: 'Veritabanı yapılandırılmamış.'
+            });
+        }
+
+        const ibanRaw = req.body?.iban;
+        const accountHolderNameRaw = req.body?.accountHolderName;
+        const iban = dbDriverBankAccounts.normalizeIban(ibanRaw);
+        const accountHolderName = String(accountHolderNameRaw || '').trim();
+
+        if (!iban || !accountHolderName) {
+            return res.status(400).json({
+                success: false,
+                message: 'IBAN ve hesap sahibinin adı soyadı zorunludur.'
+            });
+        }
+
+        if (!/^TR\d{24}$/.test(iban)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Geçerli bir TR IBAN giriniz (TR + 24 hane).'
+            });
+        }
+
+        if (accountHolderName.length < 3 || accountHolderName.length > 150) {
+            return res.status(400).json({
+                success: false,
+                message: 'Hesap sahibi adı soyadı 3-150 karakter arasında olmalıdır.'
+            });
+        }
+
+        const account = await dbDriverBankAccounts.upsertDriverBankAccount(
+            req.sessionDriver.id,
+            iban,
+            accountHolderName
+        );
+
+        res.json({
+            success: true,
+            message: 'Hesap bilgileri kaydedildi.',
+            account
+        });
+    } catch (error) {
+        console.error('[Server] Banka hesabı kaydetme hatası:', error.message);
+        res.status(500).json({
+            success: false,
+            message: 'Hesap bilgileri kaydedilirken hata oluştu.'
+        });
+    }
+});
+
+/**
+ * POST /api/drivers/withdraw
+ * Sürücünün kayıtlı IBAN'ına EFT gönderir ve Yandex bakiyesini düşer.
+ * - 4 TL çekim ücreti alınır (sürücüye amount-4 gider, Yandex'ten amount düşer)
+ * - 12 saat cooldown DB'de saklanır (restart sonrası korunur)
+ */
+const WITHDRAW_FEE_TL   = 4;
+const WITHDRAW_COOLDOWN_MS = 5 * 60 * 1000; // 5 Dakika (Çift Tıklama ve Tekrar Deneme Bekleme Süresi)
+
+app.post('/api/drivers/withdraw', requireAuth, async (req, res) => {
+    let client;
+    const driverId = req.sessionDriver.id;
+    const grossAmount = parseFloat(req.body?.amount);
+
+    try {
+        if (!db.isConfigured()) {
+            return res.status(503).json({ success: false, message: 'Veritabanı yapılandırılmamış.' });
+        }
+
+        // ── 1. Ön Validasyonlar ───────────────────────────────────
+        if (isKillswitchActive) {
+            return res.status(503).json({ success: false, message: 'Para çekme işlemleri geçici bir süreliğine askıya alınmıştır. Lütfen daha sonra tekrar deneyiniz.' });
+        }
+
+        if (isNaN(grossAmount) || grossAmount <= 0) {
+            return res.status(400).json({ success: false, message: 'Geçerli bir tutar giriniz.' });
+        }
+        if (grossAmount <= WITHDRAW_FEE_TL) {
+            return res.status(400).json({
+                success: false,
+                message: `Çekim tutarı en az ${WITHDRAW_FEE_TL + 0.01} TL olmalıdır (${WITHDRAW_FEE_TL} TL çekim ücreti alınmaktadır).`
+            });
+        }
+
+        // ── 2. Atomik Cooldown ve Satır Kilitleme (Race Condition Koruması) ──
+        // Transaction başlatıyoruz ve driver_profiles satırını kilitliyoruz.
+        client = await db.pool.connect();
+        await client.query('BEGIN');
+
+        // FOR UPDATE ile bu sürücünün satırını diğer işlemler bitene kadar kilitliyoruz.
+        const profileRow = await client.query(
+            'SELECT last_withdraw_at FROM driver_profiles WHERE driver_id = $1 FOR UPDATE',
+            [driverId]
+        );
+        
+        const lastWithdrawAt = profileRow.rows[0]?.last_withdraw_at
+            ? new Date(profileRow.rows[0].last_withdraw_at).getTime()
+            : null;
+
+        if (lastWithdrawAt) {
+            const elapsed = Date.now() - lastWithdrawAt;
+            const remaining = WITHDRAW_COOLDOWN_MS - elapsed;
+            if (remaining > 0) {
+                await client.query('ROLLBACK');
+                client.release();
+                client = null;
+
+                const nextTime = new Date(lastWithdrawAt + WITHDRAW_COOLDOWN_MS);
+                const hh = String(nextTime.getHours()).padStart(2, '0');
+                const mm = String(nextTime.getMinutes()).padStart(2, '0');
+                return res.status(429).json({
+                    success: false,
+                    message: `Bekleme süresi dolmadı. Tekrar çekim yapabileceğiniz saat: ${hh}:${mm}.`
+                });
+            }
+        }
+
+        // Cooldown'ı hemen şimdi (bekleme durumunda) güncelliyoruz ki paralel istekler engellensin.
+        await client.query(
+            `INSERT INTO driver_profiles (driver_id, phone, last_withdraw_at, updated_at)
+             VALUES ($1, '', NOW(), NOW())
+             ON CONFLICT (driver_id) DO UPDATE SET
+                 last_withdraw_at = NOW(),
+                 updated_at = NOW()`,
+            [driverId]
+        );
+
+        // Kilidi bırakabiliriz (commit), çünkü artık last_withdraw_at güncel.
+        await client.query('COMMIT');
+        client.release();
+        client = null;
+
+        // ── 3. Anlık Bakiye Doğrulama (Yandex API) ────────────────
+        // Frontend'den gelen tutarın gerçekte var olup olmadığını Yandex API'den anlık teyit ediyoruz.
+        const parkPid = sessionParkPartnerId(req);
+        const yandexBalance = await yandexFleetApi.getDriverBalance(driverId, parkPid);
+        
+        const currentTotal    = parseFloat(yandexBalance?.balance || 0);
+        // İncelemede olan bakiye (blockedBalance) artık dikkate alınmıyor. Sürücü tümünü çekebilir.
+        const withdrawable    = currentTotal;
+
+        if (grossAmount > withdrawable + 0.01) { // 0.01 TL'lik küçük yuvarlama payı
+            // Bakiye yetersizse cooldown'ı geri çek (sürücü tekrar deneyebilsin)
+            await db.query(
+                'UPDATE driver_profiles SET last_withdraw_at = $1 WHERE driver_id = $2',
+                [profileRow.rows[0]?.last_withdraw_at || null, driverId]
+            );
+            return res.status(400).json({
+                success: false,
+                message: `Yetersiz bakiye. Çekilebilir tutarınız (${withdrawable.toFixed(2).replace('.', ',')} TL) talep edilen tutardan düşük.`
+            });
+        }
+
+        // ── 4. Banka Hesabı ve Ödeme İşlemi ───────────────────────
+        const netAmount = parseFloat((grossAmount - WITHDRAW_FEE_TL).toFixed(2));
+        const account   = await dbDriverBankAccounts.getDriverBankAccount(driverId);
+        
+        if (!account || !account.iban || !account.accountHolderName) {
+            // IBAN yoksa cooldown'ı geri çek
+            await db.query('UPDATE driver_profiles SET last_withdraw_at = $1 WHERE driver_id = $2', [profileRow.rows[0]?.last_withdraw_at || null, driverId]);
+            return res.status(400).json({ success: false, message: 'Kayıtlı banka hesabı bulunamadı.' });
+        }
+
+        const nameParts = account.accountHolderName.trim().split(/\s+/);
+        const beneficiarySurname = nameParts.length > 1 ? nameParts.slice(1).join(' ') : nameParts[0];
+        const beneficiaryName    = nameParts[0];
+
+        const result = await paymentService.sendPayment({
+            driverId,
+            beneficiaryName,
+            beneficiarySurname,
+            beneficiaryIban: account.iban,
+            amount:           netAmount,
+            yandexAmount:     grossAmount,
+            parkPartnerId:    parkPid
+        });
+
+        const nextWithdrawTime = new Date(Date.now() + WITHDRAW_COOLDOWN_MS);
+        res.json({
+            success:        true,
+            message:        `Para çekimi başarıyla gerçekleşti. Hesabınıza ${netAmount.toFixed(2).replace('.', ',')} TL aktarıldı.`,
+            netAmount,
+            grossAmount,
+            tuRefNumber:    result.tuRefNumber,
+            warning:        result.warning || null,
+            nextWithdrawAt: nextWithdrawTime.toISOString()
+        });
+
+    } catch (error) {
+        if (client) {
+            await client.query('ROLLBACK');
+            client.release();
+        }
+        console.error('[Server] Para çekimi hatası:', error.message);
+        res.status(500).json({ success: false, message: error.message || 'Para çekimi sırasında hata oluştu.' });
+    }
+});
+
+/**
+ * GET /api/drivers/withdraw-status
+ * Sürücünün para çekme cooldown durumunu DB'den döner (restart sonrası korunur)
+ */
+app.get('/api/drivers/withdraw-status', requireAuth, async (req, res) => {
+    try {
+        const driverId = req.sessionDriver.id;
+        if (!db.isConfigured()) {
+            return res.json({ success: true, canWithdraw: true, cooldownUntil: null, hoursLeft: 0 });
+        }
+        const profileRow = await db.query(
+            'SELECT last_withdraw_at FROM driver_profiles WHERE driver_id = $1',
+            [driverId]
+        );
+        const lastWithdrawAt = profileRow.rows[0]?.last_withdraw_at
+            ? new Date(profileRow.rows[0].last_withdraw_at).getTime()
+            : null;
+
+        if (!lastWithdrawAt) {
+            return res.json({ success: true, canWithdraw: true, cooldownUntil: null, hoursLeft: 0 });
+        }
+        const elapsed   = Date.now() - lastWithdrawAt;
+        const remaining = WITHDRAW_COOLDOWN_MS - elapsed;
+        if (remaining <= 0) {
+            return res.json({ success: true, canWithdraw: true, cooldownUntil: null, hoursLeft: 0 });
+        }
+        const hoursLeft = Math.ceil(remaining / (1000 * 60 * 60));
+        return res.json({
+            success: true,
+            canWithdraw: false,
+            cooldownUntil: new Date(lastWithdrawAt + WITHDRAW_COOLDOWN_MS).toISOString(),
+            hoursLeft
+        });
+    } catch (err) {
+        console.error('[Server] Withdraw status hatası:', err.message);
+        return res.json({ success: true, canWithdraw: true, cooldownUntil: null, hoursLeft: 0 });
     }
 });
 
@@ -1008,8 +1331,27 @@ app.get('/api/campaign', async (req, res) => {
 });
 
 /**
+ * GET /api/admin/upt-balance
+ * Uption (Aktif Bank) kurumsal c\u00fczdan TRY bakiyesini d\u00f6ner (admin gerekli)
+ */
+app.get('/api/admin/upt-balance', requireAdminAuth, async (req, res) => {
+    try {
+        const result = await uptService.getUptBalance();
+        res.json({
+            success:    result.success,
+            tryBalanceRaw: result.tryBalanceRaw,
+            balances:   result.balances,
+            error:      result.error || null
+        });
+    } catch (err) {
+        console.error('[Admin] UPT bakiye hatas\u0131:', err.message);
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+/**
  * GET /api/admin/parks
- * Yandex parkları (şehir etiketi + partnerId) — admin paneli şehir filtresi için
+ * Yandex parklar\u0131 (\u015fehir etiketi + partnerId) \u2014 admin paneli \u015fehir filtresi i\u00e7in
  */
 app.get('/api/admin/parks', requireAdminAuth, async (req, res) => {
     try {
@@ -1082,6 +1424,45 @@ app.get('/api/admin/leaderboard', requireAdminAuth, customLeaderboardLimiter, as
  * Tüm leaderboard cache'ini temizler ve Yandex API'den yeniden tam senkronizasyon başlatır.
  * Hatalı veri / eksik yolculuk durumlarında admin tarafından manuel tetiklenir.
  */
+app.get('/api/admin/payment-logs', requireAdminAuth, async (req, res) => {
+    try {
+        if (!db.isConfigured()) {
+            return res.status(503).json({ success: false, message: 'Veritabanı yapılandırılmamış.' });
+        }
+        const result = await db.query(
+            `SELECT * FROM payment_logs ORDER BY created_at DESC LIMIT 500`
+        );
+        res.json({ success: true, logs: result.rows });
+    } catch (err) {
+        console.error('[AdminAPI] Payment logs hatası:', err.message);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.get('/api/admin/killswitch', requireAdminAuth, (req, res) => {
+    res.json({ success: true, active: isKillswitchActive });
+});
+
+app.post('/api/admin/killswitch', requireAdminAuth, express.json(), async (req, res) => {
+    const { active } = req.body;
+    if (typeof active !== 'boolean') {
+        return res.status(400).json({ success: false, message: 'Geçersiz parametre.' });
+    }
+    
+    try {
+        await db.query(
+            "UPDATE system_settings SET value = $1, updated_at = NOW() WHERE key = 'is_withdraw_suspended'",
+            [active ? 'true' : 'false']
+        );
+        isKillswitchActive = active;
+        console.log(`[Admin] Killswitch durumu veritabanında değiştirildi: ${active ? 'AÇIK (ASKIYA ALINDI)' : 'KAPALI (AKTİF)'}`);
+        res.json({ success: true, active: isKillswitchActive, message: active ? 'Para çekme işlemleri askıya alındı.' : 'Para çekme işlemleri tekrar aktif edildi.' });
+    } catch (err) {
+        console.error('[AdminAPI] Killswitch güncelleme hatası:', err.message);
+        res.status(500).json({ success: false, message: 'Ayarlar güncellenirken veritabanı hatası oluştu.' });
+    }
+});
+
 app.post('/api/admin/leaderboard/resync', requireAdminAuth, async (req, res) => {
     try {
         console.log('[Server] Admin tarafından zorla yeniden senkronizasyon talep edildi.');
@@ -1135,11 +1516,85 @@ app.get('/', (req, res) => {
 // Sunucuyu başlat (DB migration sonrası)
 const PORT = config.server.port;
 
+/**
+ * Yandex Fleet'teki tüm sürücüleri driver_profiles tablosuna ekler.
+ * Mevcut kayıtlara dokunmaz — sadece eksik driver_id'leri ekler.
+ * Telefon numarası olmayan sürücüler atlanır (phone NOT NULL UNIQUE kısıtı).
+ */
+async function syncDriverProfiles() {
+    if (!db.isConfigured()) return;
+
+    const parks = config.getYandexParkSources();
+    let totalInserted = 0;
+    let totalSkipped  = 0;
+    let totalNoPhone  = 0;
+
+    for (const park of parks) {
+        try {
+            console.log(`[DriverProfileSync] ${park.label} sürücüleri çekiliyor...`);
+            const profiles = await yandexFleetApi.fetchDriverProfilesForParkSource(park);
+
+            for (const profile of profiles) {
+                const dp        = profile.driver_profile || profile;
+                const drvId     = dp.id || dp.driver_profile_id;
+                if (!drvId) continue;
+
+                const firstName = (dp.first_name || '').trim();
+                const lastName  = (dp.last_name  || '').trim();
+                const phone     = Array.isArray(dp.phones) && dp.phones.length
+                    ? String(dp.phones[0]).replace(/\D/g, '')  // sadece rakam
+                    : null;
+
+                // Telefonu olmayan sürücüleri atla (phone NOT NULL UNIQUE kısıtı)
+                if (!phone) {
+                    totalNoPhone++;
+                    continue;
+                }
+
+                try {
+                    const result = await db.query(
+                        `INSERT INTO driver_profiles
+                             (driver_id, phone, first_name, last_name, park_partner_id, created_at, updated_at)
+                         VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+                         ON CONFLICT (driver_id) DO NOTHING`,
+                        [drvId, phone, firstName, lastName, park.partnerId]
+                    );
+                    if (result.rowCount > 0) totalInserted++;
+                    else totalSkipped++;
+                } catch (insertErr) {
+                    // Aynı telefon numarası farklı driver_id ile zaten kayıtlı — atla
+                    totalSkipped++;
+                }
+            }
+
+            console.log(`[DriverProfileSync] ${park.label}: ${profiles.length} profil işlendi.`);
+        } catch (err) {
+            console.warn(`[DriverProfileSync] ${park.label} hata:`, err.message);
+        }
+    }
+
+    console.log(
+        `[DriverProfileSync] Tamamlandı: ${totalInserted} eklendi, ` +
+        `${totalSkipped} zaten mevcuttu, ${totalNoPhone} telefonsuz atlandı.`
+    );
+}
+
 async function startServer() {
     if (db.isConfigured()) {
         const connected = await db.testConnection();
         if (connected) {
             await runMigrations();
+
+            // Killswitch durumunu veritabanından yükleyelim
+            try {
+                const ksResult = await db.query("SELECT value FROM system_settings WHERE key = 'is_withdraw_suspended'");
+                if (ksResult.rows.length > 0) {
+                    isKillswitchActive = ksResult.rows[0].value === 'true';
+                    console.log(`[Server] Killswitch durumu veritabanından yüklendi: ${isKillswitchActive ? 'ASKIDA' : 'AKTİF'}`);
+                }
+            } catch (ksErr) {
+                console.error('[Server] Killswitch durumu veritabanından okunamadı:', ksErr.message);
+            }
             try {
                 const mainPid = config.yandexFleet.partnerId;
                 if (mainPid) {
@@ -1151,6 +1606,11 @@ async function startServer() {
             } catch (e) {
                 console.warn('[DB] campaigns park_partner_id backfill:', e.message);
             }
+
+            // driver_profiles tablosunu Yandex'ten gelen verilerle doldur (eksikleri ekle)
+            syncDriverProfiles().catch(e =>
+                console.warn('[DB] driver_profiles sync hatası:', e.message)
+            );
         }
     }
 

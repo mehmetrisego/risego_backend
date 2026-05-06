@@ -7,6 +7,11 @@ const dbSessions = require('../db/sessions');
 const dbAdminSessions = require('../db/adminSessions');
 const db = require('../db');
 
+function isDevModeEnabled() {
+    const raw = process.env.DEVMODE || process.env.devmode || '';
+    return String(raw).trim().toLowerCase() === 'enable';
+}
+
 class AuthService {
     constructor() {
         this.otpStore = new Map();
@@ -129,7 +134,7 @@ class AuthService {
             car: car.number
                 ? `${car.brand || ''} ${car.model || ''} (${car.year || ''}) - Plaka: ${car.number}`
                 : 'Araç atanmamış',
-            balance: !isNaN(rawBalance) ? `${Math.round(rawBalance)} ₺` : '-',
+            balance: !isNaN(rawBalance) ? `${rawBalance.toFixed(2).replace('.', ',')} ₺` : '-',
             tripCount: 0,
             parkPartnerId
         };
@@ -325,6 +330,7 @@ class AuthService {
     async verifyRegistrationOTP(phone, otp) {
         const normalizedPhone = this.normalizePhone(phone);
         const data = this.registerOtpStore.get(normalizedPhone);
+        const otpTrimmed = String(otp || '').trim().replace(/\D/g, '');
 
         if (!data) {
             return { success: false, message: 'Doğrulama kodu bulunamadı. Lütfen tekrar deneyin.' };
@@ -340,8 +346,9 @@ class AuthService {
             return { success: false, message: 'Çok fazla deneme yapıldı. Lütfen yeni kod isteyin.' };
         }
 
+        const isDevBypass = isDevModeEnabled() && otpTrimmed === '000000';
         data.attempts++;
-        if (data.code !== otp) {
+        if (!isDevBypass && data.code !== otpTrimmed) {
             return {
                 success: false,
                 message: `Geçersiz doğrulama kodu. ${5 - data.attempts} deneme hakkınız kaldı.`
@@ -423,6 +430,30 @@ class AuthService {
                 expiresAt,
                 parkForRegistration.partnerId
             );
+            // driver_profiles tablosuna telefon + isim + park kaydet
+            try {
+                await db.query(
+                    `INSERT INTO driver_profiles (driver_id, phone, first_name, last_name, city, park_partner_id, updated_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, NOW())
+                     ON CONFLICT (driver_id) DO UPDATE SET
+                         phone = EXCLUDED.phone,
+                         first_name = EXCLUDED.first_name,
+                         last_name = EXCLUDED.last_name,
+                         city = EXCLUDED.city,
+                         park_partner_id = EXCLUDED.park_partner_id,
+                         updated_at = NOW()`,
+                    [
+                        driver.id,
+                        normalizedPhone,
+                        registrationData.firstName || '',
+                        registrationData.lastName || '',
+                        registrationData.city || '',
+                        parkForRegistration.partnerId
+                    ]
+                );
+            } catch (dpErr) {
+                console.error('[AuthService] driver_profiles kayıt hatası:', dpErr.message);
+            }
         }
 
         return { success: true, driver, sessionToken };
@@ -503,6 +534,7 @@ class AuthService {
     async verifyOTP(phone, otp) {
         const normalizedPhone = this.normalizePhone(phone);
         const otpData = this.otpStore.get(normalizedPhone);
+        const otpTrimmed = String(otp || '').trim().replace(/\D/g, '');
 
         if (!otpData) {
             return {
@@ -530,8 +562,9 @@ class AuthService {
         }
 
         // Kod kontrolü
+        const isDevBypass = isDevModeEnabled() && otpTrimmed === '000000';
         otpData.attempts++;
-        if (otpData.code !== otp) {
+        if (!isDevBypass && otpData.code !== otpTrimmed) {
             return {
                 success: false,
                 message: `Geçersiz doğrulama kodu. ${5 - otpData.attempts} deneme hakkınız kaldı.`
@@ -551,7 +584,7 @@ class AuthService {
 
             if (balanceData) {
                 const rawBal = parseFloat(balanceData.balance);
-                driver.balance = !isNaN(rawBal) ? `${Math.round(rawBal)} ₺` : driver.balance;
+                driver.balance = !isNaN(rawBal) ? `${rawBal.toFixed(2).replace('.', ',')} ₺` : driver.balance;
             }
         } catch (error) {
             console.error('[AuthService] Sürücü verileri çekilemedi:', error.message);
