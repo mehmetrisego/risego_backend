@@ -39,7 +39,7 @@ class AuthService {
 
         // Oturum yönetimi: token -> { phone, driverId, city, createdAt }
         this.sessions = new Map();
-        this.SESSION_TTL = 7 * 24 * 60 * 60 * 1000; // 7 gün
+        this.SESSION_TTL = 10 * 365 * 24 * 60 * 60 * 1000; // 10 yıl (pratikte süresiz)
         // Admin panel OTP ve oturum
         this.adminOtpStore = new Map();
         this.adminOtpLastSentAt = new Map();

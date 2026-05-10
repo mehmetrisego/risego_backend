@@ -1,0 +1,1 @@
+ALTER TABLE driver_profiles ADD COLUMN IF NOT EXISTS wallet_balance NUMERIC(10, 2) DEFAULT 0.00;

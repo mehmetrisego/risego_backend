@@ -16,6 +16,7 @@ const axios  = require('axios');
 const config = require('../config');
 const db = require('../db');
 const dbOrders = require('../db/orders');
+const yandexFleetApi = require('./yandexFleetApi');
 
 // ─── Sabitler ──────────────────────────────────────────────────────────
 const PAGE_LIMIT       = 500;              // Her sayfada max sipariş (Yandex max 1000, 500 güvenli)
@@ -566,6 +567,8 @@ class LeaderboardService {
             } else {
                 await this._fullSync();
             }
+            // İlk senkronizasyonda bakiyeleri de eşitle
+            await this._syncDriverBalances();
         };
         this._readyPromise = initSync();
 
@@ -591,12 +594,61 @@ class LeaderboardService {
                 } else {
                     await this._deltaSync();
                 }
+                // Bakiyeleri de eşitle
+                await this._syncDriverBalances();
             } catch (e) {
                 console.error('[LeaderboardService] Periyodik senkronizasyon hatası:', e.message);
             }
         }, DELTA_INTERVAL);
 
         console.log(`[LeaderboardService] Cron aktif (her ${DELTA_INTERVAL / 60_000} dakikada delta güncelleme).`);
+    }
+
+    /** Yandex'ten sürücü profillerini çekip bakiyeleri DB'ye kaydeder (Optimize Bulk Sync) */
+    async _syncDriverBalances() {
+        if (!db.isConfigured()) return;
+        try {
+            console.log('[LeaderboardService] Sürücü bakiyeleri DB\'ye eşitleniyor...');
+            const sources = config.getYandexParkSources();
+            for (const park of sources) {
+                const drivers = await yandexFleetApi.fetchDriverProfilesForParkSource(park);
+                if (!drivers || drivers.length === 0) continue;
+
+                const allValues = [];
+                const allParams = [];
+                
+                for (const d of drivers) {
+                    const driverId = d.driver_profile?.id;
+                    // Yandex API list endpoint'inde bakiye genellikle 'accounts' dizisi içinde döner
+                    const balance = parseFloat(d.accounts?.[0]?.balance || d.account?.balance || 0);
+                    if (!driverId) continue;
+                    allValues.push({ driverId, balance });
+                }
+
+                // 500'lü paketler halinde toplu insert (Bulk Upsert)
+                const CHUNK_SIZE = 500;
+                for (let i = 0; i < allValues.length; i += CHUNK_SIZE) {
+                    const chunk = allValues.slice(i, i + CHUNK_SIZE);
+                    const params = [];
+                    const valueStrings = chunk.map((item, idx) => {
+                        const base = idx * 2;
+                        params.push(item.driverId, item.balance);
+                        return `($${base + 1}, $${base + 2}, NOW())`;
+                    });
+
+                    await db.query(`
+                        INSERT INTO park_driver_balances (driver_id, balance, updated_at)
+                        VALUES ${valueStrings.join(', ')}
+                        ON CONFLICT (driver_id) DO UPDATE SET
+                            balance = EXCLUDED.balance,
+                            updated_at = NOW()
+                    `, params);
+                }
+            }
+            console.log(`[LeaderboardService] ✅ Sürücü bakiyeleri toplu olarak güncellendi.`);
+        } catch (err) {
+            console.error('[LeaderboardService] Sürücü bakiyeleri eşitlenirken hata:', err.message);
+        }
     }
 
     /** Cron'u durdurur */

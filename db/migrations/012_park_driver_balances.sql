@@ -1,0 +1,1 @@
+CREATE TABLE IF NOT EXISTS park_driver_balances (driver_id VARCHAR(100) PRIMARY KEY, balance NUMERIC(15, 2) DEFAULT 0, updated_at TIMESTAMP DEFAULT NOW());

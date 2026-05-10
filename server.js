@@ -411,42 +411,30 @@ app.post('/api/drivers/balance', requireAuth, async (req, res) => {
 
 /**
  * GET /api/drivers/bank-account
- * Oturumdaki sürücünün kayıtlı banka hesap bilgilerini döner.
+ * Oturumdaki sürücünün tüm kayıtlı banka hesaplarını döner.
  */
 app.get('/api/drivers/bank-account', requireAuth, async (req, res) => {
     try {
         if (!db.isConfigured()) {
-            return res.status(503).json({
-                success: false,
-                message: 'Veritabanı yapılandırılmamış.'
-            });
+            return res.status(503).json({ success: false, message: 'Veritabanı yapılandırılmamış.' });
         }
 
-        const account = await dbDriverBankAccounts.getDriverBankAccount(req.sessionDriver.id);
-        res.json({
-            success: true,
-            account
-        });
+        const accounts = await dbDriverBankAccounts.getDriverBankAccounts(req.sessionDriver.id);
+        res.json({ success: true, accounts });
     } catch (error) {
-        console.error('[Server] Banka hesabı getirme hatası:', error.message);
-        res.status(500).json({
-            success: false,
-            message: 'Banka hesap bilgileri alınırken hata oluştu.'
-        });
+        console.error('[Server] Banka hesapları getirme hatası:', error.message);
+        res.status(500).json({ success: false, message: 'Banka hesap bilgileri alınırken hata oluştu.' });
     }
 });
 
 /**
  * POST /api/drivers/bank-account
- * Oturumdaki sürücünün IBAN + hesap sahibi ad-soyad bilgilerini kaydeder/günceller.
+ * Yeni bir banka hesabı ekler.
  */
 app.post('/api/drivers/bank-account', requireAuth, async (req, res) => {
     try {
         if (!db.isConfigured()) {
-            return res.status(503).json({
-                success: false,
-                message: 'Veritabanı yapılandırılmamış.'
-            });
+            return res.status(503).json({ success: false, message: 'Veritabanı yapılandırılmamış.' });
         }
 
         const ibanRaw = req.body?.iban;
@@ -455,27 +443,14 @@ app.post('/api/drivers/bank-account', requireAuth, async (req, res) => {
         const accountHolderName = String(accountHolderNameRaw || '').trim();
 
         if (!iban || !accountHolderName) {
-            return res.status(400).json({
-                success: false,
-                message: 'IBAN ve hesap sahibinin adı soyadı zorunludur.'
-            });
+            return res.status(400).json({ success: false, message: 'IBAN ve hesap sahibinin adı soyadı zorunludur.' });
         }
 
         if (!/^TR\d{24}$/.test(iban)) {
-            return res.status(400).json({
-                success: false,
-                message: 'Geçerli bir TR IBAN giriniz (TR + 24 hane).'
-            });
+            return res.status(400).json({ success: false, message: 'Geçerli bir TR IBAN giriniz (TR + 24 hane).' });
         }
 
-        if (accountHolderName.length < 3 || accountHolderName.length > 150) {
-            return res.status(400).json({
-                success: false,
-                message: 'Hesap sahibi adı soyadı 3-150 karakter arasında olmalıdır.'
-            });
-        }
-
-        const account = await dbDriverBankAccounts.upsertDriverBankAccount(
+        const account = await dbDriverBankAccounts.addDriverBankAccount(
             req.sessionDriver.id,
             iban,
             accountHolderName
@@ -483,15 +458,41 @@ app.post('/api/drivers/bank-account', requireAuth, async (req, res) => {
 
         res.json({
             success: true,
-            message: 'Hesap bilgileri kaydedildi.',
+            message: 'Yeni hesap başarıyla eklendi.',
             account
         });
     } catch (error) {
-        console.error('[Server] Banka hesabı kaydetme hatası:', error.message);
+        console.error('[Server] Banka hesabı ekleme hatası:', error.message, error);
         res.status(500).json({
             success: false,
-            message: 'Hesap bilgileri kaydedilirken hata oluştu.'
+            message: 'Hesap bilgileri kaydedilirken hata oluştu: ' + error.message
         });
+    }
+});
+
+/**
+ * DELETE /api/drivers/bank-account/:id
+ * Belirtilen banka hesabını siler.
+ */
+app.delete('/api/drivers/bank-account/:id', requireAuth, async (req, res) => {
+    try {
+        if (!db.isConfigured()) {
+            return res.status(503).json({ success: false, message: 'Veritabanı yapılandırılmamış.' });
+        }
+
+        const accountId = parseInt(req.params.id);
+        const driverId = req.sessionDriver.id;
+
+        const deleted = await dbDriverBankAccounts.deleteDriverBankAccount(driverId, accountId);
+
+        if (deleted) {
+            res.json({ success: true, message: 'Banka hesabı silindi.' });
+        } else {
+            res.status(404).json({ success: false, message: 'Hesap bulunamadı veya silinemedi.' });
+        }
+    } catch (error) {
+        console.error('[Server] Banka hesabı silme hatası:', error.message);
+        res.status(500).json({ success: false, message: 'Hesap silinirken hata oluştu.' });
     }
 });
 
@@ -600,12 +601,30 @@ app.post('/api/drivers/withdraw', requireAuth, async (req, res) => {
 
         // ── 4. Banka Hesabı ve Ödeme İşlemi ───────────────────────
         const netAmount = parseFloat((grossAmount - WITHDRAW_FEE_TL).toFixed(2));
-        const account   = await dbDriverBankAccounts.getDriverBankAccount(driverId);
+        const bankAccountId = req.body?.bankAccountId;
+        let account = null;
+
+        if (bankAccountId) {
+            const accRes = await db.query(
+                'SELECT iban, account_holder_name FROM driver_bank_accounts WHERE id = $1 AND driver_id = $2',
+                [bankAccountId, driverId]
+            );
+            if (accRes.rows.length > 0) {
+                account = {
+                    iban: accRes.rows[0].iban,
+                    accountHolderName: accRes.rows[0].account_holder_name
+                };
+            }
+        } else {
+            // Eğer ID gönderilmemişse son hesabı al (geriye uyumluluk ve varsayılan)
+            const accounts = await dbDriverBankAccounts.getDriverBankAccounts(driverId);
+            if (accounts.length > 0) account = accounts[0];
+        }
         
         if (!account || !account.iban || !account.accountHolderName) {
             // IBAN yoksa cooldown'ı geri çek
             await db.query('UPDATE driver_profiles SET last_withdraw_at = $1 WHERE driver_id = $2', [profileRow.rows[0]?.last_withdraw_at || null, driverId]);
-            return res.status(400).json({ success: false, message: 'Kayıtlı banka hesabı bulunamadı.' });
+            return res.status(400).json({ success: false, message: 'Geçerli bir banka hesabı seçilmedi.' });
         }
 
         const nameParts = account.accountHolderName.trim().split(/\s+/);
@@ -1435,6 +1454,20 @@ app.get('/api/admin/payment-logs', requireAdminAuth, async (req, res) => {
         res.json({ success: true, logs: result.rows });
     } catch (err) {
         console.error('[AdminAPI] Payment logs hatası:', err.message);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.get('/api/admin/drivers/total-balance', requireAdminAuth, async (req, res) => {
+    try {
+        if (!db.isConfigured()) {
+            return res.json({ success: true, totalBalance: 0 });
+        }
+        const result = await db.query('SELECT SUM(balance) as total FROM park_driver_balances');
+        const total = parseFloat(result.rows[0]?.total || 0);
+        res.json({ success: true, totalBalance: total });
+    } catch (err) {
+        console.error('[AdminAPI] Toplam sürücü bakiyesi hesaplanamadı:', err.message);
         res.status(500).json({ success: false, message: err.message });
     }
 });
