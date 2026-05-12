@@ -23,7 +23,7 @@ const PAGE_LIMIT       = 500;              // Her sayfada max sipariş (Yandex m
 const THROTTLE_MS      = 500;             // İstekler arası minimum bekleme (ms) — 512MB RAM için artırıldı
 const MAX_RETRIES      = 5;               // Hata durumunda max yeniden deneme
 const REQUEST_TIMEOUT  = 30_000;          // 30 saniye HTTP timeout
-const DELTA_INTERVAL   = 15 * 60 * 1000;  // 15 dakikada bir delta güncelleme
+const DELTA_INTERVAL   = 30 * 60 * 1000;  // 30 dakikada bir delta güncelleme (429 azaltma)
 const CACHE_DAYS       = 31;              // Bellekte tutulacak sipariş aralığı (gün) — 512MB RAM için düşürüldü
 const CHUNK_OVERLAP_MS = 45 * 60 * 1000; // Chunk sınırlarında 45 dk overlap (sınır kaybı önleme)
 

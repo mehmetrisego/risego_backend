@@ -71,6 +71,10 @@ class YandexFleetApi {
         this.PROFILES_TTL = 5 * 60 * 1000; // 5 dakika
         /** Çoklu şehir: partnerId -> axios (X-Client-ID / X-API-Key parka özel) */
         this._partnerHttpClients = new Map();
+        // ✅ OPT-4: Sürücü bakiyesi için 2 dakikalık cache — tekrar eden balance isteklerini azaltır
+        // driverId -> { balance, blockedBalance, expiry }
+        this._balanceCache = new Map();
+        this.BALANCE_TTL = 2 * 60 * 1000; // 2 dakika
     }
 
     /**
@@ -244,6 +248,14 @@ class YandexFleetApi {
      * GET /v1/parks/contractors/blocked-balance
      */
     async getDriverBalance(driverId, parkPartnerId) {
+        // ✅ OPT-4: 2 dakikalık cache — aynı sürücü için Yandex API'ye tekrar istek atılmaz
+        const cacheKey = `${driverId}:${parkPartnerId || 'default'}`;
+        const now = Date.now();
+        const cached = this._balanceCache.get(cacheKey);
+        if (cached && now < cached.expiry) {
+            return { balance: cached.balance, blockedBalance: cached.blockedBalance };
+        }
+
         const { http, parkId } = this._resolveParkContext(parkPartnerId);
         try {
             const response = await http.get(
@@ -253,10 +265,18 @@ class YandexFleetApi {
                     headers: { 'X-Park-ID': parkId }
                 }
             );
-            return {
+            const result = {
                 balance: response.data.balance || '0',
                 blockedBalance: response.data.blocked_balance || '0'
             };
+            // Cache'e yaz
+            this._balanceCache.set(cacheKey, { ...result, expiry: now + this.BALANCE_TTL });
+            // Bellek sızıntısını önlemek için cache'i temizle (max 500 sürücü)
+            if (this._balanceCache.size > 500) {
+                const firstKey = this._balanceCache.keys().next().value;
+                this._balanceCache.delete(firstKey);
+            }
+            return result;
         } catch (error) {
             console.error(`[YandexFleetApi] Bakiye çekilirken hata (${driverId}):`, error.response?.data?.message || error.message);
             return null;
