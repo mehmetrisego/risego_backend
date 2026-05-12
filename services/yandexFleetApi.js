@@ -269,7 +269,7 @@ class YandexFleetApi {
                 balance: response.data.balance || '0',
                 blockedBalance: response.data.blocked_balance || '0'
             };
-            // Cache'e yaz
+            // Başarılı yanıtı 2 dk cache'e yaz
             this._balanceCache.set(cacheKey, { ...result, expiry: now + this.BALANCE_TTL });
             // Bellek sızıntısını önlemek için cache'i temizle (max 500 sürücü)
             if (this._balanceCache.size > 500) {
@@ -278,10 +278,22 @@ class YandexFleetApi {
             }
             return result;
         } catch (error) {
+            const status = error.response?.status;
+            if (status === 429) {
+                // 429: Rate limit — son bilinen değeri (veya 0) 5 dk cache'e yaz,
+                // böylece limit açılana kadar aynı sürücü için tekrar istek atılmaz
+                const fallback = cached
+                    ? { balance: cached.balance, blockedBalance: cached.blockedBalance }
+                    : { balance: '0', blockedBalance: '0' };
+                this._balanceCache.set(cacheKey, { ...fallback, expiry: now + 5 * 60 * 1000 });
+                console.warn(`[YandexFleetApi] Bakiye 429 — ${driverId} için 5 dk cache'lendi.`);
+                return fallback;
+            }
             console.error(`[YandexFleetApi] Bakiye çekilirken hata (${driverId}):`, error.response?.data?.message || error.message);
             return null;
         }
     }
+
 
     /**
      * Araç detaylarını getirir
