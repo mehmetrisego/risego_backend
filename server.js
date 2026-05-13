@@ -11,8 +11,9 @@ const config = require('./config');
 const yandexFleetApi      = require('./services/yandexFleetApi');
 const leaderboardService  = require('./services/leaderboardService');
 const authService = require('./services/authService');
-const paymentService = require('./services/paymentService');
-const uptService     = require('./services/uptService');
+const paymentService    = require('./services/paymentService');
+const uptService        = require('./services/uptService');
+const uptStatusService  = require('./services/uptStatusService');
 
 // Çekim cooldown artık DB'de tutulur (driver_profiles.last_withdraw_at)
 // RAM map kaldırıldı — restart sonrası da korunur
@@ -60,6 +61,12 @@ async function gracefulShutdown(signal) {
     // Cron görevlerini durdur
     if (leaderboardService && typeof leaderboardService.stopCron === 'function') {
         leaderboardService.stopCron();
+    }
+
+    // Uption durum takip cron'unu durdur
+    if (global._paymentCheckCron) {
+        clearInterval(global._paymentCheckCron);
+        global._paymentCheckCron = null;
     }
 
     // Veritabanı bağlantı havuzunu kapat
@@ -670,7 +677,7 @@ app.get('/api/drivers/withdraw-status', requireAuth, async (req, res) => {
     try {
         const driverId = req.sessionDriver.id;
         if (!db.isConfigured()) {
-            return res.json({ success: true, canWithdraw: true, cooldownUntil: null, hoursLeft: 0 });
+            return res.json({ success: true, canWithdraw: true, cooldownUntil: null, minutesLeft: 0 });
         }
         const profileRow = await db.query(
             'SELECT last_withdraw_at FROM driver_profiles WHERE driver_id = $1',
@@ -686,18 +693,18 @@ app.get('/api/drivers/withdraw-status', requireAuth, async (req, res) => {
         const elapsed   = Date.now() - lastWithdrawAt;
         const remaining = WITHDRAW_COOLDOWN_MS - elapsed;
         if (remaining <= 0) {
-            return res.json({ success: true, canWithdraw: true, cooldownUntil: null, hoursLeft: 0 });
+            return res.json({ success: true, canWithdraw: true, cooldownUntil: null, minutesLeft: 0 });
         }
-        const hoursLeft = Math.ceil(remaining / (1000 * 60 * 60));
+        const minutesLeft = Math.ceil(remaining / (1000 * 60));
         return res.json({
             success: true,
             canWithdraw: false,
             cooldownUntil: new Date(lastWithdrawAt + WITHDRAW_COOLDOWN_MS).toISOString(),
-            hoursLeft
+            minutesLeft
         });
     } catch (err) {
         console.error('[Server] Withdraw status hatası:', err.message);
-        return res.json({ success: true, canWithdraw: true, cooldownUntil: null, hoursLeft: 0 });
+        return res.json({ success: true, canWithdraw: true, cooldownUntil: null, minutesLeft: 0 });
     }
 });
 
@@ -1351,11 +1358,12 @@ app.get('/api/campaign', async (req, res) => {
 
 /**
  * GET /api/admin/upt-balance
- * Uption (Aktif Bank) kurumsal c\u00fczdan TRY bakiyesini d\u00f6ner (admin gerekli)
+ * Uption (Aktif Bank) kurumsal cüzdan TRY bakiyesini döner (admin gerekli)
  */
 app.get('/api/admin/upt-balance', requireAdminAuth, async (req, res) => {
     try {
         const result = await uptService.getUptBalance();
+
         res.json({
             success:    result.success,
             tryBalanceRaw: result.tryBalanceRaw,
@@ -1363,10 +1371,11 @@ app.get('/api/admin/upt-balance', requireAdminAuth, async (req, res) => {
             error:      result.error || null
         });
     } catch (err) {
-        console.error('[Admin] UPT bakiye hatas\u0131:', err.message);
+        console.error('[Admin] UPT bakiye hatası:', err.message);
         res.status(500).json({ success: false, error: err.message });
     }
 });
+
 
 /**
  * GET /api/admin/parks
@@ -1457,6 +1466,8 @@ app.get('/api/admin/payment-logs', requireAdminAuth, async (req, res) => {
         res.status(500).json({ success: false, message: err.message });
     }
 });
+
+
 
 app.get('/api/admin/drivers/total-balance', requireAdminAuth, async (req, res) => {
     try {
@@ -1666,6 +1677,27 @@ async function startServer() {
         leaderboardService.startCron().catch(err => {
             console.error('[Server] LeaderboardService başlatma hatası:', err.message);
         });
+
+        // ─── Uption işlem durum takip cron'u (her 5 dakikada bir) ───────────
+        global._paymentCheckCron = setInterval(async () => {
+            try {
+                await uptStatusService.checkPendingPayments();
+                await uptStatusService.syncRefundsFromBank();
+            } catch (err) {
+                console.error('[Server] UptStatus cron hatası:', err.message);
+            }
+        }, 5 * 60 * 1000);
+
+        // Başlangıçta 5 sn sonra bir kez çalıştır (restart sonrası bekleyenleri yakala)
+        setTimeout(async () => {
+            try {
+                await uptStatusService.checkPendingPayments();
+                await uptStatusService.syncRefundsFromBank();
+            } catch (err) {
+                console.error('[Server] UptStatus ilk çalışma hatası:', err.message);
+            }
+        }, 5000);
+        console.log('[Server] UptStatus cron başlatıldı (5 dk aralıklı).');
     });
 }
 

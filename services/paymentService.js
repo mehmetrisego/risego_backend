@@ -361,11 +361,14 @@ async function sendPayment({ driverId, beneficiaryName, beneficiarySurname, bene
 
         console.log(`[PaymentService] 💰 Ödeme başarıyla tamamlandı. Ref: ${tuRefNumber}`);
 
-        // BAŞARILI LOG
+        // BANKA SIRA KAYDI — nihai durum uptStatusService tarafından kontrol edilir
+        // 'pending_bank': Uption sıraya aldı, banka henüz nihai sonucu dönmedi.
+        // uptStatusService her 15 dk'da kontrol eder: TR010/011/012 → 'success',
+        // TR005C/TR006 vb. → 'bank_returned' + Yandex iadesi otomatik yapılır.
         await savePaymentLog({
             driverId, beneficiaryName: `${beneficiaryName} ${beneficiarySurname}`,
             beneficiaryIban: ibanClean, amount: numAmount, grossAmount: yandexDeductAmount,
-            tuRefNumber, status: 'success', parkPartnerId
+            tuRefNumber, status: 'pending_bank', parkPartnerId
         });
 
         return { success: true, tuRefNumber };
