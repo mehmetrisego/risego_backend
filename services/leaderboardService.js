@@ -20,7 +20,7 @@ const yandexFleetApi = require('./yandexFleetApi');
 
 // ─── Sabitler ──────────────────────────────────────────────────────────
 const PAGE_LIMIT       = 500;              // Her sayfada max sipariş (Yandex max 1000, 500 güvenli)
-const THROTTLE_MS      = 500;             // İstekler arası minimum bekleme (ms) — 512MB RAM için artırıldı
+const THROTTLE_MS      = 10000;           // İstekler arası minimum bekleme (ms) — Yandex 429 limitleri için 10 saniyeye çıkarıldı
 const MAX_RETRIES      = 5;               // Hata durumunda max yeniden deneme
 const REQUEST_TIMEOUT  = 30_000;          // 30 saniye HTTP timeout
 const DELTA_INTERVAL   = 30 * 60 * 1000;  // 30 dakikada bir delta güncelleme (429 azaltma)
@@ -203,8 +203,8 @@ class LeaderboardService {
                     retries++;
                     const retryAfter = parseInt(err.response?.headers?.['retry-after'] || '0', 10);
                     const wait = retryAfter > 0
-                        ? retryAfter * 1000
-                        : Math.min(Math.pow(2, retries) * 1500 + Math.random() * 500, 20_000);
+                        ? retryAfter * 1000 + 2000 // Retry-after'a ek 2sn pay bırak
+                        : Math.min(Math.pow(2.5, retries) * 2000 + Math.random() * 1000, 60_000); // Daha agresif backoff (max 60sn)
                     console.warn(`[LeaderboardService] HTTP ${status} → ${Math.round(wait/1000)}s bekleniyor (${retries}/${MAX_RETRIES})`);
                     await sleep(wait);
                     continue; // aynı cursor ile yeniden dene
@@ -421,10 +421,12 @@ class LeaderboardService {
                 if (db.isConfigured()) {
                     const count = await dbOrders.upsertOrders(uniqueOrders);
                     totalWritten += count;
-                    console.log(`[LeaderboardService]   ${park.label}: ${uniqueOrders.length} sipariş işlendi (upsert)`);
                 } else {
                     memoryAccum.push(...uniqueOrders);
                 }
+                
+                // Şehirler arası mola (3. Öneri - 25 saniye)
+                await sleep(25000); 
             }
 
             if (db.isConfigured()) {
@@ -508,6 +510,9 @@ class LeaderboardService {
                     for (const o of mapped) map.set(`${o.id}|${o.parkPartnerId}`, o);
                     this._orders = Array.from(map.values());
                 }
+
+                // Şehirler arası mola (3. Öneri - 25 saniye)
+                await sleep(25000);
             }
 
             if (db.isConfigured()) {
@@ -644,6 +649,9 @@ class LeaderboardService {
                             updated_at = NOW()
                     `, params);
                 }
+
+                // Şehirler arası bakiye eşitleme molası (25 saniye)
+                await sleep(25000);
             }
             console.log(`[LeaderboardService] ✅ Sürücü bakiyeleri toplu olarak güncellendi.`);
         } catch (err) {
