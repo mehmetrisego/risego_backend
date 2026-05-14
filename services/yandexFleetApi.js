@@ -130,8 +130,7 @@ class YandexFleetApi {
                         driver_profile: ['first_name', 'last_name', 'phones', 'id']
                     },
                     limit,
-                    offset,
-                    sort_order: [{ direction: 'asc', field: 'driver_profile.created_date' }]
+                    offset
                 }
             );
 

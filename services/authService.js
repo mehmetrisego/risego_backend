@@ -175,7 +175,16 @@ class AuthService {
                     this.cacheExpiry = Date.now() + this.cacheTTL;
                 }
             } catch (error) {
-                console.error('[AuthService] Park sürücü önbelleği hatası:', partnerId, error.message);
+                console.error(`[AuthService] Park sürücü önbelleği hatası (${partnerId}):`, error.message);
+                
+                // Eğer hata 500 (Internal Server Error) ise ve elimizde eski bir cache varsa, onu kullanmaya devam edelim.
+                // Bu sayede Yandex tarafındaki geçici sorunlar sistemin tamamen durmasına neden olmaz.
+                if (cached) {
+                    console.warn(`[AuthService] ${partnerId} için eski önbellek (stale) kullanılıyor.`);
+                    return; 
+                }
+                
+                // Eğer elimizde hiç veri yoksa (ilk yükleme hatası), o zaman mecbur hata fırlatıyoruz.
                 throw error;
             } finally {
                 delete this._parkRefreshPending[partnerId];
