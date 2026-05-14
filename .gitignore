@@ -30,3 +30,9 @@ Thumbs.db
 # Geçici / Agent
 agent-tools/
 mcps/
+
+tools/
+.agents/
+skills-lock.json
+RTK_GUIDE.md
+scratch/
