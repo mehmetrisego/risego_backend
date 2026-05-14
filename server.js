@@ -27,11 +27,7 @@ const fs = require('fs').promises;
 const fsSync = require('fs');
 const app = express();
 
-async function writeDriversToFile(driversInfo) {
-    const filePath = path.join(process.cwd(), 'sürücüler.txt');
-    await fs.writeFile(filePath, JSON.stringify(driversInfo, null, 2), 'utf8');
-    return filePath;
-}
+
 
 // ─── KILLSWITCH (ACİL DURUM ANAHTARI) ──────────────────────────────────────
 let isKillswitchActive = false;
@@ -137,25 +133,8 @@ const customLeaderboardLimiter = rateLimit({
     skip: (req) => !req.query.from && !req.query.to // Sadece özel tarih filtreliler rate limit yer, normal leaderboard hızlıdır
 });
 
-// ============================================
-// Kampanya: DB varsa PostgreSQL, yoksa in-memory fallback (park_partner_id anahtarı)
-// ============================================
-const activeCampaignFallbackByPark = Object.create(null);
-
-function getCampaignMemory(parkPartnerId) {
-    const key = parkPartnerId || config.yandexFleet.partnerId;
-    return activeCampaignFallbackByPark[key] || { text: '', active: false, updatedAt: null };
-}
-
-function setCampaignMemory(parkPartnerId, campaign) {
-    const key = parkPartnerId || config.yandexFleet.partnerId;
-    activeCampaignFallbackByPark[key] = campaign;
-}
-
 async function loadCampaignForPark(parkPid) {
-    return db.isConfigured()
-        ? await dbCampaigns.getCampaign(parkPid)
-        : getCampaignMemory(parkPid);
+    return await dbCampaigns.getCampaign(parkPid);
 }
 
 /** Admin: query veya body'den parkPartnerId — yoksa birincil park */
@@ -572,11 +551,7 @@ app.post('/api/drivers/withdraw', requireAuth, async (req, res) => {
 
         // Cooldown'ı hemen şimdi (bekleme durumunda) güncelliyoruz ki paralel istekler engellensin.
         await client.query(
-            `INSERT INTO driver_profiles (driver_id, phone, last_withdraw_at, updated_at)
-             VALUES ($1, '', NOW(), NOW())
-             ON CONFLICT (driver_id) DO UPDATE SET
-                 last_withdraw_at = NOW(),
-                 updated_at = NOW()`,
+            `UPDATE driver_profiles SET last_withdraw_at = NOW(), updated_at = NOW() WHERE driver_id = $1`,
             [driverId]
         );
 
@@ -1050,108 +1025,7 @@ app.get('/api/drivers/car-brands', (req, res) => {
     res.json(getCarBrandsPayload());
 });
 
-/**
- * POST /api/drivers/update-car
- * Sürücünün araç plakasını günceller (eski akış - geriye uyumluluk, oturum gerekli)
- */
-app.post('/api/drivers/update-car', requireAuth, async (req, res) => {
-    try {
-        const { carId, newPlate } = req.body;
-        const driverId = req.sessionDriver.id;
 
-        if (!carId || !newPlate) {
-            return res.status(400).json({
-                success: false,
-                message: 'Araç ID ve yeni plaka gereklidir.'
-            });
-        }
-
-        // Araç sadece oturumdaki sürücüye ait olduğunda güncellenebilir
-        if (req.sessionDriver.carId !== carId) {
-            return res.status(403).json({
-                success: false,
-                message: 'Bu aracı güncelleme yetkiniz yok.'
-            });
-        }
-
-        const trimmedPlate = newPlate.trim().toUpperCase();
-        if (trimmedPlate.length < 3) {
-            return res.status(400).json({
-                success: false,
-                message: 'Geçerli bir plaka numarası giriniz.'
-            });
-        }
-
-        await yandexFleetApi.updateCarPlate(carId, trimmedPlate, sessionParkPartnerId(req));
-
-        res.json({
-            success: true,
-            message: 'Plaka başarıyla güncellendi.',
-            newPlate: trimmedPlate
-        });
-    } catch (error) {
-        console.error('[Server] Plaka güncelleme hatası:', error.message);
-        res.status(500).json({
-            success: false,
-            message: error.message || 'Plaka güncellenirken hata oluştu.'
-        });
-    }
-});
-
-/**
- * GET /api/drivers
- * Yandex Fleet'ten sürücülerin bilgilerini çeker ve JSON olarak döner
- */
-app.get('/api/drivers', async (req, res) => {
-    try {
-        const driversInfo = await yandexFleetApi.getAllDriversInfo();
-
-        // Dosyaya yaz
-        const filePath = await writeDriversToFile(driversInfo);
-
-        res.json({
-            success: true,
-            message: `${driversInfo.length} sürücü bilgisi başarıyla çekildi ve sürücüler.txt dosyasına yazıldı.`,
-            filePath: filePath,
-            totalDrivers: driversInfo.length,
-            drivers: driversInfo
-        });
-    } catch (error) {
-        console.error('[Server] Hata:', error.message);
-        res.status(500).json({
-            success: false,
-            message: 'Sürücü bilgileri çekilirken hata oluştu.',
-            error: error.message
-        });
-    }
-});
-
-/**
- * GET /api/drivers/fetch
- * Sadece sürücüleri çekip dosyaya yazar (hızlı endpoint)
- */
-app.get('/api/drivers/fetch', async (req, res) => {
-    try {
-        const driversInfo = await yandexFleetApi.getDriverProfilesFormatted();
-
-        const filePath = await writeDriversToFile(driversInfo);
-
-        res.json({
-            success: true,
-            message: `${driversInfo.length} sürücü profili çekildi ve sürücüler.txt dosyasına yazıldı.`,
-            filePath: filePath,
-            totalDrivers: driversInfo.length,
-            drivers: driversInfo
-        });
-    } catch (error) {
-        console.error('[Server] Hata:', error.message);
-        res.status(500).json({
-            success: false,
-            message: 'Sürücü profilleri çekilirken hata oluştu.',
-            error: error.message
-        });
-    }
-});
 
 /**
  * GET /api/health
