@@ -21,6 +21,7 @@ const dbCampaigns = require('./db/campaigns');
 const dbDriverBankAccounts = require('./db/driverBankAccounts');
 const db = require('./db');
 const { runMigrations } = require('./db/runMigrations');
+const dbPaymentLogs = require('./db/paymentLogs');
 
 const path = require('path');
 const fs = require('fs').promises;
@@ -93,6 +94,7 @@ const allowedOrigins = [
     'http://127.0.0.1:3000',
     'http://127.0.0.1:5500',
     'http://localhost:5500',
+    'http://192.168.1.102:5500',
     'null'  // file:// ile açılan sayfalar
 ];
 app.use(cors({
@@ -680,6 +682,24 @@ app.get('/api/drivers/withdraw-status', requireAuth, async (req, res) => {
     } catch (err) {
         console.error('[Server] Withdraw status hatası:', err.message);
         return res.json({ success: true, canWithdraw: true, cooldownUntil: null, minutesLeft: 0 });
+    }
+});
+
+/**
+ * GET /api/drivers/withdraw-history
+ * Oturumdaki sürücünün para çekme geçmişini döner.
+ */
+app.get('/api/drivers/withdraw-history', requireAuth, async (req, res) => {
+    try {
+        if (!db.isConfigured()) {
+            return res.status(503).json({ success: false, message: 'Veritabanı yapılandırılmamış.' });
+        }
+
+        const logs = await dbPaymentLogs.getDriverPaymentLogs(req.sessionDriver.id);
+        res.json({ success: true, logs });
+    } catch (error) {
+        console.error('[Server] Çekim geçmişi getirme hatası:', error.message);
+        res.status(500).json({ success: false, message: 'Çekim geçmişi alınırken hata oluştu.' });
     }
 });
 
@@ -1532,10 +1552,11 @@ async function startServer() {
         }
     }
 
-    app.listen(PORT, () => {
+    app.listen(PORT, '0.0.0.0', () => {
         console.log('='.repeat(50));
         console.log(`  RiseGo Backend - Yandex Fleet Sürücü Sistemi`);
-        console.log(`  Sunucu http://localhost:${PORT} adresinde çalışıyor`);
+        console.log(`  Sunucu http://0.0.0.0:${PORT} adresinde çalışıyor`);
+        console.log(`  Yerel ağ erişimi: http://192.168.1.102:${PORT}/api`);
         console.log(`  Veritabanı: ${db.isConfigured() ? 'PostgreSQL (aktif)' : 'Bellek (fallback)'}`);
         console.log('='.repeat(50));
         console.log('\nKullanılabilir endpointler:');
