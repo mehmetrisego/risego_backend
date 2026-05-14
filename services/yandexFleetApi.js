@@ -571,93 +571,10 @@ class YandexFleetApi {
         }
     }
 
-    /**
-     * Araç plakasını günceller
-     * PUT /v2/parks/vehicles/car
-     */
-    async updateCarPlate(vehicleId, newPlate, parkPartnerId) {
-        const carData = await this.getCarDetails(vehicleId, parkPartnerId);
-        if (!carData) {
-            throw new Error('Araç bilgileri alınamadı.');
-        }
-
-        const updateBody = {
-            vehicle_specifications: carData.vehicle_specifications || {},
-            vehicle_licenses: {
-                ...(carData.vehicle_licenses || {}),
-                licence_plate_number: newPlate
-            },
-            park_profile: carData.park_profile || {}
-        };
-
-        const { http, parkId } = this._resolveParkContext(parkPartnerId);
-        try {
-            await http.put(
-                '/v2/parks/vehicles/car',
-                updateBody,
-                {
-                    params: { vehicle_id: vehicleId },
-                    headers: { 'X-Park-ID': parkId }
-                }
-            );
-            return true;
-        } catch (error) {
-            const msg = error.response?.data?.message || error.message;
-            console.error(`[YandexFleetApi] Plaka güncelleme hatası (${vehicleId}):`, msg);
-            throw new Error(msg);
-        }
-    }
 
 
-    /**
-     * Sürücü profil verisini düzenli formata çevirir
-     */
-    formatDriverProfile(profile) {
-        const dp = profile.driver_profile || {};
-        const car = profile.car || {};
 
-        const carBrand = car.brand || '';
-        const carModel = car.model || '';
-        const carNumber = car.number || '';
-        const carYear = car.year || '';
-        const carColor = translateColor(car.color || '');
 
-        return {
-            id: dp.id,
-            name: `${dp.first_name || ''} ${dp.last_name || ''}`.trim(),
-            phones: dp.phones || [],
-            car: carNumber
-                ? `${carBrand} ${carModel} (${carYear}) - ${carColor} - Plaka: ${carNumber}`
-                : 'Araç atanmamış',
-            tripCount: 0
-        };
-    }
-
-    /**
-     * Tüm sürücülerin profil bilgilerini döner (araç + kimlik bilgileri).
-     * Yolculuk sayısı artık leaderboardService tarafından yönetilmektedir.
-     */
-    async getAllDriversInfo() {
-        const profiles = await this._getCachedDriverProfiles();
-        return profiles.map(p => {
-            const info = this.formatDriverProfile(p);
-            info.tripCount = 0; // leaderboardService.getLeaderboard() ile birleştirin
-            return info;
-        });
-    }
-
-    /**
-     * Sadece sürücü profillerini çeker (hızlı mod)
-     */
-    async getDriverProfilesFormatted() {
-        const driverProfiles = await this.getDriverProfiles();
-
-        return driverProfiles.map(p => {
-            const info = this.formatDriverProfile(p);
-            info.tripCount = 'N/A (hızlı mod)';
-            return info;
-        });
-    }
 }
 
 module.exports = new YandexFleetApi();
