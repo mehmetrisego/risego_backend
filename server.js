@@ -1377,6 +1377,91 @@ app.get('/api/admin/drivers/total-balance', requireAdminAuth, async (req, res) =
     }
 });
 
+// Admin Bank Account Management Endpoints
+app.get('/api/admin/drivers/:driverId/bank-accounts', requireAdminAuth, async (req, res) => {
+    try {
+        const { driverId } = req.params;
+        const accounts = await dbDriverBankAccounts.getDriverBankAccounts(driverId);
+        res.json({ success: true, accounts });
+    } catch (error) {
+        console.error('[AdminAPI] Sürücü banka hesapları çekilemedi:', error.message);
+        res.status(500).json({ success: false, message: 'Banka hesapları alınırken hata oluştu.' });
+    }
+});
+
+app.post('/api/admin/drivers/:driverId/bank-accounts', requireAdminAuth, async (req, res) => {
+    try {
+        const { driverId } = req.params;
+        const ibanRaw = req.body?.iban;
+        const accountHolderNameRaw = req.body?.accountHolderName;
+
+        const iban = dbDriverBankAccounts.normalizeIban(ibanRaw);
+        const accountHolderName = String(accountHolderNameRaw || '').trim();
+
+        if (!iban || !accountHolderName) {
+            return res.status(400).json({ success: false, message: 'IBAN ve hesap sahibi adı zorunludur.' });
+        }
+
+        if (!/^TR\d{24}$/.test(iban)) {
+            return res.status(400).json({ success: false, message: 'Geçerli bir TR IBAN giriniz (TR + 24 hane).' });
+        }
+
+        const account = await dbDriverBankAccounts.addDriverBankAccount(driverId, iban, accountHolderName);
+        res.json({ success: true, message: 'Hesap başarıyla eklendi.', account });
+    } catch (error) {
+        console.error('[AdminAPI] Sürücü banka hesabı eklenemedi:', error.message);
+        res.status(500).json({ success: false, message: 'Banka hesabı eklenirken hata oluştu: ' + error.message });
+    }
+});
+
+app.put('/api/admin/bank-accounts/:accountId', requireAdminAuth, async (req, res) => {
+    try {
+        const accountId = parseInt(req.params.accountId);
+        const ibanRaw = req.body?.iban;
+        const accountHolderNameRaw = req.body?.accountHolderName;
+
+        const iban = dbDriverBankAccounts.normalizeIban(ibanRaw);
+        const accountHolderName = String(accountHolderNameRaw || '').trim();
+
+        if (!iban || !accountHolderName) {
+            return res.status(400).json({ success: false, message: 'IBAN ve hesap sahibi adı zorunludur.' });
+        }
+
+        if (!/^TR\d{24}$/.test(iban)) {
+            return res.status(400).json({ success: false, message: 'Geçerli bir TR IBAN giriniz (TR + 24 hane).' });
+        }
+
+        const account = await dbDriverBankAccounts.updateDriverBankAccount(accountId, iban, accountHolderName);
+        if (account) {
+            res.json({ success: true, message: 'Banka hesabı başarıyla güncellendi.', account });
+        } else {
+            res.status(404).json({ success: false, message: 'Güncellenecek banka hesabı bulunamadı.' });
+        }
+    } catch (error) {
+        console.error('[AdminAPI] Sürücü banka hesabı güncellenemedi:', error.message);
+        res.status(500).json({ success: false, message: 'Banka hesabı güncellenirken hata oluştu.' });
+    }
+});
+
+app.delete('/api/admin/bank-accounts/:accountId', requireAdminAuth, async (req, res) => {
+    try {
+        const accountId = parseInt(req.params.accountId);
+        if (!db.isConfigured()) {
+            return res.status(503).json({ success: false, message: 'Veritabanı yapılandırılmamış.' });
+        }
+        const result = await db.query('DELETE FROM driver_bank_accounts WHERE id = $1 RETURNING id', [accountId]);
+        if (result.rowCount > 0) {
+            res.json({ success: true, message: 'Banka hesabı silindi.' });
+        } else {
+            res.status(404).json({ success: false, message: 'Hesap bulunamadı veya silinemedi.' });
+        }
+    } catch (error) {
+        console.error('[AdminAPI] Sürücü banka hesabı silinemedi:', error.message);
+        res.status(500).json({ success: false, message: 'Banka hesabı silinirken hata oluştu.' });
+    }
+});
+
+
 app.get('/api/admin/killswitch', requireAdminAuth, (req, res) => {
     res.json({ success: true, active: isKillswitchActive });
 });

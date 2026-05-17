@@ -68,9 +68,39 @@ async function deleteDriverBankAccount(driverId, accountId) {
     return result.rowCount > 0;
 }
 
+async function updateDriverBankAccount(accountId, iban, accountHolderName) {
+    if (!db.isConfigured()) throw new Error('DB not configured');
+
+    const normalizedIban = normalizeIban(iban);
+    const normalizedName = String(accountHolderName || '').trim();
+
+    const result = await db.query(
+        `UPDATE driver_bank_accounts
+         SET iban = $1, account_holder_name = $2, updated_at = NOW()
+         WHERE id = $3
+         RETURNING id, driver_id, iban, account_holder_name,
+                   created_at AS "createdAt", updated_at AS "updatedAt"`,
+        [normalizedIban, normalizedName, accountId]
+    );
+
+    if (result.rows.length === 0) return null;
+
+    const row = result.rows[0];
+    return {
+        id: row.id,
+        driverId: row.driver_id,
+        iban: row.iban,
+        accountHolderName: row.account_holder_name,
+        createdAt: row.createdAt ? row.createdAt.toISOString() : null,
+        updatedAt: row.updatedAt ? row.updatedAt.toISOString() : null
+    };
+}
+
 module.exports = {
     getDriverBankAccounts,
     addDriverBankAccount,
     deleteDriverBankAccount,
+    updateDriverBankAccount,
     normalizeIban
 };
+
