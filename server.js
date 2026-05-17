@@ -104,7 +104,7 @@ app.use(cors({
         if (origin.endsWith('.risegodriver.com') || origin.endsWith('.github.io')) return callback(null, true);
         callback(null, false);  // İzin verilmedi
     },
-    methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'x-session-token', 'x-park-partner-id', 'x-admin-token'],
     credentials: true
 }));
