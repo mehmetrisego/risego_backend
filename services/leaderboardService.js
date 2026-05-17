@@ -693,14 +693,7 @@ class LeaderboardService {
             throw new Error('Geçersiz veya tanımsız park (parkPartnerId).');
         }
 
-        // ── İlk sync tamamlanana kadar bekle ──────────────────
-        if (this._readyPromise) {
-            try {
-                await this._readyPromise;
-            } catch (_) {
-                // İlk sync başarısız olduysa bile devam et (API'den doğrudan çekeriz)
-            }
-        }
+        // ── İlk sync beklenmiyor (arka planda çalışıyor, DB'de veri var) ──
 
         // ── Tarih parse ───────────────────────────────────────
         const [sy, sm, sd] = fromStr.split('-').map(Number);
@@ -766,7 +759,28 @@ class LeaderboardService {
         }
 
         // ── Profil haritası ───────────────────────────────────
-        const profiles   = await this._getDriverProfiles(parkSource);
+        let profiles;
+        if (db.isConfigured()) {
+            try {
+                const res = await db.query(
+                    'SELECT driver_id, first_name, last_name FROM driver_profiles WHERE park_partner_id = $1',
+                    [pid]
+                );
+                profiles = res.rows.map(r => ({
+                    driver_profile: {
+                        id: r.driver_id,
+                        first_name: r.first_name,
+                        last_name: r.last_name
+                    }
+                }));
+            } catch (dbErr) {
+                console.error('[LeaderboardService] DB profiles fetch error, falling back to Yandex API:', dbErr.message);
+                profiles = await this._getDriverProfiles(parkSource);
+            }
+        } else {
+            profiles = await this._getDriverProfiles(parkSource);
+        }
+
         const profileMap = {};
         for (const p of profiles) {
             const dp  = p.driver_profile || {};
