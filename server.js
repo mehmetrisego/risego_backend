@@ -31,7 +31,7 @@ const app = express();
 
 
 // ─── KILLSWITCH (ACİL DURUM ANAHTARI) ──────────────────────────────────────
-let isKillswitchActive = false;
+let suspendedCities = [];
 // Durum başlangıçta startServer() içinde veritabanından yüklenecek.
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -497,6 +497,7 @@ app.post('/api/drivers/withdraw', requireAuth, async (req, res) => {
     let client;
     const driverId = req.sessionDriver.id;
     const grossAmount = parseFloat(req.body?.amount);
+    const parkPid = sessionParkPartnerId(req);
 
     try {
         if (!db.isConfigured()) {
@@ -504,8 +505,8 @@ app.post('/api/drivers/withdraw', requireAuth, async (req, res) => {
         }
 
         // ── 1. Ön Validasyonlar ───────────────────────────────────
-        if (isKillswitchActive) {
-            return res.status(503).json({ success: false, message: 'Para çekme işlemleri geçici bir süreliğine askıya alınmıştır. Lütfen daha sonra tekrar deneyiniz.' });
+        if (suspendedCities.includes(parkPid)) {
+            return res.status(503).json({ success: false, message: 'Para çekme işlemleri bulunduğunuz şehir için geçici bir süreliğine askıya alınmıştır. Lütfen daha sonra tekrar deneyiniz.' });
         }
 
         if (isNaN(grossAmount) || grossAmount <= 0) {
@@ -564,7 +565,6 @@ app.post('/api/drivers/withdraw', requireAuth, async (req, res) => {
 
         // ── 3. Anlık Bakiye Doğrulama (Yandex API) ────────────────
         // Frontend'den gelen tutarın gerçekte var olup olmadığını Yandex API'den anlık teyit ediyoruz.
-        const parkPid = sessionParkPartnerId(req);
         const yandexBalance = await yandexFleetApi.getDriverBalance(driverId, parkPid);
         
         const currentTotal    = parseFloat(yandexBalance?.balance || 0);
@@ -1468,23 +1468,23 @@ app.delete('/api/admin/bank-accounts/:accountId', requireAdminAuth, async (req, 
 
 
 app.get('/api/admin/killswitch', requireAdminAuth, (req, res) => {
-    res.json({ success: true, active: isKillswitchActive });
+    res.json({ success: true, suspendedCities });
 });
 
 app.post('/api/admin/killswitch', requireAdminAuth, express.json(), async (req, res) => {
-    const { active } = req.body;
-    if (typeof active !== 'boolean') {
+    const { suspendedCities: newSuspended } = req.body;
+    if (!Array.isArray(newSuspended)) {
         return res.status(400).json({ success: false, message: 'Geçersiz parametre.' });
     }
     
     try {
         await db.query(
-            "UPDATE system_settings SET value = $1, updated_at = NOW() WHERE key = 'is_withdraw_suspended'",
-            [active ? 'true' : 'false']
+            "UPDATE system_settings SET value = $1, updated_at = NOW() WHERE key = 'suspended_cities'",
+            [JSON.stringify(newSuspended)]
         );
-        isKillswitchActive = active;
-        console.log(`[Admin] Killswitch durumu veritabanında değiştirildi: ${active ? 'AÇIK (ASKIYA ALINDI)' : 'KAPALI (AKTİF)'}`);
-        res.json({ success: true, active: isKillswitchActive, message: active ? 'Para çekme işlemleri askıya alındı.' : 'Para çekme işlemleri tekrar aktif edildi.' });
+        suspendedCities = newSuspended;
+        console.log(`[Admin] Killswitch durumu veritabanında değiştirildi. Askıya alınan şehirler: ${suspendedCities.join(', ')}`);
+        res.json({ success: true, suspendedCities, message: 'Para çekme kısıtlamaları güncellendi.' });
     } catch (err) {
         console.error('[AdminAPI] Killswitch güncelleme hatası:', err.message);
         res.status(500).json({ success: false, message: 'Ayarlar güncellenirken veritabanı hatası oluştu.' });
@@ -1615,10 +1615,17 @@ async function startServer() {
 
             // Killswitch durumunu veritabanından yükleyelim
             try {
-                const ksResult = await db.query("SELECT value FROM system_settings WHERE key = 'is_withdraw_suspended'");
+                const ksResult = await db.query("SELECT value FROM system_settings WHERE key = 'suspended_cities'");
                 if (ksResult.rows.length > 0) {
-                    isKillswitchActive = ksResult.rows[0].value === 'true';
-                    console.log(`[Server] Killswitch durumu veritabanından yüklendi: ${isKillswitchActive ? 'ASKIDA' : 'AKTİF'}`);
+                    try {
+                        suspendedCities = JSON.parse(ksResult.rows[0].value);
+                        if (!Array.isArray(suspendedCities)) suspendedCities = [];
+                    } catch (e) {
+                        suspendedCities = [];
+                    }
+                    console.log(`[Server] Killswitch durumu veritabanından yüklendi. Askıdaki şehirler: ${suspendedCities.join(', ')}`);
+                } else {
+                    await db.query("INSERT INTO system_settings (key, value) VALUES ('suspended_cities', '[]') ON CONFLICT (key) DO NOTHING");
                 }
             } catch (ksErr) {
                 console.error('[Server] Killswitch durumu veritabanından okunamadı:', ksErr.message);
