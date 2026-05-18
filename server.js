@@ -1019,14 +1019,19 @@ app.post('/api/drivers/register/verify', async (req, res) => {
  * GET /api/drivers/car-brands
  * Zorunlu: data/yandexVehicleReference.json (brandsWithModels dolu olmalı)
  */
+let cachedCarBrandsPayload = null;
+
 function getCarBrandsPayload() {
+    if (cachedCarBrandsPayload) return cachedCarBrandsPayload;
+
     const refPath = path.join(__dirname, 'data', 'yandexVehicleReference.json');
     try {
         if (fsSync.existsSync(refPath)) {
             const raw = JSON.parse(fsSync.readFileSync(refPath, 'utf8'));
             if (raw.brandsWithModels && Array.isArray(raw.brandsWithModels) && raw.brandsWithModels.length > 0) {
                 const brands = raw.brandsWithModels.map(b => b.brand);
-                return { success: true, brands, brandsWithModels: raw.brandsWithModels };
+                cachedCarBrandsPayload = { success: true, brands, brandsWithModels: raw.brandsWithModels };
+                return cachedCarBrandsPayload;
             }
         }
     } catch (e) {
