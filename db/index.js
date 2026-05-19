@@ -18,11 +18,25 @@ const pool = connectionString
     ? new Pool({
           connectionString,
           ssl: poolSslOption(connectionString),
-          max: 10,
+          max: 20,
           idleTimeoutMillis: 30000,
-          connectionTimeoutMillis: 10000
+          connectionTimeoutMillis: 10000,
+          // TCP keepalive — sunucu/NAT tarafından öldürülen bağlantıları tespit eder
+          keepAlive: true,
+          keepAliveInitialDelayMillis: 30000,
+          // Boşta kalan havuzun process'i kilitlemesini engeller
+          allowExitOnIdle: true
       })
     : null;
+
+// ─── Havuz Hata Yönetimi ─────────────────────────────────────────────────────
+// Boşta bekleyen bir client koptuğunda pool'u zehirlemesini engelle
+if (pool) {
+    pool.on('error', (err) => {
+        console.error('[DB] Havuzdaki boşta bağlantı koptu (otomatik kaldırıldı):', err.message);
+        // pg Pool zaten kopan client'ı otomatik atar, burada sadece logluyoruz
+    });
+}
 
 /**
  * Veritabanı bağlantısını test eder
