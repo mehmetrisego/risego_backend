@@ -97,6 +97,16 @@ class AuthService {
                     this._driverLiveCache.delete(driverId);
                 }
             }
+            // Rate-limit cache çöplerini temizle
+            for (const [phone, lastSent] of this.otpLastSentAt.entries()) {
+                if (now - lastSent > this.OTP_RATE_LIMIT_MS) this.otpLastSentAt.delete(phone);
+            }
+            for (const [phone, lastSent] of this.registerOtpLastSentAt.entries()) {
+                if (now - lastSent > this.REGISTER_OTP_RATE_LIMIT_MS) this.registerOtpLastSentAt.delete(phone);
+            }
+            for (const [phone, lastSent] of this.adminOtpLastSentAt.entries()) {
+                if (now - lastSent > this.OTP_RATE_LIMIT_MS) this.adminOtpLastSentAt.delete(phone);
+            }
         }, 1000 * 60 * 30); // ✅ Her 30 dakikada bir (eskiden saatte birdi)
     }
 
