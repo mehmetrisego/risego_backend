@@ -135,6 +135,15 @@ exports.withdraw = async (req, res) => {
             return res.status(503).json({ success: false, message: 'Para çekme işlemleri bulunduğunuz şehir için geçici bir süreliğine askıya alınmıştır. Lütfen daha sonra tekrar deneyiniz.' });
         }
 
+        // Gece bakım penceresi (00:00–01:00 TR): senkronizasyon çalışırken çekim bloke
+        if (systemService.isMaintenanceWindowActive()) {
+            return res.status(503).json({
+                success: false,
+                maintenanceWindow: true,
+                message: 'Sistem gece bakımı sırasında (00:00–01:00) para çekimi geçici olarak kapalıdır. Lütfen saat 01:00\'dan sonra tekrar deneyiniz.'
+            });
+        }
+
         if (isNaN(grossAmount) || grossAmount <= 0) return res.status(400).json({ success: false, message: 'Geçerli bir tutar giriniz.' });
         if (grossAmount <= WITHDRAW_FEE_TL) return res.status(400).json({ success: false, message: `Çekim tutarı en az ${WITHDRAW_FEE_TL + 0.01} TL olmalıdır (${WITHDRAW_FEE_TL} TL çekim ücreti alınmaktadır).` });
 
@@ -215,6 +224,16 @@ exports.withdraw = async (req, res) => {
 
 exports.getWithdrawStatus = async (req, res) => {
     try {
+        // Gece bakım penceresi
+        if (systemService.isMaintenanceWindowActive()) {
+            return res.json({
+                success: true,
+                canWithdraw: false,
+                maintenanceWindow: true,
+                message: 'Sistem gece bakımı sırasında (00:00–01:00) para çekimi geçici olarak kapalıdır.'
+            });
+        }
+
         const driverId = req.sessionDriver.id;
         if (!db.isConfigured()) return res.json({ success: true, canWithdraw: true, cooldownUntil: null, minutesLeft: 0 });
         const profileRow = await db.query('SELECT last_withdraw_at FROM driver_profiles WHERE driver_id = $1', [driverId]);

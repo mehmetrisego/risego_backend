@@ -23,7 +23,7 @@ const PAGE_LIMIT       = 500;              // Her sayfada max sipariş (Yandex m
 const THROTTLE_MS      = 10000;           // İstekler arası minimum bekleme (ms) — Yandex 429 limitleri için 10 saniyeye çıkarıldı
 const MAX_RETRIES      = 5;               // Hata durumunda max yeniden deneme
 const REQUEST_TIMEOUT  = 30_000;          // 30 saniye HTTP timeout
-const DELTA_INTERVAL   = 30 * 60 * 1000;  // 30 dakikada bir delta güncelleme (429 azaltma)
+// DELTA_INTERVAL kaldırıldı — artık gece 00:00–01:00 bakım penceresi kullanılıyor (cronManager.js)
 const CACHE_DAYS       = 31;              // Bellekte tutulacak sipariş aralığı (gün) — 512MB RAM için düşürüldü
 const CHUNK_OVERLAP_MS = 45 * 60 * 1000; // Chunk sınırlarında 45 dk overlap (sınır kaybı önleme)
 
@@ -548,13 +548,12 @@ class LeaderboardService {
      * server.js'de bir kez çağrılır.
      *
      * Davranış:
-     *   1. İlk tam senkronizasyonu başlatır ve _readyPromise'e bağlar.
-     *   2. _readyPromise tamamlanana kadar gelen leaderboard istekleri bekler
-     *      → Admin butonu ya da müdahale gerektirmez, sistem tamamen otomatik.
-     *   3. Her 15 dakikada bir delta güncelleme çalışır.
+     *   1. İlk senkronizasyonu başlatır (DB doluysa delta, boşsa full sync).
+     *   2. _readyPromise tamamlanana kadar leaderboard istekleri bekler.
+     *   3. Periyodik delta YOK — gece 00:00–01:00 bakım penceresi cronManager tarafından yönetilir.
      */
     async startCron() {
-        console.log('[LeaderboardService] Cron başlatılıyor...');
+        console.log('[LeaderboardService] Başlangıç sync başlatılıyor...');
 
         // İlk senkronizasyon: DB doluysa delta, boşsa full sync
         const initSync = async () => {
@@ -587,26 +586,30 @@ class LeaderboardService {
             }, 60_000);
         });
 
-        // Her 15 dakikada bir delta güncelleme
-        this._cronHandle = setInterval(async () => {
-            console.log('[LeaderboardService] ⏰ Periyodik senkronizasyon...');
-            try {
-                const needsFullSync = db.isConfigured()
-                    ? (await dbOrders.getOrderCount()) === 0
-                    : (this._orders.length === 0 || !this._ordersTo);
-                if (needsFullSync) {
-                    await this._fullSync();
-                } else {
-                    await this._deltaSync();
-                }
-                // Bakiyeleri de eşitle
-                await this._syncDriverBalances();
-            } catch (e) {
-                console.error('[LeaderboardService] Periyodik senkronizasyon hatası:', e.message);
-            }
-        }, DELTA_INTERVAL);
+        console.log('[LeaderboardService] Başlangıç sync tetiklendi. Gece sync: cronManager 00:00 TR.');
+    }
 
-        console.log(`[LeaderboardService] Cron aktif (her ${DELTA_INTERVAL / 60_000} dakikada delta güncelleme).`);
+    /**
+     * Gece bakım penceresi delta sync — cronManager tarafından 00:00 TR'de çağrılır.
+     * Son sync'ten bu yana eksik yolculukları çeker + bakiyeleri günceller.
+     */
+    async runNightlySync() {
+        console.log('[LeaderboardService] 🌙 Gece delta sync başlıyor...');
+        try {
+            const needsFull = db.isConfigured()
+                ? (await dbOrders.getOrderCount()) === 0
+                : (this._orders.length === 0 || !this._ordersTo);
+            if (needsFull) {
+                console.log('[LeaderboardService] DB boş — tam senkronizasyon çalışıyor...');
+                await this._fullSync();
+            } else {
+                await this._deltaSync();
+            }
+            await this._syncDriverBalances();
+            console.log('[LeaderboardService] ✅ Gece sync tamamlandı.');
+        } catch (err) {
+            console.error('[LeaderboardService] ❌ Gece sync hatası:', err.message);
+        }
     }
 
     /** Yandex'ten sürücü profillerini çekip bakiyeleri DB'ye kaydeder (Optimize Bulk Sync) */
