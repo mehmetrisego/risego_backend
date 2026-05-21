@@ -246,12 +246,12 @@ class YandexFleetApi {
      * Sürücünün bakiyesini getirir
      * GET /v1/parks/contractors/blocked-balance
      */
-    async getDriverBalance(driverId, parkPartnerId) {
+    async getDriverBalance(driverId, parkPartnerId, forceRefresh = false) {
         // ✅ OPT-4: 2 dakikalık cache — aynı sürücü için Yandex API'ye tekrar istek atılmaz
         const cacheKey = `${driverId}:${parkPartnerId || 'default'}`;
         const now = Date.now();
         const cached = this._balanceCache.get(cacheKey);
-        if (cached && now < cached.expiry) {
+        if (!forceRefresh && cached && now < cached.expiry) {
             return { balance: cached.balance, blockedBalance: cached.blockedBalance };
         }
 
@@ -291,6 +291,14 @@ class YandexFleetApi {
             console.error(`[YandexFleetApi] Bakiye çekilirken hata (${driverId}):`, error.response?.data?.message || error.message);
             return null;
         }
+    }
+
+    /**
+     * Belirli bir sürücü için bakiye önbelleğini temizler
+     */
+    invalidateBalanceCache(driverId, parkPartnerId) {
+        const cacheKey = `${driverId}:${parkPartnerId || 'default'}`;
+        this._balanceCache.delete(cacheKey);
     }
 
 
