@@ -1,6 +1,9 @@
 const crypto = require('crypto');
 const config = require('../config');
 const yandexFleetApi = require('./yandexFleetApi');
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
 const leaderboardService = require('./leaderboardService');
 const netgsmService = require('./netgsmService');
 const dbSessions = require('../db/sessions');
@@ -28,7 +31,7 @@ class AuthService {
         // Sürücü cache (telefon -> profil) — birincil park ile uyumluluk
         this.driverCache = new Map();
         this.cacheExpiry = null;
-        this.cacheTTL = 10 * 60 * 1000; // ✅ 10 dakika (eskiden 5'ti)
+        this.cacheTTL = 30 * 60 * 1000; // ✅ 30 dakika cache süresi (eski 10 dk)
         /** partnerId -> { expiry, phoneMap } — şehir/park bazlı giriş doğrulama */
         this.parkDriverCaches = new Map();
         this._parkRefreshPending = Object.create(null);
@@ -203,10 +206,12 @@ class AuthService {
             } catch (error) {
                 console.error(`[AuthService] Park sürücü önbelleği hatası (${partnerId}):`, error.message);
                 
-                // Hata durumunda (429/500/etc.) ve eski cache varsa, cooldown/spam engellemek için expiry süresini 3 dk uzat
+                // Hata durumunda (429/500/etc.) ve eski cache varsa, cooldown/spam engellemek için expiry süresini uzat
                 if (cached) {
-                    console.warn(`[AuthService] ${partnerId} için eski önbellek (stale) 3 dakika daha uzatılarak kullanılıyor.`);
-                    cached.expiry = Date.now() + 3 * 60 * 1000;
+                    const is429 = error.response?.status === 429 || error.message.includes('429');
+                    const cooldownMs = is429 ? 30 * 60 * 1000 : 5 * 60 * 1000; // 429 ise 30 dk, diğer hatalar için 5 dk
+                    console.warn(`[AuthService] ${partnerId} için eski önbellek (stale) ${cooldownMs / 60000} dakika daha uzatılarak kullanılıyor.`);
+                    cached.expiry = Date.now() + cooldownMs;
                     return; 
                 }
                 
@@ -246,7 +251,13 @@ class AuthService {
     async findDriverByPhoneInAnyPark(phone) {
         const sources = config.getYandexParkSources();
         if (sources.length === 0) return null;
-        await Promise.all(sources.map(s => this.refreshParkDriverCache(s)));
+        
+        // Sıralı sorgulama (Sequential execution) ve mola ile paralel limit aşımını önleme
+        for (const s of sources) {
+            await this.refreshParkDriverCache(s);
+            await sleep(1000); // Parklar arası 1s stagger delay
+        }
+        
         const normalized = this.normalizePhone(phone);
         for (const src of sources) {
             const d = this.lookupPhoneInParkCache(normalized, src.partnerId);

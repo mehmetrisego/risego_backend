@@ -1,6 +1,20 @@
 const axios = require('axios');
 const crypto = require('crypto');
+const http = require('http');
+const https = require('https');
 const config = require('../config');
+
+const keepAliveAgentOptions = {
+    keepAlive: true,
+    maxSockets: 100,
+    maxFreeSockets: 10,
+    timeout: 60000,
+    freeSocketTimeout: 30000
+};
+const httpAgent = new http.Agent(keepAliveAgentOptions);
+const httpsAgent = new https.Agent(keepAliveAgentOptions);
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // Rusça renk isimlerini Türkçe'ye çevir
 const COLOR_MAP = {
@@ -55,6 +69,8 @@ class YandexFleetApi {
         this.httpClient = axios.create({
             baseURL: this.baseUrl,
             timeout: 30000, // ✅ OPT-2: 30s timeout — asılı kalan istekler sunucuyu dondurmasın
+            httpAgent,
+            httpsAgent,
             headers: {
                 'X-Client-ID': config.yandexFleet.clientId,
                 'X-API-Key': config.yandexFleet.apiKey,
@@ -102,6 +118,8 @@ class YandexFleetApi {
                 axios.create({
                     baseURL: src.baseUrl || config.yandexFleet.baseUrl,
                     timeout: 30000,
+                    httpAgent,
+                    httpsAgent,
                     headers: {
                         'X-Client-ID': src.clientId,
                         'X-API-Key': src.apiKey,
@@ -125,6 +143,9 @@ class YandexFleetApi {
         let hasMore = true;
 
         while (hasMore) {
+            if (offset > 0) {
+                await sleep(1500); // 1.5s delay between pages to prevent 429
+            }
             const response = await http.post(
                 '/v1/parks/driver-profiles/list',
                 {
@@ -189,6 +210,9 @@ class YandexFleetApi {
 
         while (hasMore) {
             try {
+                if (offset > 0) {
+                    await sleep(1500); // 1.5s delay between pages to prevent 429
+                }
                 const response = await http.post(
                     '/v1/parks/driver-profiles/list',
                     {

@@ -13,10 +13,23 @@
 // ============================================================
 
 const axios  = require('axios');
+const http = require('http');
+const https = require('https');
 const config = require('../config');
 const db = require('../db');
 const dbOrders = require('../db/orders');
 const yandexFleetApi = require('./yandexFleetApi');
+
+const keepAliveAgentOptions = {
+    keepAlive: true,
+    maxSockets: 100,
+    maxFreeSockets: 10,
+    timeout: 60000,
+    freeSocketTimeout: 30000
+};
+const httpAgent = new http.Agent(keepAliveAgentOptions);
+const httpsAgent = new https.Agent(keepAliveAgentOptions);
+
 
 // ─── Sabitler ──────────────────────────────────────────────────────────
 const PAGE_LIMIT       = 500;              // Her sayfada max sipariş (Yandex max 1000, 500 güvenli)
@@ -43,6 +56,8 @@ function getAxiosForPark(parkSource) {
         parkHttpClients.set(pid, axios.create({
             baseURL: parkSource.baseUrl || config.yandexFleet.baseUrl,
             timeout: REQUEST_TIMEOUT,
+            httpAgent,
+            httpsAgent,
             headers: {
                 'X-Client-ID': parkSource.clientId,
                 'X-API-Key': parkSource.apiKey,
