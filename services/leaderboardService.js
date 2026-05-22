@@ -23,7 +23,7 @@ const PAGE_LIMIT       = 500;              // Her sayfada max sipariş (Yandex m
 const THROTTLE_MS      = 10000;           // İstekler arası minimum bekleme (ms) — Yandex 429 limitleri için 10 saniyeye çıkarıldı
 const MAX_RETRIES      = 5;               // Hata durumunda max yeniden deneme
 const REQUEST_TIMEOUT  = 30_000;          // 30 saniye HTTP timeout
-// DELTA_INTERVAL kaldırıldı — artık gece 00:00–01:00 bakım penceresi kullanılıyor (cronManager.js)
+// DELTA_INTERVAL kaldırıldı — artık gece 06:00–07:00 bakım penceresi kullanılıyor (cronManager.js)
 const CACHE_DAYS       = 31;              // Bellekte tutulacak sipariş aralığı (gün) — 512MB RAM için düşürüldü
 const CHUNK_OVERLAP_MS = 45 * 60 * 1000; // Chunk sınırlarında 45 dk overlap (sınır kaybı önleme)
 
@@ -550,7 +550,7 @@ class LeaderboardService {
      * Davranış:
      *   1. İlk senkronizasyonu başlatır (DB doluysa delta, boşsa full sync).
      *   2. _readyPromise tamamlanana kadar leaderboard istekleri bekler.
-     *   3. Periyodik delta YOK — gece 00:00–01:00 bakım penceresi cronManager tarafından yönetilir.
+     *   3. Periyodik delta YOK — gece 06:00–07:00 bakım penceresi cronManager tarafından yönetilir.
      */
     async startCron() {
         console.log('[LeaderboardService] Başlangıç sync başlatılıyor...');
@@ -586,11 +586,11 @@ class LeaderboardService {
             }, 60_000);
         });
 
-        console.log('[LeaderboardService] Başlangıç sync tetiklendi. Gece sync: cronManager 00:00 TR.');
+        console.log('[LeaderboardService] Başlangıç sync tetiklendi. Gece sync: cronManager 06:00 TR.');
     }
 
     /**
-     * Gece bakım penceresi delta sync — cronManager tarafından 00:00 TR'de çağrılır.
+     * Gece bakım penceresi delta sync — cronManager tarafından 06:00 TR'de çağrılır.
      * Son sync'ten bu yana eksik yolculukları çeker + bakiyeleri günceller.
      */
     async runNightlySync() {

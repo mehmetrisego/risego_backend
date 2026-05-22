@@ -135,12 +135,12 @@ exports.withdraw = async (req, res) => {
             return res.status(503).json({ success: false, message: 'Para çekme işlemleri bulunduğunuz şehir için geçici bir süreliğine askıya alınmıştır. Lütfen daha sonra tekrar deneyiniz.' });
         }
 
-        // Gece bakım penceresi (00:00–01:00 TR): senkronizasyon çalışırken çekim bloke
+        // Gece bakım penceresi (06:00–07:00 TR): senkronizasyon çalışırken çekim bloke
         if (systemService.isMaintenanceWindowActive()) {
             return res.status(503).json({
                 success: false,
                 maintenanceWindow: true,
-                message: 'Sistem gece bakımı sırasında (00:00–01:00) para çekimi geçici olarak kapalıdır. Lütfen saat 01:00\'dan sonra tekrar deneyiniz.'
+                message: 'Sistem gece bakımı sırasında (06:00–07:00) para çekimi geçici olarak kapalıdır. Lütfen saat 07:00\'dan sonra tekrar deneyiniz.'
             });
         }
 
@@ -230,7 +230,7 @@ exports.getWithdrawStatus = async (req, res) => {
                 success: true,
                 canWithdraw: false,
                 maintenanceWindow: true,
-                message: 'Sistem gece bakımı sırasında (00:00–01:00) para çekimi geçici olarak kapalıdır.'
+                message: 'Sistem gece bakımı sırasında (06:00–07:00) para çekimi geçici olarak kapalıdır.'
             });
         }
 

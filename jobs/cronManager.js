@@ -4,9 +4,9 @@ const systemService      = require('../services/systemService');
 
 // ─── Gece Sync Durumu ──────────────────────────────────────────────────
 // TZ=Europe/Istanbul → new Date().getHours() doğrudan İstanbul saati döner.
-// 00:00–01:00 → bakım penceresi + delta sync
-// 01:00       → bakım biter
-// 02:00       → hasRunToday sıfırlanır (ertesi gece için)
+// 06:00–07:00 → bakım penceresi + delta sync
+// 07:00       → bakım biter
+// 08:00       → hasRunToday sıfırlanır (ertesi gece için)
 
 let _hasRunToday       = false;
 let _nightSyncScheduler = null;
@@ -15,24 +15,24 @@ function _checkNightWindow() {
     const h = new Date().getHours();
     const m = new Date().getMinutes();
 
-    // 00:XX — bakım başlat + sync tetikle (günde bir kez)
-    if (h === 0 && !_hasRunToday) {
+    // 06:XX — bakım başlat + sync tetikle (günde bir kez)
+    if (h === 6 && !_hasRunToday) {
         _hasRunToday = true;
-        console.log('[NightSync] ⏰ 00:00 TR — bakım penceresi açılıyor, delta sync başlıyor...');
+        console.log('[NightSync] ⏰ 06:00 TR — bakım penceresi açılıyor, delta sync başlıyor...');
         systemService.setMaintenanceWindow(true);
         leaderboardService.runNightlySync().catch(err => {
             console.error('[NightSync] ❌ Gece delta sync hatası:', err.message);
         });
     }
 
-    // 01:00 — bakım kapat
-    if (h === 1 && m === 0 && systemService.isMaintenanceWindowActive()) {
-        console.log('[NightSync] ✅ 01:00 TR — bakım penceresi kapanıyor.');
+    // 07:00 — bakım kapat
+    if (h === 7 && m === 0 && systemService.isMaintenanceWindowActive()) {
+        console.log('[NightSync] ✅ 07:00 TR — bakım penceresi kapanıyor.');
         systemService.setMaintenanceWindow(false);
     }
 
-    // 02:00 — flag sıfırla (ertesi gece çalışsın)
-    if (h === 2) {
+    // 08:00 — flag sıfırla (ertesi gece çalışsın)
+    if (h === 8) {
         _hasRunToday = false;
     }
 }
@@ -64,10 +64,10 @@ function startAllCrons() {
     }, 5000);
 
     // 3. Gece sync scheduler — her dakika saat kontrol eder
-    // Sunucu 00:00–01:00 arasında yeniden başladıysa bakımı hemen uygula
+    // Sunucu 06:00–07:00 arasında yeniden başladıysa bakımı hemen uygula
     const startHour = new Date().getHours();
-    if (startHour === 0) {
-        console.log('[NightSync] Sunucu 00:00–01:00 penceresinde başlatıldı — bakım aktif.');
+    if (startHour === 6) {
+        console.log('[NightSync] Sunucu 06:00–07:00 penceresinde başlatıldı — bakım aktif.');
         _hasRunToday = true;
         systemService.setMaintenanceWindow(true);
         // startCron ilk sync'ini tamamlasın, sonra delta çek
@@ -76,8 +76,8 @@ function startAllCrons() {
                 console.error('[NightSync] Başlangıç gece sync hatası:', err.message);
             });
         }, 15000);
-    } else if (startHour === 1) {
-        // 01:XX'de başladı → sync bugün zaten yapıldı (ya da yapılmıyor), bakım kapalı
+    } else if (startHour === 7) {
+        // 07:XX'de başladı → sync bugün zaten yapıldı (ya da yapılmıyor), bakım kapalı
         _hasRunToday = true;
         systemService.setMaintenanceWindow(false);
     }
