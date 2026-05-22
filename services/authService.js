@@ -48,6 +48,16 @@ class AuthService {
 
         // Memory Leak önlemek için belli periyotlarla ölü oturumları silen görev başlatılıyor
         this._startGarbageCollector();
+
+        // Yandex API bakiye istekleri için park önbelleğini sorgulama callback'ini kaydet
+        yandexFleetApi.registerCacheLookup((driverId, parkPartnerId) => {
+            const pid = parkPartnerId || config.yandexFleet.partnerId;
+            const entry = this.parkDriverCaches.get(pid);
+            if (entry && entry.driverIdMap) {
+                return entry.driverIdMap.get(driverId);
+            }
+            return null;
+        });
     }
 
     /**
@@ -145,6 +155,7 @@ class AuthService {
                 ? `${car.brand || ''} ${car.model || ''} (${car.year || ''}) - Plaka: ${car.number}`
                 : 'Araç atanmamış',
             balance: !isNaN(rawBalance) ? `${rawBalance.toFixed(2).replace('.', ',')} ₺` : '-',
+            rawBalance: !isNaN(rawBalance) ? rawBalance : 0,
             tripCount: 0,
             parkPartnerId
         };
@@ -167,15 +178,20 @@ class AuthService {
             try {
                 const profiles = await yandexFleetApi.fetchDriverProfilesForParkSource(parkSource);
                 const phoneMap = new Map();
+                const driverIdMap = new Map();
                 for (const profile of profiles) {
                     const driverInfo = this.profileToDriverInfo(profile, partnerId);
                     for (const ph of driverInfo.phones || []) {
                         phoneMap.set(this.normalizePhone(ph), driverInfo);
                     }
+                    if (driverInfo.id) {
+                        driverIdMap.set(driverInfo.id, driverInfo);
+                    }
                 }
                 this.parkDriverCaches.set(partnerId, {
                     expiry: Date.now() + this.cacheTTL,
-                    phoneMap
+                    phoneMap,
+                    driverIdMap
                 });
                 if (partnerId === config.yandexFleet.partnerId) {
                     this.driverCache.clear();
@@ -187,10 +203,10 @@ class AuthService {
             } catch (error) {
                 console.error(`[AuthService] Park sürücü önbelleği hatası (${partnerId}):`, error.message);
                 
-                // Eğer hata 500 (Internal Server Error) ise ve elimizde eski bir cache varsa, onu kullanmaya devam edelim.
-                // Bu sayede Yandex tarafındaki geçici sorunlar sistemin tamamen durmasına neden olmaz.
+                // Hata durumunda (429/500/etc.) ve eski cache varsa, cooldown/spam engellemek için expiry süresini 3 dk uzat
                 if (cached) {
-                    console.warn(`[AuthService] ${partnerId} için eski önbellek (stale) kullanılıyor.`);
+                    console.warn(`[AuthService] ${partnerId} için eski önbellek (stale) 3 dakika daha uzatılarak kullanılıyor.`);
+                    cached.expiry = Date.now() + 3 * 60 * 1000;
                     return; 
                 }
                 

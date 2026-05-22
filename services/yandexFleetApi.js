@@ -75,6 +75,11 @@ class YandexFleetApi {
         // driverId -> { balance, blockedBalance, expiry }
         this._balanceCache = new Map();
         this.BALANCE_TTL = 2 * 60 * 1000; // 2 dakika
+        this._cacheLookupFn = null;
+    }
+
+    registerCacheLookup(fn) {
+        this._cacheLookupFn = fn;
     }
 
     /**
@@ -253,6 +258,24 @@ class YandexFleetApi {
         const cached = this._balanceCache.get(cacheKey);
         if (!forceRefresh && cached && now < cached.expiry) {
             return { balance: cached.balance, blockedBalance: cached.blockedBalance };
+        }
+
+        // forceRefresh değilse, Yandex API'ye gitmeden önce authService'in toplu sürücü profil önbelleğindeki bakiyeye bak
+        if (!forceRefresh && this._cacheLookupFn) {
+            try {
+                const driverInfo = this._cacheLookupFn(driverId, parkPartnerId);
+                if (driverInfo && driverInfo.rawBalance !== undefined) {
+                    const result = {
+                        balance: String(driverInfo.rawBalance),
+                        blockedBalance: '0'
+                    };
+                    // Sonucu yerel bakiye cache'ine 2 dakikalığına kaydet
+                    this._balanceCache.set(cacheKey, { ...result, expiry: now + this.BALANCE_TTL });
+                    return result;
+                }
+            } catch (err) {
+                console.error('[YandexFleetApi] Park sürücü önbelleği bakiye sorgulama hatası:', err.message);
+            }
         }
 
         const { http, parkId } = this._resolveParkContext(parkPartnerId);
