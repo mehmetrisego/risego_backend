@@ -625,6 +625,41 @@ class YandexFleetApi {
         }
     }
 
+    /**
+     * Tek bir sürücünün profil ve araç detaylarını Yandex'ten çeker
+     */
+    async getDriverProfile(driverId, parkPartnerId) {
+        const { http, parkId } = this._resolveParkContext(parkPartnerId);
+        try {
+            const response = await http.post(
+                '/v1/parks/driver-profiles/list',
+                {
+                    query: {
+                        park: {
+                            id: parkId,
+                            driver_profile: {
+                                id: [driverId]
+                            }
+                        }
+                    },
+                    fields: {
+                        account: ['balance'],
+                        car: ['brand', 'model', 'number', 'year', 'color', 'id'],
+                        driver_profile: ['first_name', 'last_name', 'phones', 'id']
+                    },
+                    limit: 1
+                }
+            );
+
+            const profiles = response.data?.driver_profiles || [];
+            if (profiles.length === 0) return null;
+            return profiles[0];
+        } catch (error) {
+            console.error(`[YandexFleetApi] Tekil sürücü profili çekilirken hata (${driverId}):`, error.response?.data || error.message);
+            return null;
+        }
+    }
+
 
 
 

@@ -42,4 +42,7 @@ router.delete('/bank-accounts/:accountId', adminController.deleteBankAccount);
 router.get('/killswitch', adminController.getKillswitch);
 router.post('/killswitch', express.json(), adminController.updateKillswitch);
 
+// Manuel Sürücü Senkronizasyonu
+router.post('/sync-drivers', express.json(), adminController.syncDrivers);
+
 module.exports = router;

@@ -328,11 +328,38 @@ exports.changeCar = async (req, res) => {
             let car = null;
             try { car = await yandexFleetApi.findCarByPlate(trimmedPlate, parkPid); } catch (e) { }
             const carInfo = car ? { id: car.id || carId, brand: car.brand || brand || '', model: car.model || model || '', year: car.year || year || '', number: car.number || trimmedPlate } : { id: carId, brand: brand || '', model: model || '', year: year || '', number: trimmedPlate };
+            
+            if (db.isConfigured()) {
+                const carText = carInfo.number
+                    ? `${carInfo.brand || ''} ${carInfo.model || ''} (${carInfo.year || ''}) - Plaka: ${carInfo.number}`
+                    : 'Araç atanmamış';
+                await db.query(
+                    `UPDATE driver_profiles 
+                     SET car_id = $1, car_number = $2, car_name = $3, updated_at = NOW() 
+                     WHERE driver_id = $4`,
+                    [carInfo.id, carInfo.number, carText, driverId]
+                ).catch(err => console.error('[DB] Araç güncelleme hatası (changeCar):', err.message));
+            }
+
             res.json({ success: true, message: 'Araç başarıyla değiştirildi.', car: carInfo });
         } else {
             if (!brand || !model || !year) return res.status(400).json({ success: false, message: 'Yeni araç için marka, model ve yıl gereklidir.' });
             const result = await yandexFleetApi.createCarAndBind(trimmedPlate, brand, model, year, driverId, parkPid);
-            res.json({ success: true, message: 'Yeni araç kaydedildi ve size atandı.', car: { id: result.vehicleId, brand: result.brand, model: result.model, year: result.year, number: result.plate } });
+            const carInfo = { id: result.vehicleId, brand: result.brand, model: result.model, year: result.year, number: result.plate };
+
+            if (db.isConfigured()) {
+                const carText = carInfo.number
+                    ? `${carInfo.brand || ''} ${carInfo.model || ''} (${carInfo.year || ''}) - Plaka: ${carInfo.number}`
+                    : 'Araç atanmamış';
+                await db.query(
+                    `UPDATE driver_profiles 
+                     SET car_id = $1, car_number = $2, car_name = $3, updated_at = NOW() 
+                     WHERE driver_id = $4`,
+                    [carInfo.id, carInfo.number, carText, driverId]
+                ).catch(err => console.error('[DB] Araç güncelleme hatası (createCarAndBind):', err.message));
+            }
+
+            res.json({ success: true, message: 'Yeni araç kaydedildi ve size atandı.', car: carInfo });
         }
     } catch (error) {
         console.error('[DriverController] Araç değiştirme hatası:', error.message);

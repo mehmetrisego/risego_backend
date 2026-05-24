@@ -4,6 +4,8 @@ const dbCampaigns = require('../db/campaigns');
 const dbDriverBankAccounts = require('../db/driverBankAccounts');
 const dbPaymentLogs = require('../db/paymentLogs');
 
+const yandexFleetApi = require('../services/yandexFleetApi');
+const authService = require('../services/authService');
 const uptService = require('../services/uptService');
 const leaderboardService = require('../services/leaderboardService');
 const systemService = require('../services/systemService');
@@ -262,5 +264,91 @@ exports.getLeaderboardStatus = async (req, res) => {
         res.json({ success: true, status });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
+    }
+};
+
+exports.syncDrivers = async (req, res) => {
+    const { parkIds } = req.body;
+    if (!Array.isArray(parkIds) || parkIds.length === 0) {
+        return res.status(400).json({ success: false, message: 'Lütfen en az bir şehir seçin.' });
+    }
+
+    try {
+        let totalInserted = 0;
+        let totalUpdated = 0;
+        let totalNoPhone = 0;
+
+        for (const parkId of parkIds) {
+            const park = config.findYandexParkByPartnerId(parkId);
+            if (!park) continue;
+
+            console.log(`[AdminSync] ${park.label} için sürücüler senkronize ediliyor...`);
+            const profiles = await yandexFleetApi.fetchDriverProfilesForParkSource(park);
+
+            // 50'şerli batch halinde DB güncellemeleri
+            const BATCH_SIZE = 50;
+            for (let i = 0; i < profiles.length; i += BATCH_SIZE) {
+                const chunk = profiles.slice(i, i + BATCH_SIZE);
+                await Promise.all(chunk.map(async (profile) => {
+                    const dp        = profile.driver_profile || profile;
+                    const drvId     = dp.id || dp.driver_profile_id;
+                    if (!drvId) return;
+
+                    const firstName = (dp.first_name || '').trim();
+                    const lastName  = (dp.last_name  || '').trim();
+                    const phone     = Array.isArray(dp.phones) && dp.phones.length
+                        ? String(dp.phones[0]).replace(/\D/g, '')  // sadece rakam
+                        : null;
+
+                    if (!phone) {
+                        totalNoPhone++;
+                        return;
+                    }
+
+                    const car = profile.car || {};
+                    const carId = car.id || null;
+                    const carNumber = car.number || null;
+                    const carText = car.number
+                        ? `${car.brand || ''} ${car.model || ''} (${car.year || ''}) - Plaka: ${car.number}`
+                        : 'Araç atanmamış';
+
+                    try {
+                        const result = await db.query(
+                            `INSERT INTO driver_profiles
+                                  (driver_id, phone, first_name, last_name, park_partner_id, car_id, car_number, car_name, created_at, updated_at)
+                              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+                              ON CONFLICT (driver_id) DO UPDATE SET
+                                  phone = EXCLUDED.phone,
+                                  first_name = EXCLUDED.first_name,
+                                  last_name = EXCLUDED.last_name,
+                                  park_partner_id = EXCLUDED.park_partner_id,
+                                  car_id = EXCLUDED.car_id,
+                                  car_number = EXCLUDED.car_number,
+                                  car_name = EXCLUDED.car_name,
+                                  updated_at = NOW()`,
+                            [drvId, phone, firstName, lastName, park.partnerId, carId, carNumber, carText]
+                        );
+                        if (result.rowCount > 0) totalInserted++;
+                        else totalUpdated++;
+                    } catch (insertErr) {
+                        totalUpdated++;
+                    }
+                }));
+            }
+        }
+
+        // Başarılı senkronizasyon sonrası bellek cache'ini temizleyelim ki veriler taze gözüksün
+        authService.invalidateDriverCache();
+
+        res.json({
+            success: true,
+            inserted: totalInserted,
+            updated: totalUpdated,
+            noPhone: totalNoPhone,
+            message: 'Seçilen şehirlerdeki sürücüler başarıyla senkronize edildi.'
+        });
+    } catch (error) {
+        console.error('[AdminController] Manuel senkronizasyon hatası:', error.message);
+        res.status(500).json({ success: false, message: 'Senkronizasyon işlemi sırasında hata oluştu: ' + error.message });
     }
 };

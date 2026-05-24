@@ -1,0 +1,3 @@
+ALTER TABLE driver_profiles ADD COLUMN IF NOT EXISTS car_id VARCHAR(64);
+ALTER TABLE driver_profiles ADD COLUMN IF NOT EXISTS car_number VARCHAR(50);
+ALTER TABLE driver_profiles ADD COLUMN IF NOT EXISTS car_name VARCHAR(255);

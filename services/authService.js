@@ -243,12 +243,82 @@ class AuthService {
     }
 
     async findDriverByPhoneInPark(phone, parkSource) {
+        // 1. Önce DB'de ara
+        if (db.isConfigured()) {
+            try {
+                const normalized = this.normalizePhone(phone);
+                const digits = normalized.replace(/\D/g, '');
+                const last10 = digits.slice(-10);
+
+                const res = await db.query(
+                    `SELECT driver_id, first_name, last_name, phone, park_partner_id, city, car_id, car_number, car_name 
+                     FROM driver_profiles 
+                     WHERE phone = $1 OR phone = $2 OR phone = $3 OR phone = $4`,
+                    [normalized, digits, '90' + last10, '0' + last10]
+                );
+
+                if (res.rows && res.rows.length > 0) {
+                    const row = res.rows[0];
+                    return {
+                        id: row.driver_id,
+                        name: `${row.first_name || ''} ${row.last_name || ''}`.trim(),
+                        phones: [row.phone],
+                        carId: row.car_id || null,
+                        carNumber: row.car_number || null,
+                        car: row.car_name || 'Araç atanmamış',
+                        balance: '-',
+                        rawBalance: 0,
+                        tripCount: 0,
+                        parkPartnerId: row.park_partner_id || parkSource.partnerId
+                    };
+                }
+            } catch (dbErr) {
+                console.error('[AuthService] DB sürücü arama hatası:', dbErr.message);
+            }
+        }
+
+        // 2. DB'de yoksa, Yandex API'ye git (Bulk yenileme)
         await this.refreshParkDriverCache(parkSource);
         return this.lookupPhoneInParkCache(phone, parkSource.partnerId);
     }
 
     /** Kayıt: telefon herhangi bir filoda var mı */
     async findDriverByPhoneInAnyPark(phone) {
+        // 1. Önce DB'de ara
+        if (db.isConfigured()) {
+            try {
+                const normalized = this.normalizePhone(phone);
+                const digits = normalized.replace(/\D/g, '');
+                const last10 = digits.slice(-10);
+
+                const res = await db.query(
+                    `SELECT driver_id, first_name, last_name, phone, park_partner_id, city, car_id, car_number, car_name 
+                     FROM driver_profiles 
+                     WHERE phone = $1 OR phone = $2 OR phone = $3 OR phone = $4`,
+                    [normalized, digits, '90' + last10, '0' + last10]
+                );
+
+                if (res.rows && res.rows.length > 0) {
+                    const row = res.rows[0];
+                    return {
+                        id: row.driver_id,
+                        name: `${row.first_name || ''} ${row.last_name || ''}`.trim(),
+                        phones: [row.phone],
+                        carId: row.car_id || null,
+                        carNumber: row.car_number || null,
+                        car: row.car_name || 'Araç atanmamış',
+                        balance: '-',
+                        rawBalance: 0,
+                        tripCount: 0,
+                        parkPartnerId: row.park_partner_id
+                    };
+                }
+            } catch (dbErr) {
+                console.error('[AuthService] DB sürücü arama hatası (AnyPark):', dbErr.message);
+            }
+        }
+
+        // 2. DB'de yoksa, Yandex API'den sıralı kontrol et
         const sources = config.getYandexParkSources();
         if (sources.length === 0) return null;
         
@@ -279,6 +349,42 @@ class AuthService {
         const pid = parkPartnerId || config.yandexFleet.partnerId;
         const src = config.findYandexParkByPartnerId(pid);
         if (!src) return null;
+
+        // 1. Önce DB'de ara
+        if (db.isConfigured()) {
+            try {
+                const normalized = this.normalizePhone(phone);
+                const digits = normalized.replace(/\D/g, '');
+                const last10 = digits.slice(-10);
+
+                const res = await db.query(
+                    `SELECT driver_id, first_name, last_name, phone, park_partner_id, city, car_id, car_number, car_name 
+                     FROM driver_profiles 
+                     WHERE phone = $1 OR phone = $2 OR phone = $3 OR phone = $4`,
+                    [normalized, digits, '90' + last10, '0' + last10]
+                );
+
+                if (res.rows && res.rows.length > 0) {
+                    const row = res.rows[0];
+                    return {
+                        id: row.driver_id,
+                        name: `${row.first_name || ''} ${row.last_name || ''}`.trim(),
+                        phones: [row.phone],
+                        carId: row.car_id || null,
+                        carNumber: row.car_number || null,
+                        car: row.car_name || 'Araç atanmamış',
+                        balance: '-',
+                        rawBalance: 0,
+                        tripCount: 0,
+                        parkPartnerId: row.park_partner_id || pid
+                    };
+                }
+            } catch (dbErr) {
+                console.error('[AuthService] DB getDriverForSession hatası:', dbErr.message);
+            }
+        }
+
+        // 2. DB'de yoksa, Yandex API cache'e git
         await this.refreshParkDriverCache(src);
         return this.lookupPhoneInParkCache(phone, pid);
     }
@@ -622,16 +728,37 @@ class AuthService {
 
         const parkPid = otpData.parkPartnerId;
         try {
-            const balanceData = await yandexFleetApi.getDriverBalance(driver.id, parkPid).catch(err => null);
+            // Canlı tekil profil ve bakiye çekimi (büyük liste indirmeden)
+            const [profileData, balanceData, tripCount] = await Promise.all([
+                yandexFleetApi.getDriverProfile(driver.id, parkPid).catch(() => null),
+                yandexFleetApi.getDriverBalance(driver.id, parkPid, true).catch(() => null), // Canlı bakiye
+                leaderboardService.getDriverTripCount(driver.id, 'all', driver.parkPartnerId).catch(() => 0)
+            ]);
 
-            // Tüm zamanları çekmek çok ağır, UI'de göstermek için 'daily' (günlük) veya dashboard'un kendi isteği tercih edilmeli.
-            // driver.tripCount manuel veya ayrı apiden gelsin. Burada sistemi kilitlemiyoruz.
-            driver.tripCount = await leaderboardService.getDriverTripCount(driver.id, 'all', driver.parkPartnerId).catch(() => 0);
+            if (profileData) {
+                const fullInfo = this.profileToDriverInfo(profileData, parkPid);
+                driver.name = fullInfo.name;
+                driver.car = fullInfo.car;
+                driver.carId = fullInfo.carId;
+                driver.carNumber = fullInfo.carNumber;
+                driver.phones = fullInfo.phones;
+            }
 
             if (balanceData) {
                 const rawBal = parseFloat(balanceData.balance);
                 driver.balance = !isNaN(rawBal) ? `${rawBal.toFixed(2).replace('.', ',')} ₺` : driver.balance;
             }
+            driver.tripCount = tripCount;
+
+            // Mini-cache'e yaz (girişte 2 dk geçerli)
+            this._driverLiveCache.set(driver.id, {
+                balance: driver.balance,
+                tripCount: driver.tripCount,
+                car: driver.car,
+                carId: driver.carId,
+                carNumber: driver.carNumber,
+                expiry: Date.now() + 2 * 60 * 1000
+            });
         } catch (error) {
             console.error('[AuthService] Sürücü verileri çekilemedi:', error.message);
         }
@@ -739,13 +866,38 @@ class AuthService {
             // Cache geçerli — API'ye gitmeden taze gibi göster
             driver.balance = cached.balance;
             driver.tripCount = cached.tripCount;
+            if (cached.car) {
+                driver.car = cached.car;
+                driver.carId = cached.carId;
+                driver.carNumber = cached.carNumber;
+            }
         } else {
-            // Cache süresi dolmuş veya yok — taze çek
+            // Cache süresi dolmuş veya yok — taze çek (büyük liste indirmeden tekil profil)
             try {
-                const [balanceData, tripCount] = await Promise.all([
-                    yandexFleetApi.getDriverBalance(driver.id, parkPid).catch(() => null),
+                const [profileData, balanceData, tripCount] = await Promise.all([
+                    yandexFleetApi.getDriverProfile(driver.id, parkPid).catch(() => null),
+                    yandexFleetApi.getDriverBalance(driver.id, parkPid, true).catch(() => null), // Canlı bakiye
                     leaderboardService.getDriverTripCount(driver.id, 'all', driver.parkPartnerId).catch(() => 0)
                 ]);
+
+                if (profileData) {
+                    const fullInfo = this.profileToDriverInfo(profileData, parkPid);
+                    driver.name = fullInfo.name;
+                    driver.car = fullInfo.car;
+                    driver.carId = fullInfo.carId;
+                    driver.carNumber = fullInfo.carNumber;
+                    driver.phones = fullInfo.phones;
+
+                    // DB'ye de güncel araç bilgilerini yazalım (self-healing)
+                    if (db.isConfigured()) {
+                        db.query(
+                            `UPDATE driver_profiles 
+                             SET car_id = $1, car_number = $2, car_name = $3, updated_at = NOW() 
+                             WHERE driver_id = $4`,
+                            [driver.carId, driver.carNumber, driver.car, driver.id]
+                        ).catch(err => console.error('[DB] Oturum sırasında araç güncelleme hatası:', err.message));
+                    }
+                }
 
                 if (balanceData) {
                     const rawBal = parseFloat(balanceData.balance);
@@ -757,6 +909,9 @@ class AuthService {
                 this._driverLiveCache.set(driver.id, {
                     balance: driver.balance,
                     tripCount: driver.tripCount,
+                    car: driver.car,
+                    carId: driver.carId,
+                    carNumber: driver.carNumber,
                     expiry: now + LIVE_TTL
                 });
             } catch (e) {

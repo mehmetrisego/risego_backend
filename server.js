@@ -143,13 +143,28 @@ async function syncDriverProfiles() {
                     continue;
                 }
 
+                const car = profile.car || {};
+                const carId = car.id || null;
+                const carNumber = car.number || null;
+                const carText = car.number
+                    ? `${car.brand || ''} ${car.model || ''} (${car.year || ''}) - Plaka: ${car.number}`
+                    : 'Araç atanmamış';
+
                 try {
                     const result = await db.query(
                         `INSERT INTO driver_profiles
-                             (driver_id, phone, first_name, last_name, park_partner_id, created_at, updated_at)
-                         VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-                         ON CONFLICT (driver_id) DO NOTHING`,
-                        [drvId, phone, firstName, lastName, park.partnerId]
+                              (driver_id, phone, first_name, last_name, park_partner_id, car_id, car_number, car_name, created_at, updated_at)
+                          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+                          ON CONFLICT (driver_id) DO UPDATE SET
+                              phone = EXCLUDED.phone,
+                              first_name = EXCLUDED.first_name,
+                              last_name = EXCLUDED.last_name,
+                              park_partner_id = EXCLUDED.park_partner_id,
+                              car_id = EXCLUDED.car_id,
+                              car_number = EXCLUDED.car_number,
+                              car_name = EXCLUDED.car_name,
+                              updated_at = NOW()`,
+                        [drvId, phone, firstName, lastName, park.partnerId, carId, carNumber, carText]
                     );
                     if (result.rowCount > 0) totalInserted++;
                     else totalSkipped++;
