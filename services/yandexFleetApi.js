@@ -636,10 +636,10 @@ class YandexFleetApi {
                 {
                     query: {
                         park: {
-                            id: parkId
-                        },
-                        driver_profile: {
-                            id: [driverId]
+                            id: parkId,
+                            driver_profile: {
+                                id: [driverId]
+                            }
                         }
                     },
                     fields: {
