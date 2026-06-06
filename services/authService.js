@@ -728,26 +728,9 @@ class AuthService {
 
         const parkPid = otpData.parkPartnerId;
         try {
-            // Canlı tekil profil ve bakiye çekimi (büyük liste indirmeden)
-            const [profileData, balanceData, tripCount] = await Promise.all([
-                yandexFleetApi.getDriverProfile(driver.id, parkPid).catch(() => null),
-                yandexFleetApi.getDriverBalance(driver.id, parkPid, false).catch(() => null), // Canlı bakiye
-                leaderboardService.getDriverTripCount(driver.id, 'all', driver.parkPartnerId).catch(() => 0)
-            ]);
-
-            if (profileData) {
-                const fullInfo = this.profileToDriverInfo(profileData, parkPid);
-                driver.name = fullInfo.name;
-                driver.car = fullInfo.car;
-                driver.carId = fullInfo.carId;
-                driver.carNumber = fullInfo.carNumber;
-                driver.phones = fullInfo.phones;
-            }
-
-            if (balanceData) {
-                const rawBal = parseFloat(balanceData.balance);
-                driver.balance = !isNaN(rawBal) ? `${rawBal.toFixed(2).replace('.', ',')} ₺` : driver.balance;
-            }
+            // Sadece tripCount bilgisini al (Yandex'ten çekme)
+            const tripCount = await leaderboardService.getDriverTripCount(driver.id, 'all', driver.parkPartnerId).catch(() => 0);
+            
             driver.tripCount = tripCount;
 
             // Mini-cache'e yaz (girişte 2 dk geçerli)
@@ -872,37 +855,10 @@ class AuthService {
                 driver.carNumber = cached.carNumber;
             }
         } else {
-            // Cache süresi dolmuş veya yok — taze çek (büyük liste indirmeden tekil profil)
+            // Cache süresi dolmuş veya yok — Yandex API kullanılmıyor, databaseden gelen veriler kullanılıyor
             try {
-                const [profileData, balanceData, tripCount] = await Promise.all([
-                    yandexFleetApi.getDriverProfile(driver.id, parkPid).catch(() => null),
-                    yandexFleetApi.getDriverBalance(driver.id, parkPid, false).catch(() => null), // Canlı bakiye
-                    leaderboardService.getDriverTripCount(driver.id, 'all', driver.parkPartnerId).catch(() => 0)
-                ]);
+                const tripCount = await leaderboardService.getDriverTripCount(driver.id, 'all', driver.parkPartnerId).catch(() => 0);
 
-                if (profileData) {
-                    const fullInfo = this.profileToDriverInfo(profileData, parkPid);
-                    driver.name = fullInfo.name;
-                    driver.car = fullInfo.car;
-                    driver.carId = fullInfo.carId;
-                    driver.carNumber = fullInfo.carNumber;
-                    driver.phones = fullInfo.phones;
-
-                    // DB'ye de güncel araç bilgilerini yazalım (self-healing)
-                    if (db.isConfigured()) {
-                        db.query(
-                            `UPDATE driver_profiles 
-                             SET car_id = $1, car_number = $2, car_name = $3, updated_at = NOW() 
-                             WHERE driver_id = $4`,
-                            [driver.carId, driver.carNumber, driver.car, driver.id]
-                        ).catch(err => console.error('[DB] Oturum sırasında araç güncelleme hatası:', err.message));
-                    }
-                }
-
-                if (balanceData) {
-                    const rawBal = parseFloat(balanceData.balance);
-                    driver.balance = !isNaN(rawBal) ? `${Math.round(rawBal)} ₺` : driver.balance;
-                }
                 driver.tripCount = tripCount;
 
                 // Mini-cache'e yaz
