@@ -731,7 +731,7 @@ class AuthService {
             // Canlı tekil profil ve bakiye çekimi (büyük liste indirmeden)
             const [profileData, balanceData, tripCount] = await Promise.all([
                 yandexFleetApi.getDriverProfile(driver.id, parkPid).catch(() => null),
-                yandexFleetApi.getDriverBalance(driver.id, parkPid, true).catch(() => null), // Canlı bakiye
+                yandexFleetApi.getDriverBalance(driver.id, parkPid, false).catch(() => null), // Canlı bakiye
                 leaderboardService.getDriverTripCount(driver.id, 'all', driver.parkPartnerId).catch(() => 0)
             ]);
 
@@ -876,7 +876,7 @@ class AuthService {
             try {
                 const [profileData, balanceData, tripCount] = await Promise.all([
                     yandexFleetApi.getDriverProfile(driver.id, parkPid).catch(() => null),
-                    yandexFleetApi.getDriverBalance(driver.id, parkPid, true).catch(() => null), // Canlı bakiye
+                    yandexFleetApi.getDriverBalance(driver.id, parkPid, false).catch(() => null), // Canlı bakiye
                     leaderboardService.getDriverTripCount(driver.id, 'all', driver.parkPartnerId).catch(() => 0)
                 ]);
 

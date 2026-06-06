@@ -57,7 +57,7 @@ exports.getCampaign = async (req, res) => {
 exports.getBalance = async (req, res) => {
     try {
         const driverId = req.sessionDriver.id;
-        const balanceData = await yandexFleetApi.getDriverBalance(driverId, sessionParkPartnerId(req));
+        const balanceData = await yandexFleetApi.getDriverBalance(driverId, sessionParkPartnerId(req), true);
 
         if (balanceData) {
             res.json({
