@@ -172,8 +172,8 @@ exports.withdraw = async (req, res) => {
         client.release();
         client = null;
 
-        // Çekim sırasında cache atlanıp, doğrudan Yandex'ten anlık güncel bakiye alınmalı
-        const yandexBalance = await yandexFleetApi.getDriverBalance(driverId, parkPid, true);
+        // Çift bakiye sorgusunu engellemek için cache kullan: Modal açılırken (getBalance) alınan güncel bakiye zaten 2 dk önbellekte.
+        const yandexBalance = await yandexFleetApi.getDriverBalance(driverId, parkPid, false);
         const withdrawable = parseFloat(yandexBalance?.balance || 0);
 
         if (grossAmount > withdrawable + 0.01) {

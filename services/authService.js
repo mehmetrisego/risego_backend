@@ -550,17 +550,11 @@ class AuthService {
             parkPartnerId: parkForRegistration.partnerId
         };
 
-        // Bakiye ve yolculuk sayısını çek (yeni sürücü için 0 olacak)
+        // Yolculuk sayısını çek (yeni sürücü için 0 olacak), bakiye de sıfır varsayılır
         try {
-            const [tripCount, balanceData] = await Promise.all([
-                leaderboardService.getDriverTripCount(driver.id, 'all', driver.parkPartnerId).catch(() => 0),
-                yandexFleetApi.getDriverBalance(driver.id, parkForRegistration.partnerId).catch(() => null)
-            ]);
+            const tripCount = await leaderboardService.getDriverTripCount(driver.id, 'all', driver.parkPartnerId).catch(() => 0);
             driver.tripCount = tripCount;
-            if (balanceData) {
-                const rawBal = parseFloat(balanceData.balance);
-                driver.balance = !isNaN(rawBal) ? `${Math.round(rawBal)} ₺` : '-';
-            }
+            driver.balance = '-'; // Zaten yeni hesap, çekilecek bir bakiye yok, API'ye gitme
         } catch (e) {
             console.error('[AuthService] Yeni sürücü verileri çekilemedi:', e.message);
         }

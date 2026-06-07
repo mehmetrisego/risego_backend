@@ -92,6 +92,12 @@ class YandexFleetApi {
         this._balanceCache = new Map();
         this.BALANCE_TTL = 2 * 60 * 1000; // 2 dakika
         this._cacheLookupFn = null;
+
+        // ✅ Global Throttle: Yandex bakiye istekleri arasına minimum 500ms boşluk koy
+        // Farklı sürücülerin eşzamanlı isteklerinin 429 tetiklemesini engeller
+        this._lastBalanceRequestTime = 0;
+        this._balanceThrottleQueue = Promise.resolve();
+        this.BALANCE_MIN_INTERVAL = 500; // ms
     }
 
     registerCacheLookup(fn) {
@@ -308,6 +314,41 @@ class YandexFleetApi {
             }
         }
 
+        // ✅ Global Throttle: Yandex'e gitmeden önce son isteğin üstünden yeterince zaman geçmesini bekle
+        const balanceResult = await this._throttledBalanceRequest(driverId, parkPartnerId, cacheKey, now, cached);
+        return balanceResult;
+    }
+
+    /**
+     * Yandex bakiye isteğini global throttle ile sıraya sokar.
+     * Tüm istekler tek bir kuyruktan geçer, aralarında minimum 500ms boşluk olur.
+     */
+    async _throttledBalanceRequest(driverId, parkPartnerId, cacheKey, now, cached) {
+        // Kuyruğa ekle — önceki istek bitmeden yenisi başlamaz
+        const result = new Promise((resolve) => {
+            this._balanceThrottleQueue = this._balanceThrottleQueue.then(async () => {
+                // Kuyrukta beklerken cache dolmuş olabilir (başka istek çekmiş olabilir)
+                const freshCached = this._balanceCache.get(cacheKey);
+                if (freshCached && Date.now() < freshCached.expiry) {
+                    resolve({ balance: freshCached.balance, blockedBalance: freshCached.blockedBalance });
+                    return;
+                }
+
+                // Son istekten bu yana yeterince zaman geçmesini bekle
+                const elapsed = Date.now() - this._lastBalanceRequestTime;
+                if (elapsed < this.BALANCE_MIN_INTERVAL) {
+                    await sleep(this.BALANCE_MIN_INTERVAL - elapsed);
+                }
+                this._lastBalanceRequestTime = Date.now();
+
+                resolve(await this._doBalanceRequest(driverId, parkPartnerId, cacheKey, cached));
+            }).catch(() => {});
+        });
+        return result;
+    }
+
+    async _doBalanceRequest(driverId, parkPartnerId, cacheKey, cached) {
+        const now = Date.now();
         const { http, parkId } = this._resolveParkContext(parkPartnerId);
         try {
             const response = await http.get(
