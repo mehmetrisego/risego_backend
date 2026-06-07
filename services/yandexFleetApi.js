@@ -280,8 +280,14 @@ class YandexFleetApi {
         const cacheKey = `${driverId}:${parkPartnerId || 'default'}`;
         const now = Date.now();
         const cached = this._balanceCache.get(cacheKey);
-        if (!forceRefresh && cached && now < cached.expiry) {
-            return { balance: cached.balance, blockedBalance: cached.blockedBalance };
+        
+        // Eğer önbellekte geçerli bir veri varsa; 
+        // Ya zorla yenileme istenmemiş olmalı (forceRefresh == false)
+        // Ya da bu sürücü Yandex'ten yeni ceza yemiş olmalı (isRateLimited == true). Bu durumda zorla yenilemeyi reddet!
+        if (cached && now < cached.expiry) {
+            if (!forceRefresh || cached.isRateLimited) {
+                return { balance: cached.balance, blockedBalance: cached.blockedBalance };
+            }
         }
 
         // forceRefresh değilse, Yandex API'ye gitmeden önce authService'in toplu sürücü profil önbelleğindeki bakiyeye bak
@@ -331,7 +337,8 @@ class YandexFleetApi {
                 const fallback = cached
                     ? { balance: cached.balance, blockedBalance: cached.blockedBalance }
                     : { balance: '0', blockedBalance: '0' };
-                this._balanceCache.set(cacheKey, { ...fallback, expiry: now + 5 * 60 * 1000 });
+                // isRateLimited bayrağını true olarak ekliyoruz ki forceRefresh ile bu kilit kırılmasın
+                this._balanceCache.set(cacheKey, { ...fallback, expiry: now + 5 * 60 * 1000, isRateLimited: true });
                 console.warn(`[YandexFleetApi] Bakiye 429 — ${driverId} için 5 dk cache'lendi.`);
                 return fallback;
             }

@@ -16,7 +16,7 @@ const systemService = require('../services/systemService');
 const { sessionParkPartnerId } = require('../middlewares/auth.middleware');
 
 const WITHDRAW_FEE_TL = 4;
-const WITHDRAW_COOLDOWN_MS = 5 * 60 * 1000;
+const WITHDRAW_COOLDOWN_MS = 10 * 60 * 1000;
 
 exports.getTripCount = async (req, res) => {
     try {
