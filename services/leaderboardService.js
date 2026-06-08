@@ -586,8 +586,8 @@ class LeaderboardService {
             } else {
                 await this._fullSync();
             }
-            // İlk senkronizasyonda bakiyeleri de eşitle
-            await this._syncDriverBalances();
+            // Bakiye eşitleme kaldırıldı — bakiye artık sadece sürücü "Para Çek"e bastığında Yandex'ten çekiliyor
+            // await this._syncDriverBalances();
         };
         this._readyPromise = initSync();
 
@@ -620,7 +620,8 @@ class LeaderboardService {
             } else {
                 await this._deltaSync();
             }
-            await this._syncDriverBalances();
+            // Bakiye eşitleme kaldırıldı — gereksiz Yandex API yükü oluşturuyordu
+            // await this._syncDriverBalances();
             console.log('[LeaderboardService] ✅ Gece sync tamamlandı.');
         } catch (err) {
             console.error('[LeaderboardService] ❌ Gece sync hatası:', err.message);

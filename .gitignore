@@ -38,3 +38,6 @@ skills-lock.json
 RTK_GUIDE.md
 scratch/
 SYSTEM_ARCHITECTURE.md
+CLAUDE.md
+.rtk/
+check_withdraws.js

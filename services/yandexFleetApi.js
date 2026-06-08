@@ -93,11 +93,11 @@ class YandexFleetApi {
         this.BALANCE_TTL = 2 * 60 * 1000; // 2 dakika
         this._cacheLookupFn = null;
 
-        // ✅ Global Throttle: Yandex bakiye istekleri arasına minimum 500ms boşluk koy
-        // Farklı sürücülerin eşzamanlı isteklerinin 429 tetiklemesini engeller
-        this._lastBalanceRequestTime = 0;
-        this._balanceThrottleQueue = Promise.resolve();
-        this.BALANCE_MIN_INTERVAL = 500; // ms
+        // ✅ Global Throttle: TÜM Yandex API istekleri arasına minimum 500ms boşluk koy
+        // Farklı sürücülerin eşzamanlı isteklerinin + sync işlemlerinin 429 tetiklemesini engeller
+        this._lastYandexRequestTime = 0;
+        this._yandexThrottleQueue = Promise.resolve();
+        this.YANDEX_MIN_INTERVAL = 500; // ms
     }
 
     registerCacheLookup(fn) {
@@ -152,7 +152,8 @@ class YandexFleetApi {
             if (offset > 0) {
                 await sleep(1500); // 1.5s delay between pages to prevent 429
             }
-            const response = await http.post(
+            // Global throttle üzerinden geçir
+            const response = await this._throttledYandexRequest(() => http.post(
                 '/v1/parks/driver-profiles/list',
                 {
                     query: { park: { id: parkId } },
@@ -164,7 +165,7 @@ class YandexFleetApi {
                     limit,
                     offset
                 }
-            );
+            ));
 
             const data = response.data;
             const drivers = data.driver_profiles || [];
@@ -320,13 +321,37 @@ class YandexFleetApi {
     }
 
     /**
+     * TÜM Yandex API isteklerini global throttle ile sıraya sokar.
+     * İstekler arasında minimum 500ms boşluk olur. (bakiye, profil, sipariş vs.)
+     */
+    async _throttledYandexRequest(requestFn) {
+        const result = new Promise((resolve, reject) => {
+            this._yandexThrottleQueue = this._yandexThrottleQueue.then(async () => {
+                // Son istekten bu yana yeterince zaman geçmesini bekle
+                const elapsed = Date.now() - this._lastYandexRequestTime;
+                if (elapsed < this.YANDEX_MIN_INTERVAL) {
+                    await sleep(this.YANDEX_MIN_INTERVAL - elapsed);
+                }
+                this._lastYandexRequestTime = Date.now();
+
+                try {
+                    resolve(await requestFn());
+                } catch (err) {
+                    reject(err);
+                }
+            }).catch(() => {});
+        });
+        return result;
+    }
+
+    /**
      * Yandex bakiye isteğini global throttle ile sıraya sokar.
-     * Tüm istekler tek bir kuyruktan geçer, aralarında minimum 500ms boşluk olur.
+     * Ayrıca kuyrukta beklerken cache dolmuşsa Yandex'e hiç gitmez.
      */
     async _throttledBalanceRequest(driverId, parkPartnerId, cacheKey, now, cached) {
         // Kuyruğa ekle — önceki istek bitmeden yenisi başlamaz
         const result = new Promise((resolve) => {
-            this._balanceThrottleQueue = this._balanceThrottleQueue.then(async () => {
+            this._yandexThrottleQueue = this._yandexThrottleQueue.then(async () => {
                 // Kuyrukta beklerken cache dolmuş olabilir (başka istek çekmiş olabilir)
                 const freshCached = this._balanceCache.get(cacheKey);
                 if (freshCached && Date.now() < freshCached.expiry) {
@@ -335,11 +360,11 @@ class YandexFleetApi {
                 }
 
                 // Son istekten bu yana yeterince zaman geçmesini bekle
-                const elapsed = Date.now() - this._lastBalanceRequestTime;
-                if (elapsed < this.BALANCE_MIN_INTERVAL) {
-                    await sleep(this.BALANCE_MIN_INTERVAL - elapsed);
+                const elapsed = Date.now() - this._lastYandexRequestTime;
+                if (elapsed < this.YANDEX_MIN_INTERVAL) {
+                    await sleep(this.YANDEX_MIN_INTERVAL - elapsed);
                 }
-                this._lastBalanceRequestTime = Date.now();
+                this._lastYandexRequestTime = Date.now();
 
                 resolve(await this._doBalanceRequest(driverId, parkPartnerId, cacheKey, cached));
             }).catch(() => {});
@@ -373,14 +398,14 @@ class YandexFleetApi {
         } catch (error) {
             const status = error.response?.status;
             if (status === 429) {
-                // 429: Rate limit — son bilinen değeri (veya 0) 5 dk cache'e yaz,
+                // 429: Rate limit — son bilinen değeri (veya 0) 10 dk cache'e yaz,
                 // böylece limit açılana kadar aynı sürücü için tekrar istek atılmaz
                 const fallback = cached
                     ? { balance: cached.balance, blockedBalance: cached.blockedBalance }
                     : { balance: '0', blockedBalance: '0' };
                 // isRateLimited bayrağını true olarak ekliyoruz ki forceRefresh ile bu kilit kırılmasın
-                this._balanceCache.set(cacheKey, { ...fallback, expiry: now + 5 * 60 * 1000, isRateLimited: true });
-                console.warn(`[YandexFleetApi] Bakiye 429 — ${driverId} için 5 dk cache'lendi.`);
+                this._balanceCache.set(cacheKey, { ...fallback, expiry: now + 10 * 60 * 1000, isRateLimited: true });
+                console.warn(`[YandexFleetApi] Bakiye 429 — ${driverId} (key=${cacheKey}) için 10 dk cache'lendi.`);
                 return fallback;
             }
             console.error(`[YandexFleetApi] Bakiye çekilirken hata (${driverId}):`, error.response?.data?.message || error.message);
