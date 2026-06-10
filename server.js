@@ -222,9 +222,13 @@ async function startServer() {
             }
 
             // driver_profiles tablosunu Yandex'ten gelen verilerle doldur (eksikleri ekle)
+            // KULLANICI TALEBİ: Başlangıçta (restartta) tüm sürücüleri senkronize etmeyi engelledik.
+            // Artık sadece gece (cron) ve admin manuel tetiklediğinde çalışacak.
+            /*
             syncDriverProfiles().catch(e =>
                 console.warn('[DB] driver_profiles sync hatası:', e.message)
             );
+            */
         }
     }
 
