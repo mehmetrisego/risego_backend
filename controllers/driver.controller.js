@@ -57,7 +57,11 @@ exports.getCampaign = async (req, res) => {
 exports.getBalance = async (req, res) => {
     try {
         const driverId = req.sessionDriver.id;
-        const balanceData = await yandexFleetApi.getDriverBalance(driverId, sessionParkPartnerId(req), true);
+        // KULLANICI TALEBİ / OPTİMİZASYON:
+        // Eskiden burada `true` (forceRefresh) vardı. Bu durum sürücü sayfaya her girdiğinde
+        // Yandex'in cache'i yok sayarak tekrar sorgulanmasına ve 429 Rate Limit yemesine sebep oluyordu.
+        // Artık `false` yaptık. Sürücü 2 dakikada 1 kez Yandex'e gidebilir, diğer girişlerinde cache'ten hızlıca yanıt alır.
+        const balanceData = await yandexFleetApi.getDriverBalance(driverId, sessionParkPartnerId(req), false);
 
         if (balanceData) {
             res.json({

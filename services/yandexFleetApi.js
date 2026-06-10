@@ -90,7 +90,7 @@ class YandexFleetApi {
         // ✅ OPT-4: Sürücü bakiyesi için 2 dakikalık cache — tekrar eden balance isteklerini azaltır
         // driverId -> { balance, blockedBalance, expiry }
         this._balanceCache = new Map();
-        this.BALANCE_TTL = 2 * 60 * 1000; // 2 dakika
+        this.BALANCE_TTL = 8 * 60 * 1000; // Kullanıcı talebi: 8 dakika
         this._cacheLookupFn = null;
 
         // ✅ Global Throttle: TÜM Yandex API istekleri arasına minimum 500ms boşluk koy
