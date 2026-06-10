@@ -33,7 +33,7 @@ const httpsAgent = new https.Agent(keepAliveAgentOptions);
 
 // ─── Sabitler ──────────────────────────────────────────────────────────
 const PAGE_LIMIT       = 500;              // Her sayfada max sipariş (Yandex max 1000, 500 güvenli)
-const THROTTLE_MS      = 10000;           // İstekler arası minimum bekleme (ms) — Yandex 429 limitleri için 10 saniyeye çıkarıldı
+const THROTTLE_MS      = 300000;          // İstekler arası bekleme 5 dakika (300,000 ms)
 const MAX_RETRIES      = 5;               // Hata durumunda max yeniden deneme
 const REQUEST_TIMEOUT  = 30_000;          // 30 saniye HTTP timeout
 // DELTA_INTERVAL kaldırıldı — artık gece 06:00–07:00 bakım penceresi kullanılıyor (cronManager.js)
@@ -440,8 +440,8 @@ class LeaderboardService {
                     memoryAccum.push(...uniqueOrders);
                 }
                 
-                // Şehirler arası mola (3. Öneri - 25 saniye)
-                await sleep(25000); 
+                // Şehirler arası mola (Kullanıcı talebi - 5 dakika)
+                await sleep(300000); 
             }
 
             if (db.isConfigured()) {
@@ -526,8 +526,8 @@ class LeaderboardService {
                     this._orders = Array.from(map.values());
                 }
 
-                // Şehirler arası mola (3. Öneri - 25 saniye)
-                await sleep(25000);
+                // Şehirler arası mola (Kullanıcı talebi - 5 dakika)
+                await sleep(300000);
             }
 
             if (db.isConfigured()) {
@@ -568,7 +568,7 @@ class LeaderboardService {
      *   3. Periyodik delta YOK — gece 06:00–07:00 bakım penceresi cronManager tarafından yönetilir.
      */
     async startCron() {
-        console.log('[LeaderboardService] Başlangıç sync başlatılıyor...');
+        console.log('[LeaderboardService] Başlangıç ayarlamaları yapılıyor (Sync kapalı)...');
 
         // İlk senkronizasyon: DB doluysa delta, boşsa full sync
         const initSync = async () => {
@@ -578,6 +578,10 @@ class LeaderboardService {
                     console.log(`[LeaderboardService] Eski siparişler birincil parka taşındı: ${n} satır`);
                 }
             }
+            
+            // KULLANICI TALEBİ: Sunucu her başlatıldığında gün ortasında veri çekilmesini istemediği için
+            // bu kısım yorum satırına alındı. Veriler artık SADECE gece 06:00 - 07:00 arasında (runNightlySync ile) çekilecek.
+            /*
             if (db.isConfigured() && (await dbOrders.getOrderCount()) > 0) {
                 this._ordersFrom = new Date(Date.now() - CACHE_DAYS * 24 * 60 * 60 * 1000);
                 this._ordersTo = await dbOrders.getLatestBookedAt() || new Date();
@@ -586,6 +590,17 @@ class LeaderboardService {
             } else {
                 await this._fullSync();
             }
+            */
+
+            if (db.isConfigured() && (await dbOrders.getOrderCount()) > 0) {
+                this._ordersFrom = new Date(Date.now() - CACHE_DAYS * 24 * 60 * 60 * 1000);
+                this._ordersTo = await dbOrders.getLatestBookedAt() || new Date();
+                this._lastSyncAt = new Date();
+                console.log('[LeaderboardService] Sistem yeniden başlatıldı, gün ortası sync atlandı. Sonraki sync 06:00.');
+            } else {
+                console.log('[LeaderboardService] UYARI: DB boş. Sipariş verileri ilk gece sync (06:00) çalışana kadar eksik görünebilir.');
+            }
+
             // Bakiye eşitleme kaldırıldı — bakiye artık sadece sürücü "Para Çek"e bastığında Yandex'ten çekiliyor
             // await this._syncDriverBalances();
         };
@@ -593,15 +608,10 @@ class LeaderboardService {
 
         // Hata olsa bile sunucuyu durdurmayalım
         this._readyPromise.catch(err => {
-            console.error('[LeaderboardService] İlk senkronizasyon başarısız:', err.message);
-            // 60 saniye sonra otomatik yeniden dene
-            setTimeout(() => {
-                console.log('[LeaderboardService] Yeniden deneniyor...');
-                this._readyPromise = this._fullSync();
-            }, 60_000);
+            console.error('[LeaderboardService] Başlangıç kontrolleri başarısız:', err.message);
         });
 
-        console.log('[LeaderboardService] Başlangıç sync tetiklendi. Gece sync: cronManager 06:00 TR.');
+        console.log('[LeaderboardService] Başlangıç adımları tamam. Gece sync: cronManager 06:00 TR.');
     }
 
     /**
@@ -669,8 +679,8 @@ class LeaderboardService {
                     `, params);
                 }
 
-                // Şehirler arası bakiye eşitleme molası (25 saniye)
-                await sleep(25000);
+                // Şehirler arası bakiye eşitleme molası (5 dakika)
+                await sleep(300000);
             }
             console.log(`[LeaderboardService] ✅ Sürücü bakiyeleri toplu olarak güncellendi.`);
         } catch (err) {

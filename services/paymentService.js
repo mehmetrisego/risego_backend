@@ -12,6 +12,7 @@ const axios = require('axios');
 const crypto = require('crypto');
 const config = require('../config');
 const db = require('../db');
+const yandexFleetApi = require('./yandexFleetApi');
 
 /**
  * XML özel karakterlerini kaçırır (XML Injection koruması)
@@ -235,45 +236,21 @@ async function postSoap(soapAction, xmlBody) {
  * @returns {Promise<Object>}
  */
 async function deductYandexBalance(driverId, amount, parkPartnerId, description = 'Para çekimi') {
-    const src = parkPartnerId
-        ? config.findYandexParkByPartnerId(parkPartnerId)
-        : null;
-
-    const baseUrl = (src?.baseUrl) || config.yandexFleet.baseUrl;
-    const clientId = (src?.clientId) || config.yandexFleet.clientId;
-    const apiKey = (src?.apiKey) || config.yandexFleet.apiKey;
-    const parkId = (src?.partnerId) || config.yandexFleet.partnerId;
-
-    const idempotencyToken = crypto.randomBytes(16).toString('hex');
-
-    const body = {
-        park_id: parkId,
-        driver_profile_id: driverId,
-        category_id: 'partner_service_manual', // is_creatable=true olan kategori
-        amount: String(amount), // İşlemin negatif veya pozitif (iade) olmasına izin veriyoruz
-        description
-    };
+    const parkId = parkPartnerId || config.yandexFleet.partnerId;
 
     console.log(`[PaymentService] Yandex bakiye kesintisi: sürücü=${driverId} tutar=${amount} TRY park=${parkId}`);
-    console.log(`[PaymentService] Transaction body:`, JSON.stringify(body));
+    console.log(`[PaymentService] Transaction body:`, JSON.stringify({
+        park_id: parkId,
+        driver_profile_id: driverId,
+        category_id: 'partner_service_manual',
+        amount: String(amount),
+        description
+    }));
 
-    let resp;
     try {
-        resp = await axios.post(
-            `${baseUrl}/v2/parks/driver-profiles/transactions`,
-            body,
-            {
-                headers: {
-                    'X-Client-ID': clientId,
-                    'X-API-Key': apiKey,
-                    'X-Park-ID': parkId,
-                    'X-Idempotency-Token': idempotencyToken,
-                    'Content-Type': 'application/json',
-                    'Accept-Language': 'tr'
-                },
-                timeout: 30000
-            }
-        );
+        // ✅ Global throttle kuyruğundan geçir — 429 hatalarını önler
+        const data = await yandexFleetApi.deductBalance(driverId, String(amount), parkId, description);
+        return data;
     } catch (err) {
         // Yandex 400/403 hata detayını logla
         if (err.response) {
@@ -281,8 +258,6 @@ async function deductYandexBalance(driverId, amount, parkPartnerId, description 
         }
         throw err;
     }
-
-    return resp.data;
 }
 
 // ─── Ana Servis Fonksiyonu ───────────────────────────────────────────────────

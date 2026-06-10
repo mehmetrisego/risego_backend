@@ -421,6 +421,46 @@ class YandexFleetApi {
         this._balanceCache.delete(cacheKey);
     }
 
+    /**
+     * Sürücü bakiyesinden kesinti yapar — Global Throttle üzerinden geçer.
+     * PaymentService bu metodu kullanarak Yandex rate limit bütçesini korur.
+     *
+     * @param {string} driverId - Yandex sürücü profil ID
+     * @param {string} amount   - Kesilecek tutar (negatif string: "-1216.7")
+     * @param {string} parkPartnerId - Park UUID
+     * @param {string} description - İşlem açıklaması
+     * @returns {Promise<Object>}
+     */
+    async deductBalance(driverId, amount, parkPartnerId, description = 'Para çekimi') {
+        const { http, parkId } = this._resolveParkContext(parkPartnerId);
+        const crypto = require('crypto');
+        const idempotencyToken = crypto.randomBytes(16).toString('hex');
+
+        const body = {
+            park_id: parkId,
+            driver_profile_id: driverId,
+            category_id: 'partner_service_manual',
+            amount: String(amount),
+            description
+        };
+
+        // Global throttle kuyruğundan geçir
+        const resp = await this._throttledYandexRequest(() =>
+            http.post(
+                '/v2/parks/driver-profiles/transactions',
+                body,
+                {
+                    headers: {
+                        'X-Park-ID': parkId,
+                        'X-Idempotency-Token': idempotencyToken,
+                    },
+                    timeout: 30000
+                }
+            )
+        );
+        return resp.data;
+    }
+
 
     /**
      * Araç detaylarını getirir
