@@ -372,6 +372,13 @@ class YandexFleetApi {
     async _doBalanceRequest(driverId, parkPartnerId, cacheKey, cached) {
         const now = Date.now();
         const { http, parkId } = this._resolveParkContext(parkPartnerId);
+        
+        let firstTrySuccess = false;
+        let balance = null;
+        let blockedBalance = '0';
+        let firstTryError429 = false;
+        let firstTryErrorMsg = '';
+
         try {
             console.log(`[Bakiye-7] Yandex API İsteği Gidiyor: Sürücü=${driverId}, endpoint=/v1/parks/driver-profiles/list (Sadece bakiye filtreli)`);
             const response = await http.post(
@@ -396,42 +403,86 @@ class YandexFleetApi {
             );
 
             const profiles = response.data?.driver_profiles || [];
-            if (profiles.length === 0) {
-                console.warn(`[Bakiye-HATA] Sürücü Yandex'te bulunamadı: ${driverId}`);
-                return null;
+            if (profiles.length > 0) {
+                balance = profiles[0].accounts?.[0]?.balance;
+                if (balance !== undefined && balance !== null) {
+                    firstTrySuccess = true;
+                    balance = String(balance);
+                } else {
+                    firstTryErrorMsg = 'driver-profiles response accounts/balance empty';
+                }
+            } else {
+                firstTryErrorMsg = 'driver-profiles response profiles empty';
             }
+        } catch (error) {
+            const status = error.response?.status;
+            if (status === 429) {
+                firstTryError429 = true;
+            }
+            firstTryErrorMsg = error.response?.data?.message || error.message;
+            console.warn(`[Bakiye-HATA] driver-profiles/list çağrısı başarısız (${driverId}): Status=${status}, Hata=${firstTryErrorMsg}. Fallback blocked-balance denenecek.`);
+        }
 
-            const balance = profiles[0].accounts?.[0]?.balance || '0';
+        if (firstTrySuccess) {
             const result = {
-                balance: String(balance),
-                blockedBalance: '0' // Arayüzde kullanılmadığı için 0 dönebiliriz
+                balance,
+                blockedBalance: '0'
             };
-            
-            console.log(`[Bakiye-8] Başarılı Yandex Yanıtı: Sürücü=${driverId}, Bakiye=${result.balance}. Cache 8dk güncellendi.`);
-            // Başarılı yanıtı 8 dk cache'e yaz
+            console.log(`[Bakiye-8] Başarılı Yandex Yanıtı (driver-profiles/list): Sürücü=${driverId}, Bakiye=${result.balance}. Cache 8dk güncellendi.`);
             this._balanceCache.set(cacheKey, { ...result, expiry: now + this.BALANCE_TTL });
-            // Bellek sızıntısını önlemek için cache'i temizle (max 500 sürücü)
             if (this._balanceCache.size > 500) {
                 const firstKey = this._balanceCache.keys().next().value;
                 this._balanceCache.delete(firstKey);
             }
             return result;
+        }
+
+        // driver-profiles/list başarısız olduysa veya bakiye dönmediyse, blocked-balance ile şansımızı deneyelim:
+        try {
+            console.log(`[Bakiye-7-Fallback] Yandex API İsteği Gidiyor (Fallback): Sürücü=${driverId}, endpoint=/v1/parks/contractors/blocked-balance`);
+            const response = await http.get(
+                '/v1/parks/contractors/blocked-balance',
+                {
+                    params: { contractor_id: driverId },
+                    headers: { 'X-Park-ID': parkId }
+                }
+            );
+
+            balance = response.data?.balance;
+            
+            if (balance !== undefined && balance !== null) {
+                const result = {
+                    balance: String(balance),
+                    blockedBalance: '0'
+                };
+                console.log(`[Bakiye-8] Başarılı Yandex Yanıtı (blocked-balance): Sürücü=${driverId}, Bakiye=${result.balance}. Cache 8dk güncellendi.`);
+                this._balanceCache.set(cacheKey, { ...result, expiry: now + this.BALANCE_TTL });
+                if (this._balanceCache.size > 500) {
+                    const firstKey = this._balanceCache.keys().next().value;
+                    this._balanceCache.delete(firstKey);
+                }
+                return result;
+            } else {
+                throw new Error('blocked-balance response balance empty');
+            }
         } catch (error) {
             const status = error.response?.status;
-            if (status === 429) {
-                console.warn(`[Bakiye-HATA] Yandex 429 (Rate Limit): Sürücü=${driverId}. Yandex sınırı aşıldı! Headers:`, JSON.stringify(error.response?.headers || {}));
-                
-                // 429: Rate limit — son bilinen değeri (veya 0) 10 dk cache'e yaz,
-                // böylece limit açılana kadar aynı sürücü için tekrar istek atılmaz
+            const errorMsg = error.response?.data?.message || error.message;
+            console.error(`[Bakiye-HATA] blocked-balance çağrısı da başarısız (${driverId}): Status=${status}, Hata=${errorMsg}`);
+
+            // Eğer ilk istek veya ikinci istekten biri 429 rate-limit hatası aldıysa, rate limit kalkanını çalıştır
+            const isAny429 = firstTryError429 || (status === 429);
+            
+            if (isAny429) {
                 const fallback = cached
                     ? { balance: cached.balance, blockedBalance: cached.blockedBalance }
                     : { balance: '0', blockedBalance: '0' };
-                // isRateLimited bayrağını true olarak ekliyoruz ki forceRefresh ile bu kilit kırılmasın
+                
                 this._balanceCache.set(cacheKey, { ...fallback, expiry: now + 10 * 60 * 1000, isRateLimited: true });
-                console.warn(`[Bakiye-Koruma] Bakiye 429 — ${driverId} için 10 dk cache (kalkan) aktif edildi. Bu süre bitene kadar bu sürücüye istek atılamaz.`);
+                console.warn(`[Bakiye-Koruma] Sürücü=${driverId} için 10 dk kalkan aktif edildi (429 Rate Limit algılandı).`);
                 return fallback;
             }
-            console.error(`[Bakiye-HATA] Yandex API Hata (${driverId}): Status=${status}, Mesaj=${error.response?.data?.message || error.message}`);
+
             return null;
         }
     }
