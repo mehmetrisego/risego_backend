@@ -373,17 +373,38 @@ class YandexFleetApi {
         const now = Date.now();
         const { http, parkId } = this._resolveParkContext(parkPartnerId);
         try {
-            console.log(`[Bakiye-7] Yandex API İsteği Gidiyor: Sürücü=${driverId}, endpoint=/v1/parks/contractors/blocked-balance`);
-            const response = await http.get(
-                '/v1/parks/contractors/blocked-balance',
+            console.log(`[Bakiye-7] Yandex API İsteği Gidiyor: Sürücü=${driverId}, endpoint=/v1/parks/driver-profiles/list (Sadece bakiye filtreli)`);
+            const response = await http.post(
+                '/v1/parks/driver-profiles/list',
                 {
-                    params: { contractor_id: driverId },
+                    query: {
+                        park: {
+                            id: parkId,
+                            driver_profile: {
+                                id: [driverId]
+                            }
+                        }
+                    },
+                    fields: {
+                        account: ['balance']
+                    },
+                    limit: 1
+                },
+                {
                     headers: { 'X-Park-ID': parkId }
                 }
             );
+
+            const profiles = response.data?.driver_profiles || [];
+            if (profiles.length === 0) {
+                console.warn(`[Bakiye-HATA] Sürücü Yandex'te bulunamadı: ${driverId}`);
+                return null;
+            }
+
+            const balance = profiles[0].accounts?.[0]?.balance || '0';
             const result = {
-                balance: response.data.balance || '0',
-                blockedBalance: response.data.blocked_balance || '0'
+                balance: String(balance),
+                blockedBalance: '0' // Arayüzde kullanılmadığı için 0 dönebiliriz
             };
             
             console.log(`[Bakiye-8] Başarılı Yandex Yanıtı: Sürücü=${driverId}, Bakiye=${result.balance}. Cache 8dk güncellendi.`);
