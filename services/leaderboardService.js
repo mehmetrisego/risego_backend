@@ -33,7 +33,7 @@ const httpsAgent = new https.Agent(keepAliveAgentOptions);
 
 // ─── Sabitler ──────────────────────────────────────────────────────────
 const PAGE_LIMIT       = 500;              // Her sayfada max sipariş (Yandex max 1000, 500 güvenli)
-const THROTTLE_MS      = 300000;          // İstekler arası bekleme 5 dakika (300,000 ms)
+const THROTTLE_MS      = 2000;          // Sayfalar arası bekleme 2 saniye (gece sync hızlandırması için)
 const MAX_RETRIES      = 5;               // Hata durumunda max yeniden deneme
 const REQUEST_TIMEOUT  = 30_000;          // 30 saniye HTTP timeout
 // DELTA_INTERVAL kaldırıldı — artık gece 06:00–07:00 bakım penceresi kullanılıyor (cronManager.js)
@@ -216,10 +216,8 @@ class LeaderboardService {
 
                 if ((status === 429 || (status >= 500 && status < 600)) && retries < MAX_RETRIES) {
                     retries++;
-                    const retryAfter = parseInt(err.response?.headers?.['retry-after'] || '0', 10);
-                    const wait = retryAfter > 0
-                        ? retryAfter * 1000 + 2000 // Retry-after'a ek 2sn pay bırak
-                        : Math.min(Math.pow(2.5, retries) * 2000 + Math.random() * 1000, 60_000); // Daha agresif backoff (max 60sn)
+                    // KULLANICI TALEBİ: 429 alındığında 6s, 13s, 60s gibi kısa beklemeler yerine her zaman 5 dakika beklenmesi istendi.
+                    const wait = 300000; // Sabit 5 dakika
                     console.warn(`[LeaderboardService] HTTP ${status} → ${Math.round(wait/1000)}s bekleniyor (${retries}/${MAX_RETRIES})`);
                     await sleep(wait);
                     continue; // aynı cursor ile yeniden dene

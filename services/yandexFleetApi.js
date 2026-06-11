@@ -307,24 +307,8 @@ class YandexFleetApi {
             console.log(`[Bakiye-2] Cache Boş: Sürücü=${driverId}. Yeni veri çekilecek.`);
         }
 
-        // forceRefresh değilse, Yandex API'ye gitmeden önce authService'in toplu sürücü profil önbelleğindeki bakiyeye bak
-        if (!forceRefresh && this._cacheLookupFn) {
-            try {
-                const driverInfo = this._cacheLookupFn(driverId, parkPartnerId);
-                if (driverInfo && driverInfo.rawBalance !== undefined) {
-                    const result = {
-                        balance: String(driverInfo.rawBalance),
-                        blockedBalance: '0'
-                    };
-                    // Sonucu yerel bakiye cache'ine 8 dakikalığına kaydet
-                    this._balanceCache.set(cacheKey, { ...result, expiry: now + this.BALANCE_TTL });
-                    console.log(`[Bakiye-3] AuthService'den Çekildi: Sürücü=${driverId}, Tutar=${result.balance} TRY. Yandex isteği atlanıyor.`);
-                    return result;
-                }
-            } catch (err) {
-                console.error('[YandexFleetApi] Park sürücü önbelleği bakiye sorgulama hatası:', err.message);
-            }
-        }
+        // KULLANICI TALEBİ: authService üzerindeki önbellekte kalan bakiyeler eski (stale) olabildiği için,
+        // bakiye cache süresi dolduğunda doğrudan Yandex'e gitmesi istendi. Bu yüzden authService fallback'i kaldırıldı.
 
         // ✅ Global Throttle: Yandex'e gitmeden önce son isteğin üstünden yeterince zaman geçmesini bekle
         const balanceResult = await this._throttledBalanceRequest(driverId, parkPartnerId, cacheKey, now, cached);
