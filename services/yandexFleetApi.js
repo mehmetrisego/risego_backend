@@ -281,8 +281,6 @@ class YandexFleetApi {
      * GET /v1/parks/contractors/blocked-balance
      */
     async getDriverBalance(driverId, parkPartnerId, forceRefresh = false) {
-        console.log(`[Bakiye-1] İstek Geldi: Sürücü=${driverId}, forceRefresh=${forceRefresh}`);
-        
         // ✅ OPT-4: 8 dakikalık cache — aynı sürücü için Yandex API'ye tekrar istek atılmaz
         const cacheKey = `${driverId}:${parkPartnerId || 'default'}`;
         const now = Date.now();
@@ -292,19 +290,13 @@ class YandexFleetApi {
         // Ya zorla yenileme istenmemiş olmalı (forceRefresh == false)
         // Ya da bu sürücü Yandex'ten yeni ceza yemiş olmalı (isRateLimited == true). Bu durumda zorla yenilemeyi reddet!
         if (cached) {
-            const ttlRemaining = Math.round((cached.expiry - now) / 1000);
             if (now < cached.expiry) {
                 if (!forceRefresh || cached.isRateLimited) {
-                    console.log(`[Bakiye-2] Cache Kullanıldı: Sürücü=${driverId}, KalanSüre=${ttlRemaining}sn, isRateLimited=${cached.isRateLimited}`);
                     return { balance: cached.balance, blockedBalance: cached.blockedBalance };
                 } else {
-                    console.log(`[Bakiye-2] Cache İptal (ForceRefresh=true): Sürücü=${driverId}. Yandex'e gidilecek.`);
+                    console.log(`[Yandex API] Önbellek yenileniyor (Zorunlu): Sürücü=${driverId}`);
                 }
-            } else {
-                console.log(`[Bakiye-2] Cache Süresi Dolmuş: Sürücü=${driverId}. Yeni veri çekilecek.`);
             }
-        } else {
-            console.log(`[Bakiye-2] Cache Boş: Sürücü=${driverId}. Yeni veri çekilecek.`);
         }
 
         // KULLANICI TALEBİ: authService üzerindeki önbellekte kalan bakiyeler eski (stale) olabildiği için,
@@ -350,7 +342,6 @@ class YandexFleetApi {
                 // Kuyrukta beklerken cache dolmuş olabilir (başka istek çekmiş olabilir)
                 const freshCached = this._balanceCache.get(cacheKey);
                 if (freshCached && Date.now() < freshCached.expiry) {
-                    console.log(`[Bakiye-5] Kuyrukta Beklerken Cache Dolmuş: Sürücü=${driverId}. Yandex'e gitmekten vazgeçildi.`);
                     resolve({ balance: freshCached.balance, blockedBalance: freshCached.blockedBalance });
                     return;
                 }
@@ -358,7 +349,6 @@ class YandexFleetApi {
                 // Son istekten bu yana yeterince zaman geçmesini bekle
                 const elapsed = Date.now() - this._lastYandexRequestTime;
                 if (elapsed < this.YANDEX_MIN_INTERVAL) {
-                    console.log(`[Bakiye-6] Throttle Beklemesi: Sürücü=${driverId}, ${this.YANDEX_MIN_INTERVAL - elapsed}ms bekleniyor...`);
                     await sleep(this.YANDEX_MIN_INTERVAL - elapsed);
                 }
                 this._lastYandexRequestTime = Date.now();
@@ -380,7 +370,7 @@ class YandexFleetApi {
         let firstTryErrorMsg = '';
 
         try {
-            console.log(`[Bakiye-7] Yandex API İsteği Gidiyor: Sürücü=${driverId}, endpoint=/v1/parks/driver-profiles/list (Sadece bakiye filtreli)`);
+            console.log(`[Yandex API] Bakiye sorgulanıyor (driver-profiles/list): Sürücü=${driverId}`);
             const response = await http.post(
                 '/v1/parks/driver-profiles/list',
                 {
@@ -420,7 +410,7 @@ class YandexFleetApi {
                 firstTryError429 = true;
             }
             firstTryErrorMsg = error.response?.data?.message || error.message;
-            console.warn(`[Bakiye-HATA] driver-profiles/list çağrısı başarısız (${driverId}): Status=${status}, Hata=${firstTryErrorMsg}. Fallback blocked-balance denenecek.`);
+            console.warn(`[Yandex API] Sürücü bakiye sorgusu başarısız (driver-profiles/list): Sürücü=${driverId}, Hata Kodu=${status || 'Bilinmiyor'}, Hata=${firstTryErrorMsg}. Yedek sorgu denenecek.`);
         }
 
         if (firstTrySuccess) {
@@ -428,7 +418,7 @@ class YandexFleetApi {
                 balance,
                 blockedBalance: '0'
             };
-            console.log(`[Bakiye-8] Başarılı Yandex Yanıtı (driver-profiles/list): Sürücü=${driverId}, Bakiye=${result.balance}. Cache 8dk güncellendi.`);
+            console.log(`[Yandex API] Bakiye sorgulama başarılı (driver-profiles/list): Sürücü=${driverId}, Bakiye=${result.balance} TL`);
             this._balanceCache.set(cacheKey, { ...result, expiry: now + this.BALANCE_TTL });
             if (this._balanceCache.size > 500) {
                 const firstKey = this._balanceCache.keys().next().value;
@@ -439,7 +429,7 @@ class YandexFleetApi {
 
         // driver-profiles/list başarısız olduysa veya bakiye dönmediyse, blocked-balance ile şansımızı deneyelim:
         try {
-            console.log(`[Bakiye-7-Fallback] Yandex API İsteği Gidiyor (Fallback): Sürücü=${driverId}, endpoint=/v1/parks/contractors/blocked-balance`);
+            console.log(`[Yandex API] Bakiye sorgulanıyor (Yedek - blocked-balance): Sürücü=${driverId}`);
             const response = await http.get(
                 '/v1/parks/contractors/blocked-balance',
                 {
@@ -455,7 +445,7 @@ class YandexFleetApi {
                     balance: String(balance),
                     blockedBalance: '0'
                 };
-                console.log(`[Bakiye-8] Başarılı Yandex Yanıtı (blocked-balance): Sürücü=${driverId}, Bakiye=${result.balance}. Cache 8dk güncellendi.`);
+                console.log(`[Yandex API] Bakiye sorgulama başarılı (blocked-balance): Sürücü=${driverId}, Bakiye=${result.balance} TL`);
                 this._balanceCache.set(cacheKey, { ...result, expiry: now + this.BALANCE_TTL });
                 if (this._balanceCache.size > 500) {
                     const firstKey = this._balanceCache.keys().next().value;
@@ -468,7 +458,7 @@ class YandexFleetApi {
         } catch (error) {
             const status = error.response?.status;
             const errorMsg = error.response?.data?.message || error.message;
-            console.error(`[Bakiye-HATA] blocked-balance çağrısı da başarısız (${driverId}): Status=${status}, Hata=${errorMsg}`);
+            console.error(`[Yandex API HATA] Yedek bakiye sorgusu da başarısız oldu: Sürücü=${driverId}, Hata Kodu=${status || 'Bilinmiyor'}, Hata=${errorMsg}`);
 
             // Eğer ilk istek veya ikinci istekten biri 429 rate-limit hatası aldıysa, rate limit kalkanını çalıştır
             const isAny429 = firstTryError429 || (status === 429);
@@ -479,7 +469,7 @@ class YandexFleetApi {
                     : { balance: '0', blockedBalance: '0' };
                 
                 this._balanceCache.set(cacheKey, { ...fallback, expiry: now + 10 * 60 * 1000, isRateLimited: true });
-                console.warn(`[Bakiye-Koruma] Sürücü=${driverId} için 10 dk kalkan aktif edildi (429 Rate Limit algılandı).`);
+                console.warn(`[Yandex API KORUMA] Sürücü=${driverId} için 10 dakika istek kalkanı (Rate Limit - Hata Kodu: 429) aktif edildi.`);
                 return fallback;
             }
 
