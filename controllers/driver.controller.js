@@ -176,8 +176,8 @@ exports.withdraw = async (req, res) => {
         client.release();
         client = null;
 
-        // Çift bakiye sorgusunu engellemek için cache kullan: Modal açılırken (getBalance) alınan güncel bakiye zaten 2 dk önbellekte.
-        const yandexBalance = await yandexFleetApi.getDriverBalance(driverId, parkPid, false);
+        // Çekim öncesi taze bakiye kontrolü yap
+        const yandexBalance = await yandexFleetApi.getDriverBalance(driverId, parkPid, true);
         const withdrawable = parseFloat(yandexBalance?.balance || 0);
 
         if (grossAmount > withdrawable + 0.01) {
@@ -210,8 +210,9 @@ exports.withdraw = async (req, res) => {
             driverId, beneficiaryName, beneficiarySurname, beneficiaryIban: account.iban, amount: netAmount, yandexAmount: grossAmount, parkPartnerId: parkPid
         });
 
-        // Çekim başarılı oldu, Yandex'teki gerçek bakiye de değiştiği için cache'i temizle
-        yandexFleetApi.invalidateBalanceCache(driverId, parkPid);
+        // Çekim başarılı oldu: Çekilen tutar sonrası kalan bakiye hesaplanır ve Yandex API gecikmesine karşı 15 dakika boyunca kilitlenir
+        const remainingBalance = Math.max(0, withdrawable - grossAmount);
+        yandexFleetApi.invalidateBalanceCache(driverId, parkPid, remainingBalance);
 
         const nextWithdrawTime = new Date(Date.now() + WITHDRAW_COOLDOWN_MS);
         res.json({

@@ -288,10 +288,10 @@ class YandexFleetApi {
         
         // Eğer önbellekte geçerli bir veri varsa; 
         // Ya zorla yenileme istenmemiş olmalı (forceRefresh == false)
-        // Ya da bu sürücü Yandex'ten yeni ceza yemiş olmalı (isRateLimited == true). Bu durumda zorla yenilemeyi reddet!
+        // Ya da sürücü için çekim sonrası bakiye kilidi / rate limit kalkanı aktif olmalı.
         if (cached) {
             if (now < cached.expiry) {
-                if (!forceRefresh || cached.isRateLimited) {
+                if (!forceRefresh || cached.isRateLimited || cached.isPostWithdrawOverride) {
                     return { balance: cached.balance, blockedBalance: cached.blockedBalance };
                 } else {
                     console.log(`[Yandex API] Önbellek yenileniyor (Zorunlu): Sürücü=${driverId}`);
@@ -414,6 +414,16 @@ class YandexFleetApi {
         }
 
         if (firstTrySuccess) {
+            // Çekim sonrası kilit kontrolü: Yandex API henüz kendi bakiyesini güncellemediyse (stale data), kilitli bakiyeyi koru
+            if (cached && cached.isPostWithdrawOverride && now < cached.expiry) {
+                const yandexVal = parseFloat(balance) || 0;
+                const overrideVal = parseFloat(cached.balance) || 0;
+                if (yandexVal > overrideVal) {
+                    console.warn(`[Yandex API KORUMA] Sürücü=${driverId} için Yandex gecikmeli bakiye döndü (${balance} TL). Kilitli bakiye (${cached.balance} TL) korundu.`);
+                    return { balance: cached.balance, blockedBalance: cached.blockedBalance };
+                }
+            }
+
             const result = {
                 balance,
                 blockedBalance: '0'
@@ -441,6 +451,15 @@ class YandexFleetApi {
             balance = response.data?.balance;
             
             if (balance !== undefined && balance !== null) {
+                if (cached && cached.isPostWithdrawOverride && now < cached.expiry) {
+                    const yandexVal = parseFloat(balance) || 0;
+                    const overrideVal = parseFloat(cached.balance) || 0;
+                    if (yandexVal > overrideVal) {
+                        console.warn(`[Yandex API KORUMA] Sürücü=${driverId} için Yandex (yedek) gecikmeli bakiye döndü (${balance} TL). Kilitli bakiye (${cached.balance} TL) korundu.`);
+                        return { balance: cached.balance, blockedBalance: cached.blockedBalance };
+                    }
+                }
+
                 const result = {
                     balance: String(balance),
                     blockedBalance: '0'
@@ -478,11 +497,25 @@ class YandexFleetApi {
     }
 
     /**
-     * Belirli bir sürücü için bakiye önbelleğini temizler
+     * Belirli bir sürücü için bakiye önbelleğini temizler veya yeni bakiyeyi kilitler
+     * @param {string} driverId
+     * @param {string} [parkPartnerId]
+     * @param {number|string|null} [knownNewBalance] - Çekim sonrası bilinen kalan net bakiye (örn. 0)
      */
-    invalidateBalanceCache(driverId, parkPartnerId) {
+    invalidateBalanceCache(driverId, parkPartnerId, knownNewBalance = null) {
         const cacheKey = `${driverId}:${parkPartnerId || 'default'}`;
-        this._balanceCache.delete(cacheKey);
+        if (knownNewBalance !== null && knownNewBalance !== undefined) {
+            const newBalStr = String(Math.max(0, parseFloat(knownNewBalance) || 0));
+            this._balanceCache.set(cacheKey, {
+                balance: newBalStr,
+                blockedBalance: '0',
+                expiry: Date.now() + 15 * 60 * 1000, // 15 dakika kilit
+                isPostWithdrawOverride: true
+            });
+            console.log(`[Yandex API] Sürücü=${driverId} için çekim sonrası bakiye kilitlendi: ${newBalStr} TL (15 dk)`);
+        } else {
+            this._balanceCache.delete(cacheKey);
+        }
     }
 
     /**
