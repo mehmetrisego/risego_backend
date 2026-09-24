@@ -1,3 +1,4 @@
+const withdrawalSafety = require('../services/withdrawalSafetyService');
 const config = require('../config');
 const db = require('../db');
 const dbCampaigns = require('../db/campaigns');
@@ -6,9 +7,7 @@ const dbPaymentLogs = require('../db/paymentLogs');
 
 const yandexFleetApi = require('../services/yandexFleetApi');
 const authService = require('../services/authService');
-const uptService = require('../services/uptService');
 const leaderboardService = require('../services/leaderboardService');
-const systemService = require('../services/systemService');
 
 function resolveAdminCampaignPark(req, res) {
     const fromQuery = (req.query.parkPartnerId || '').trim();
@@ -81,7 +80,7 @@ exports.deleteCampaign = async (req, res) => {
 
 exports.getUptBalance = async (req, res) => {
     try {
-        const result = await uptService.getUptBalance();
+        const { result } = await withdrawalSafety.checkBalance();
         res.json({ success: result.success, tryBalanceRaw: result.tryBalanceRaw, balances: result.balances, error: result.error || null });
     } catch (err) {
         console.error('[AdminController] UPT bakiye hatası:', err.message);
@@ -137,23 +136,16 @@ exports.getLeaderboard = async (req, res) => {
 exports.getPaymentLogs = async (req, res) => {
     try {
         if (!db.isConfigured()) return res.status(503).json({ success: false, message: 'Veritabanı yapılandırılmamış.' });
-        const result = await db.query(`SELECT * FROM payment_logs ORDER BY created_at DESC LIMIT 500`);
-        res.json({ success: true, logs: result.rows });
+        const page = await require('../db/adminPaymentLogs').getPaymentLogs(req.query);
+        res.json({ success: true, ...page });
     } catch (err) {
         console.error('[AdminController] Payment logs hatası:', err.message);
-        res.status(500).json({ success: false, message: err.message });
-    }
-};
-
-exports.getTotalBalance = async (req, res) => {
-    try {
-        if (!db.isConfigured()) return res.json({ success: true, totalBalance: 0 });
-        const result = await db.query('SELECT SUM(balance) as total FROM park_driver_balances');
-        const total = parseFloat(result.rows[0]?.total || 0);
-        res.json({ success: true, totalBalance: total });
-    } catch (err) {
-        console.error('[AdminController] Toplam sürücü bakiyesi hesaplanamadı:', err.message);
-        res.status(500).json({ success: false, message: err.message });
+        res.status(err.status === 400 ? 400 : err.code === '57014' ? 503 : 500).json({
+            success: false,
+            message: err.status === 400 ? err.message : err.code === '57014'
+                ? 'Arama zaman aşımına uğradı. Tarih veya şehir filtresiyle tekrar deneyiniz.'
+                : 'Ödeme kayıtları alınamadı.'
+        });
     }
 };
 
@@ -228,22 +220,21 @@ exports.deleteBankAccount = async (req, res) => {
     }
 };
 
-exports.getKillswitch = (req, res) => {
-    res.json({ success: true, suspendedCities: systemService.getSuspendedCities() });
+function safetyResponse(state) {
+    return { success: true, suspendedCities: state.cities, revision: state.guard.revision, lastAutomaticStop: state.guard.lastAutomaticStop };
+}
+
+exports.getKillswitch = async (req, res) => {
+    try { res.json(safetyResponse(await withdrawalSafety.getState())); }
+    catch (err) { res.status(503).json({ success: false, message: 'Çekim durumu alınamadı.' }); }
 };
 
 exports.updateKillswitch = async (req, res) => {
-    const { suspendedCities: newSuspended } = req.body;
-    if (!Array.isArray(newSuspended)) return res.status(400).json({ success: false, message: 'Geçersiz parametre.' });
-    
     try {
-        await db.query("UPDATE system_settings SET value = $1, updated_at = NOW() WHERE key = 'suspended_cities'", [JSON.stringify(newSuspended)]);
-        systemService.setSuspendedCities(newSuspended);
-        console.log(`[AdminController] Killswitch durumu veritabanında değiştirildi. Askıya alınan şehirler: ${systemService.getSuspendedCities().join(', ')}`);
-        res.json({ success: true, suspendedCities: systemService.getSuspendedCities(), message: 'Para çekme kısıtlamaları güncellendi.' });
+        const state = await withdrawalSafety.saveCities(req.body?.suspendedCities, req.body?.revision);
+        res.json({ ...safetyResponse(state), message: 'Para çekme kısıtlamaları güncellendi.' });
     } catch (err) {
-        console.error('[AdminController] Killswitch güncelleme hatası:', err.message);
-        res.status(500).json({ success: false, message: 'Ayarlar güncellenirken veritabanı hatası oluştu.' });
+        res.status(err.status || 503).json({ success: false, message: err.status ? err.message : 'Ayarlar kaydedilemedi.' });
     }
 };
 

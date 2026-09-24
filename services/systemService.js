@@ -1,9 +1,6 @@
-let suspendedCities = [];
 let _maintenanceWindow = false;
 
 module.exports = {
-    getSuspendedCities: () => suspendedCities,
-    setSuspendedCities: (cities) => { suspendedCities = cities; },
 
     isMaintenanceWindowActive: () => _maintenanceWindow,
     setMaintenanceWindow: (active) => {

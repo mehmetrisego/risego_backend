@@ -1,3 +1,4 @@
+const withdrawalSafety = require('../services/withdrawalSafetyService');
 const leaderboardService = require('../services/leaderboardService');
 const uptStatusService   = require('../services/uptStatusService');
 const systemService      = require('../services/systemService');
@@ -7,6 +8,17 @@ const systemService      = require('../services/systemService');
 // 06:00–07:00 → bakım penceresi + delta sync
 // 07:00       → bakım biter
 // 08:00       → hasRunToday sıfırlanır (ertesi gece için)
+
+let _balanceGuardTimer = null;
+let _balanceGuardRunning = false;
+
+async function checkWithdrawalSafety() {
+    if (_balanceGuardRunning) return;
+    _balanceGuardRunning = true;
+    try { await withdrawalSafety.checkBalance(true); }
+    catch (err) { console.error('[WithdrawalSafety] Bakiye kontrolü başarısız:', err.message); }
+    finally { _balanceGuardRunning = false; }
+}
 
 let _hasRunToday       = false;
 let _nightSyncScheduler = null;
@@ -38,6 +50,9 @@ function _checkNightWindow() {
 }
 
 function startAllCrons() {
+    void checkWithdrawalSafety();
+    if (_balanceGuardTimer) clearInterval(_balanceGuardTimer);
+    _balanceGuardTimer = setInterval(checkWithdrawalSafety, 60 * 1000);
     // 1. LeaderboardService ilk sync (server start)
     leaderboardService.startCron().catch(err => {
         console.error('[CronManager] LeaderboardService başlatma hatası:', err.message);
@@ -88,6 +103,8 @@ function startAllCrons() {
 }
 
 function stopAllCrons() {
+    if (_balanceGuardTimer) clearInterval(_balanceGuardTimer);
+    _balanceGuardTimer = null;
     if (leaderboardService && typeof leaderboardService.stopCron === 'function') {
         leaderboardService.stopCron();
     }

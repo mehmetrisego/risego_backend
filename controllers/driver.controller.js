@@ -1,3 +1,4 @@
+const withdrawalSafety = require('../services/withdrawalSafetyService');
 const path = require('path');
 const fsSync = require('fs');
 
@@ -134,11 +135,6 @@ exports.withdraw = async (req, res) => {
     try {
         if (!db.isConfigured()) return res.status(503).json({ success: false, message: 'Veritabanı yapılandırılmamış.' });
 
-        const suspendedCities = systemService.getSuspendedCities();
-        if (suspendedCities.includes(parkPid)) {
-            return res.status(503).json({ success: false, message: 'Para çekme işlemleri bulunduğunuz şehir için geçici bir süreliğine askıya alınmıştır. Lütfen daha sonra tekrar deneyiniz.' });
-        }
-
         // Gece bakım penceresi (06:00–07:00 TR): senkronizasyon çalışırken çekim bloke
         if (systemService.isMaintenanceWindowActive()) {
             return res.status(503).json({
@@ -150,6 +146,9 @@ exports.withdraw = async (req, res) => {
 
         if (isNaN(grossAmount) || grossAmount <= 0) return res.status(400).json({ success: false, message: 'Geçerli bir tutar giriniz.' });
         if (grossAmount <= WITHDRAW_FEE_TL) return res.status(400).json({ success: false, message: `Çekim tutarı en az ${WITHDRAW_FEE_TL + 0.01} TL olmalıdır (${WITHDRAW_FEE_TL} TL çekim ücreti alınmaktadır).` });
+
+        try { await withdrawalSafety.assertAllowed(parkPid); }
+        catch (err) { return res.status(503).json({ success: false, message: err.message }); }
 
         client = await db.pool.connect();
         await client.query('BEGIN');
@@ -206,9 +205,17 @@ exports.withdraw = async (req, res) => {
         const beneficiarySurname = nameParts.length > 1 ? nameParts.slice(1).join(' ') : nameParts[0];
         const beneficiaryName = nameParts[0];
 
+        // Recheck persisted state immediately before money movement.
+        try { await withdrawalSafety.assertAllowed(parkPid); }
+        catch (err) {
+            await db.query('UPDATE driver_profiles SET last_withdraw_at = $1 WHERE driver_id = $2', [profileRow.rows[0]?.last_withdraw_at || null, driverId]);
+            return res.status(503).json({ success: false, message: err.message });
+        }
         const result = await paymentService.sendPayment({
             driverId, beneficiaryName, beneficiarySurname, beneficiaryIban: account.iban, amount: netAmount, yandexAmount: grossAmount, parkPartnerId: parkPid
         });
+
+        withdrawalSafety.checkBalance(true).catch(err => console.error('[WithdrawalSafety] Ödeme sonrası kontrol:', err.message));
 
         // Çekim başarılı oldu: Çekilen tutar sonrası kalan bakiye hesaplanır ve Yandex API gecikmesine karşı 15 dakika boyunca kilitlenir
         const remainingBalance = Math.max(0, withdrawable - grossAmount);
@@ -229,6 +236,10 @@ exports.withdraw = async (req, res) => {
 
 exports.getWithdrawStatus = async (req, res) => {
     try {
+        const state = await withdrawalSafety.getState();
+        if (state.cities.includes(sessionParkPartnerId(req))) {
+            return res.json({ success: true, canWithdraw: false, suspended: true, message: 'Şehrinizde para çekimi askıya alınmıştır. Yönetici onayı bekleniyor.' });
+        }
         // Gece bakım penceresi
         if (systemService.isMaintenanceWindowActive()) {
             return res.json({
@@ -252,7 +263,7 @@ exports.getWithdrawStatus = async (req, res) => {
         return res.json({ success: true, canWithdraw: false, cooldownUntil: new Date(lastWithdrawAt + WITHDRAW_COOLDOWN_MS).toISOString(), minutesLeft });
     } catch (err) {
         console.error('[DriverController] Withdraw status hatası:', err.message);
-        return res.json({ success: true, canWithdraw: true, cooldownUntil: null, minutesLeft: 0 });
+        return res.status(503).json({ success: false, canWithdraw: false, message: 'Çekim durumu doğrulanamadı.' });
     }
 };
 

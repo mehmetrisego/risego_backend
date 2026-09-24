@@ -27,12 +27,6 @@ const cronManager = require('./jobs/cronManager');
 
 
 
-// ─── KILLSWITCH (ACİL DURUM ANAHTARI) ──────────────────────────────────────
-let suspendedCities = [];
-// Durum başlangıçta startServer() içinde veritabanından yüklenecek.
-// ──────────────────────────────────────────────────────────────────────────
-
-
 // ─── CANLI ORTAM İYİLEŞTİRMELERİ (Stability & Error Handling) ──────────────
 
 // 1. Beklenmedik hata yakalayıcılar (Unhandled Rejections / Uncaught Exceptions)
@@ -192,23 +186,6 @@ async function startServer() {
         if (connected) {
             await runMigrations();
 
-            // Killswitch durumunu veritabanından yükleyelim
-            try {
-                const ksResult = await db.query("SELECT value FROM system_settings WHERE key = 'suspended_cities'");
-                if (ksResult.rows.length > 0) {
-                    try {
-                        suspendedCities = JSON.parse(ksResult.rows[0].value);
-                        if (!Array.isArray(suspendedCities)) suspendedCities = [];
-                    } catch (e) {
-                        suspendedCities = [];
-                    }
-                    console.log(`[Server] Killswitch durumu veritabanından yüklendi. Askıdaki şehirler: ${suspendedCities.join(', ')}`);
-                } else {
-                    await db.query("INSERT INTO system_settings (key, value) VALUES ('suspended_cities', '[]') ON CONFLICT (key) DO NOTHING");
-                }
-            } catch (ksErr) {
-                console.error('[Server] Killswitch durumu veritabanından okunamadı:', ksErr.message);
-            }
             try {
                 const mainPid = config.yandexFleet.partnerId;
                 if (mainPid) {
@@ -257,5 +234,4 @@ startServer().catch(err => {
     console.error('[Server] Başlatma hatası:', err);
     process.exit(1);
 });
-
 

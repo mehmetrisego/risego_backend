@@ -599,8 +599,6 @@ class LeaderboardService {
                 console.log('[LeaderboardService] UYARI: DB boş. Sipariş verileri ilk gece sync (06:00) çalışana kadar eksik görünebilir.');
             }
 
-            // Bakiye eşitleme kaldırıldı — bakiye artık sadece sürücü "Para Çek"e bastığında Yandex'ten çekiliyor
-            // await this._syncDriverBalances();
         };
         this._readyPromise = initSync();
 
@@ -628,61 +626,9 @@ class LeaderboardService {
             } else {
                 await this._deltaSync();
             }
-            // Bakiye eşitleme kaldırıldı — gereksiz Yandex API yükü oluşturuyordu
-            // await this._syncDriverBalances();
             console.log('[LeaderboardService] ✅ Gece sync tamamlandı.');
         } catch (err) {
             console.error('[LeaderboardService] ❌ Gece sync hatası:', err.message);
-        }
-    }
-
-    /** Yandex'ten sürücü profillerini çekip bakiyeleri DB'ye kaydeder (Optimize Bulk Sync) */
-    async _syncDriverBalances() {
-        if (!db.isConfigured()) return;
-        try {
-            console.log('[LeaderboardService] Sürücü bakiyeleri DB\'ye eşitleniyor...');
-            const sources = config.getYandexParkSources();
-            for (const park of sources) {
-                const drivers = await yandexFleetApi.fetchDriverProfilesForParkSource(park);
-                if (!drivers || drivers.length === 0) continue;
-
-                const allValues = [];
-                const allParams = [];
-                
-                for (const d of drivers) {
-                    const driverId = d.driver_profile?.id;
-                    // Yandex API list endpoint'inde bakiye genellikle 'accounts' dizisi içinde döner
-                    const balance = parseFloat(d.accounts?.[0]?.balance || d.account?.balance || 0);
-                    if (!driverId) continue;
-                    allValues.push({ driverId, balance });
-                }
-
-                // 500'lü paketler halinde toplu insert (Bulk Upsert)
-                const CHUNK_SIZE = 500;
-                for (let i = 0; i < allValues.length; i += CHUNK_SIZE) {
-                    const chunk = allValues.slice(i, i + CHUNK_SIZE);
-                    const params = [];
-                    const valueStrings = chunk.map((item, idx) => {
-                        const base = idx * 2;
-                        params.push(item.driverId, item.balance);
-                        return `($${base + 1}, $${base + 2}, NOW())`;
-                    });
-
-                    await db.query(`
-                        INSERT INTO park_driver_balances (driver_id, balance, updated_at)
-                        VALUES ${valueStrings.join(', ')}
-                        ON CONFLICT (driver_id) DO UPDATE SET
-                            balance = EXCLUDED.balance,
-                            updated_at = NOW()
-                    `, params);
-                }
-
-                // Şehirler arası bakiye eşitleme molası (5 dakika)
-                await sleep(300000);
-            }
-            console.log(`[LeaderboardService] ✅ Sürücü bakiyeleri toplu olarak güncellendi.`);
-        } catch (err) {
-            console.error('[LeaderboardService] Sürücü bakiyeleri eşitlenirken hata:', err.message);
         }
     }
 

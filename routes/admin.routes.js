@@ -30,7 +30,6 @@ router.post('/leaderboard/resync', adminController.resyncLeaderboard);
 router.get('/leaderboard/status', adminController.getLeaderboardStatus);
 
 router.get('/payment-logs', adminController.getPaymentLogs);
-router.get('/drivers/total-balance', adminController.getTotalBalance);
 
 // Sürücü Banka Hesapları
 router.get('/drivers/:driverId/bank-accounts', adminController.getDriverBankAccounts);

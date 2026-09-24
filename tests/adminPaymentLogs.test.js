@@ -1,0 +1,44 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const { buildPaymentLogsQuery: build, paymentLogsPage: page } = require('../db/adminPaymentLogs');
+
+test('bounds page size and rejects malformed filters', () => {
+    assert.equal(build().values.at(-1), 51);
+    for (const q of [{ limit: '500' }, { limit: '0' }, { q: 'ab' }, { q: ['abc'] },
+        { from: '2026-02-30' }, { from: '2026-09-15', to: '2026-09-01' },
+        { status: 'invalid' }, { cursor: 'invalid' },
+        { cursor: Buffer.from(JSON.stringify({ at: '2026-02-30T00:00:00.000000Z', id: 1 })).toString('base64url') }]) {
+        assert.throws(() => build(q), { status: 400 });
+    }
+    assert.equal(build({ q: '12' }).values[0], 12);
+});
+
+test('user input remains a bound literal, including SQL/LIKE characters', () => {
+    const input = "O'Connor%_\\";
+    const query = build({ q: input });
+    assert.ok(!query.text.includes(input));
+    assert.equal(query.values[0], "%o'connor\\%\\_\\\\%");
+    assert.equal(build({ q: '  TR14 0004 6006 0588 8000 1546 17  ' }).values[0], '%tr140004600605888000154617%');
+    assert.equal(build({ q: 'GÜRHAN YIĞIN' }).values[0], '%gürhan yiğin%');
+});
+
+test('cursor preserves microsecond precision and uses a stable ID tie breaker', () => {
+    const rows = [
+        { id: 9, cursor_at: '2026-09-21T18:27:40.551999Z' },
+        { id: 8, cursor_at: '2026-09-21T18:27:40.551998Z' }
+    ];
+    const result = page(rows, 1);
+    assert.equal(result.logs[0].cursor_at, undefined);
+    assert.equal(result.hasMore, true);
+    const query = build({ cursor: result.nextCursor });
+    assert.deepEqual(query.values.slice(0, 2), [rows[0].cursor_at, 9]);
+    assert.match(query.text, /\(created_at, id\) </);
+    assert.equal(page(rows, 2).nextCursor, null);
+});
+
+test('date boundaries are interpreted in Istanbul and the end date is inclusive', () => {
+    const query = build({ from: '2026-09-01', to: '2026-09-15', status: 'success', parkPartnerId: 'izmir' });
+    assert.deepEqual(query.values, ['2026-09-01', '2026-09-15', 'success', 'izmir', 51]);
+    assert.match(query.text, /date \+ 1/);
+    assert.match(query.text, /Europe\/Istanbul/);
+});
