@@ -1,7 +1,7 @@
 // Ortam değişkenlerini yükle (.env dosyasından)
 require('dotenv').config();
 
-const DEFAULT_YANDEX_BASE = 'https://fleet-api.taxi.yandex.net';
+const DEFAULT_YANDEX_BASE = 'https://fleet-api.yandexcom.net';
 
 /**
  * Çoklu park: YANDEX_PARK_1_*, YANDEX_PARK_2_* ... (N artarak; PARTNER_ID boş kalana kadar)
