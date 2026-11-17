@@ -1,9 +1,9 @@
 name: Deploy to AWS Lightsail
 
 on:
-  push:
-    branches:
-      - main
+  # Otomatik push-deploy KAPATILDI (her push'ta git reset --hard origin/main + pm2 restart yapiyordu).
+  # Deploy artik yalnizca ELLE tetiklenir: GitHub -> Actions -> "Deploy to AWS Lightsail" -> Run workflow.
+  workflow_dispatch:
 
 jobs:
   deploy:
