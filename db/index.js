@@ -19,8 +19,17 @@ const pool = connectionString
           connectionString,
           ssl: poolSslOption(connectionString),
           max: 20,
-          idleTimeoutMillis: 30000,
+          // Railway public proxy bağlantısında TLS kurulumu yaklaşık 1 saniye
+          // sürebiliyor. En az iki bağlantıyı sıcak tutarak ani trafik
+          // dalgalarında tüm havuzun yeniden kurulmasını önle.
+          min: 2,
+          idleTimeoutMillis: 300000,
           connectionTimeoutMillis: 10000,
+          // Bir kilit ya da unutulmuş transaction'ın istekleri dakikalarca
+          // bekletmesine izin verme. Normal sorgular bu eşiklerin çok altında.
+          statement_timeout: 30000,
+          lock_timeout: 10000,
+          idle_in_transaction_session_timeout: 30000,
           // TCP keepalive — sunucu/NAT tarafından öldürülen bağlantıları tespit eder
           keepAlive: true,
           keepAliveInitialDelayMillis: 30000,

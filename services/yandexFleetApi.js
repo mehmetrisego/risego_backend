@@ -69,6 +69,9 @@ class YandexFleetApi {
         this.httpClient = axios.create({
             baseURL: this.baseUrl,
             timeout: 30000, // ✅ OPT-2: 30s timeout — asılı kalan istekler sunucuyu dondurmasın
+            maxRedirects: 0,
+            maxContentLength: 10 * 1024 * 1024,
+            maxBodyLength: 2 * 1024 * 1024,
             httpAgent,
             httpsAgent,
             headers: {
@@ -124,6 +127,9 @@ class YandexFleetApi {
                 axios.create({
                     baseURL: src.baseUrl || config.yandexFleet.baseUrl,
                     timeout: 30000,
+                    maxRedirects: 0,
+                    maxContentLength: 10 * 1024 * 1024,
+                    maxBodyLength: 2 * 1024 * 1024,
                     httpAgent,
                     httpsAgent,
                     headers: {
@@ -141,37 +147,89 @@ class YandexFleetApi {
     /**
      * Tek park için sürücü listesi (telefon doğrulama; önbellek authService'te)
      */
-    async fetchDriverProfilesForParkSource(parkSource) {
+    async fetchDriverProfilesForParkSource(parkSource, options = {}) {
         const { http, parkId } = this._resolveParkContext(parkSource.partnerId);
         const allDrivers = [];
-        let offset = 0;
+        let offset = Math.max(0, Number(options.startOffset || 0));
         const limit = 1000;
         let hasMore = true;
+        let pagesProcessed = 0;
+        const maxPages = options.maxPages === Infinity
+            ? Infinity
+            : Math.max(1, Number(options.maxPages || Infinity));
+        const pageRetryDelayMs = Math.max(0, Number(options.pageRetryDelayMs || 0));
+        const maxPageAttempts = options.maxPageAttempts === Infinity
+            ? Infinity
+            : Math.max(1, Number(options.maxPageAttempts || 1));
+        const fields = {
+            car: ['brand', 'model', 'number', 'year', 'color', 'id'],
+            driver_profile: ['first_name', 'last_name', 'phones', 'id', 'work_status']
+        };
+        fields.updated_at = true;
+        if (options.includeAccount !== false) fields.account = ['balance'];
+        const parkQuery = { id: parkId };
+        if (Array.isArray(options.workStatuses) && options.workStatuses.length > 0) {
+            parkQuery.driver_profile = { work_status: options.workStatuses };
+        }
+        if (options.updatedFrom || options.updatedTo) {
+            parkQuery.updated_at = {};
+            if (options.updatedFrom) parkQuery.updated_at.from = options.updatedFrom;
+            if (options.updatedTo) parkQuery.updated_at.to = options.updatedTo;
+        }
 
         while (hasMore) {
             if (offset > 0) {
                 await sleep(1500); // 1.5s delay between pages to prevent 429
             }
-            // Global throttle üzerinden geçir
-            const response = await this._throttledYandexRequest(() => http.post(
-                '/v1/parks/driver-profiles/list',
-                {
-                    query: { park: { id: parkId } },
-                    fields: {
-                        account: ['balance'],
-                        car: ['brand', 'model', 'number', 'year', 'color', 'id'],
-                        driver_profile: ['first_name', 'last_name', 'phones', 'id']
-                    },
-                    limit,
-                    offset
+            let response;
+            let pageAttempt = 0;
+            while (!response) {
+                pageAttempt++;
+                try {
+                    // Global throttle üzerinden geçir
+                    response = await this._throttledYandexRequest(() => http.post(
+                        '/v1/parks/driver-profiles/list',
+                        {
+                            query: { park: parkQuery },
+                            fields,
+                            sort_order: [{
+                                direction: 'asc',
+                                field: 'driver_profile.created_date'
+                            }],
+                            limit,
+                            offset
+                        }
+                    ));
+                } catch (error) {
+                    const isRateLimit = error.response?.status === 429 || String(error.message).includes('429');
+                    if (!isRateLimit || pageRetryDelayMs <= 0 || pageAttempt >= maxPageAttempts) throw error;
+                    if (options.deadlineAt && Date.now() + pageRetryDelayMs >= options.deadlineAt) throw error;
+                    if (typeof options.onPageRetry === 'function') {
+                        options.onPageRetry({ offset, limit, attempt: pageAttempt, delayMs: pageRetryDelayMs, error });
+                    }
+                    await sleep(pageRetryDelayMs);
                 }
-            ));
+            }
 
             const data = response.data;
             const drivers = data.driver_profiles || [];
             allDrivers.push(...drivers);
+            pagesProcessed++;
+            if (typeof options.onPageComplete === 'function') {
+                await options.onPageComplete({
+                    offset,
+                    received: drivers.length,
+                    total: data.total || allDrivers.length,
+                    profiles: drivers
+                });
+            }
 
-            if (offset + limit >= (data.total || 0) || drivers.length === 0) {
+            if (
+                offset + limit >= (data.total || 0) ||
+                drivers.length === 0 ||
+                pagesProcessed >= maxPages ||
+                (options.deadlineAt && Date.now() >= options.deadlineAt)
+            ) {
                 hasMore = false;
             } else {
                 offset += limit;
@@ -312,22 +370,16 @@ class YandexFleetApi {
      * İstekler arasında minimum 500ms boşluk olur. (bakiye, profil, sipariş vs.)
      */
     async _throttledYandexRequest(requestFn) {
-        const result = new Promise((resolve, reject) => {
-            this._yandexThrottleQueue = this._yandexThrottleQueue.then(async () => {
-                // Son istekten bu yana yeterince zaman geçmesini bekle
-                const elapsed = Date.now() - this._lastYandexRequestTime;
-                if (elapsed < this.YANDEX_MIN_INTERVAL) {
-                    await sleep(this.YANDEX_MIN_INTERVAL - elapsed);
-                }
-                this._lastYandexRequestTime = Date.now();
-
-                try {
-                    resolve(await requestFn());
-                } catch (err) {
-                    reject(err);
-                }
-            }).catch(() => {});
+        const result = this._yandexThrottleQueue.then(async () => {
+            const elapsed = Date.now() - this._lastYandexRequestTime;
+            if (elapsed < this.YANDEX_MIN_INTERVAL) {
+                await sleep(this.YANDEX_MIN_INTERVAL - elapsed);
+            }
+            this._lastYandexRequestTime = Date.now();
+            return requestFn();
         });
+        // Bir isteğin hatası kuyruğu zehirlemez; çağıran yine gerçek hatayı alır.
+        this._yandexThrottleQueue = result.catch(() => {});
         return result;
     }
 
@@ -336,26 +388,20 @@ class YandexFleetApi {
      * Ayrıca kuyrukta beklerken cache dolmuşsa Yandex'e hiç gitmez.
      */
     async _throttledBalanceRequest(driverId, parkPartnerId, cacheKey, now, cached) {
-        // Kuyruğa ekle — önceki istek bitmeden yenisi başlamaz
-        const result = new Promise((resolve) => {
-            this._yandexThrottleQueue = this._yandexThrottleQueue.then(async () => {
-                // Kuyrukta beklerken cache dolmuş olabilir (başka istek çekmiş olabilir)
-                const freshCached = this._balanceCache.get(cacheKey);
-                if (freshCached && Date.now() < freshCached.expiry) {
-                    resolve({ balance: freshCached.balance, blockedBalance: freshCached.blockedBalance });
-                    return;
-                }
+        const result = this._yandexThrottleQueue.then(async () => {
+            const freshCached = this._balanceCache.get(cacheKey);
+            if (freshCached && Date.now() < freshCached.expiry) {
+                return { balance: freshCached.balance, blockedBalance: freshCached.blockedBalance };
+            }
 
-                // Son istekten bu yana yeterince zaman geçmesini bekle
-                const elapsed = Date.now() - this._lastYandexRequestTime;
-                if (elapsed < this.YANDEX_MIN_INTERVAL) {
-                    await sleep(this.YANDEX_MIN_INTERVAL - elapsed);
-                }
-                this._lastYandexRequestTime = Date.now();
-
-                resolve(await this._doBalanceRequest(driverId, parkPartnerId, cacheKey, cached));
-            }).catch(() => {});
+            const elapsed = Date.now() - this._lastYandexRequestTime;
+            if (elapsed < this.YANDEX_MIN_INTERVAL) {
+                await sleep(this.YANDEX_MIN_INTERVAL - elapsed);
+            }
+            this._lastYandexRequestTime = Date.now();
+            return this._doBalanceRequest(driverId, parkPartnerId, cacheKey, cached);
         });
+        this._yandexThrottleQueue = result.catch(() => {});
         return result;
     }
 
@@ -528,10 +574,21 @@ class YandexFleetApi {
      * @param {string} description - İşlem açıklaması
      * @returns {Promise<Object>}
      */
-    async deductBalance(driverId, amount, parkPartnerId, description = 'Para çekimi') {
+    async deductBalance(driverId, amount, parkPartnerId, description = 'Para çekimi', options = {}) {
         const { http, parkId } = this._resolveParkContext(parkPartnerId);
-        const crypto = require('crypto');
-        const idempotencyToken = crypto.randomBytes(16).toString('hex');
+        const idempotencyToken = options.idempotencyToken || crypto.randomBytes(16).toString('hex');
+
+        if (config.yandexTransactions?.apiVersion === 'v3') {
+            return this.createTransactionV3({
+                driverId,
+                amount,
+                parkPartnerId: parkId,
+                description,
+                idempotencyToken,
+                balanceMin: options.balanceMin,
+                data: options.data
+            });
+        }
 
         const body = {
             park_id: parkId,
@@ -556,6 +613,64 @@ class YandexFleetApi {
             )
         );
         return resp.data;
+    }
+
+    /**
+     * Yandex Fleet v3 işlem oluşturma. HTTP 200 nihai başarı anlamına gelmez;
+     * çağıran taraf response.status alanını ve gerekirse status endpointini izlemelidir.
+     */
+    async createTransactionV3({
+        driverId, amount, parkPartnerId, description, idempotencyToken, balanceMin, data
+    }) {
+        if (!idempotencyToken || idempotencyToken.length < 16 || idempotencyToken.length > 64) {
+            throw new Error('Yandex v3 idempotency token 16-64 karakter olmalıdır.');
+        }
+        const { http, parkId } = this._resolveParkContext(parkPartnerId);
+        const normalizedAmount = String(amount);
+        if (!/^-?[0-9]+(\.[0-9]{1,4})?$/.test(normalizedAmount) || Number(normalizedAmount) === 0) {
+            throw new Error('Yandex v3 işlem tutarı sıfırdan farklı ve en fazla 4 ondalıklı olmalıdır.');
+        }
+
+        const body = {
+            park_id: parkId,
+            contractor_profile_id: driverId,
+            amount: normalizedAmount,
+            description,
+            version: 1,
+            data: data || {
+                kind: 'other',
+                reason: description || 'RiseGo bakiye işlemi'
+            }
+        };
+        if (balanceMin != null) {
+            body.condition = { balance_min: String(balanceMin) };
+        }
+
+        const response = await this._throttledYandexRequest(() => http.post(
+            '/v3/parks/driver-profiles/transactions',
+            body,
+            { headers: { 'X-Idempotency-Token': idempotencyToken }, timeout: 30000 }
+        ));
+        return response.data;
+    }
+
+    /** Yandex Fleet v3 işlem durumunu getirir. */
+    async getTransactionStatusV3({ driverId, parkPartnerId, transactionId, version = 1 }) {
+        if (!transactionId) throw new Error('Yandex işlem kimliği zorunludur.');
+        const { http, parkId } = this._resolveParkContext(parkPartnerId);
+        const response = await this._throttledYandexRequest(() => http.get(
+            '/v3/parks/driver-profiles/transactions/status',
+            {
+                params: {
+                    contractor_profile_id: driverId,
+                    id: transactionId,
+                    park_id: parkId,
+                    version
+                },
+                timeout: 30000
+            }
+        ));
+        return response.data;
     }
 
 
@@ -651,101 +766,6 @@ class YandexFleetApi {
             };
         }
         return null;
-    }
-
-    /**
-     * Çalışma kurallarını getirir
-     * GET /v1/parks/driver-work-rules
-     */
-    async getDriverWorkRules(parkPartnerId) {
-        const { http, parkId } = this._resolveParkContext(parkPartnerId);
-        try {
-            const response = await http.get(
-                '/v1/parks/driver-work-rules',
-                { params: { park_id: parkId } }
-            );
-            const rules = response.data?.rules || [];
-            return rules.filter(r => r.is_enabled).map(r => r.id);
-        } catch (error) {
-            console.error('[YandexFleetApi] Work rules hatası:', error.response?.data || error.message);
-            throw error;
-        }
-    }
-
-    /**
-     * Yeni taksi sürücüsü profili oluşturur
-     * POST /v2/parks/contractors/driver-profile
-     */
-    async createDriverProfile(data, parkPartnerId) {
-        const { http, parkId } = this._resolveParkContext(parkPartnerId);
-        let workRuleId = config.yandexFleet.workRuleId;
-        if (!workRuleId) {
-            const rules = await this.getDriverWorkRules(parkPartnerId);
-            workRuleId = rules[0];
-        }
-        if (!workRuleId) {
-            throw new Error('Çalışma kuralı bulunamadı. YANDEX_WORK_RULE_ID .env dosyasında tanımlayın.');
-        }
-
-        const body = {
-            person: {
-                full_name: {
-                    first_name: data.firstName,
-                    last_name: data.lastName
-                },
-                contact_info: {
-                    phone: data.phone
-                },
-                driver_license: {
-                    number: data.driverLicenseNumber,
-                    birth_date: data.birthDate,
-                    country: data.country || 'tur',
-                    issue_date: data.driverLicenseIssueDate,
-                    expiry_date: data.driverLicenseExpiryDate
-                },
-                driver_license_experience: {
-                    total_since_date: data.driverLicenseIssueDate
-                },
-                tax_identification_number: data.taxIdentificationNumber
-            },
-            account: {
-                work_rule_id: workRuleId
-            },
-            order_provider: {
-                platform: true,
-                partner: true
-            }
-        };
-
-        // ✅ OPT-5: crypto artık top-level import, require() içinde çağrılmıyor
-        const idempotencyToken = crypto.randomBytes(16).toString('hex');
-
-        try {
-            const response = await http.post(
-                '/v2/parks/contractors/driver-profile',
-                body,
-                {
-                    headers: {
-                        'X-Park-ID': parkId,
-                        'X-Idempotency-Token': idempotencyToken
-                    }
-                }
-            );
-            const contractorProfileId = response.data?.contractor_profile_id;
-            if (!contractorProfileId) {
-                throw new Error('Sürücü oluşturuldu ancak profil ID alınamadı.');
-            }
-
-            // ✅ Yeni sürücü oluşunca profil cache'ini temizle
-            this.invalidateProfileCache();
-
-            return { contractorProfileId };
-        } catch (error) {
-            const errData = error.response?.data;
-            const msg = errData?.message || errData?.code || error.message;
-            console.error('[YandexFleetApi] Sürücü oluşturma hatası:', msg, JSON.stringify(errData || {}));
-            throw new Error(msg);
-        }
     }
 
     /**
@@ -876,4 +896,6 @@ class YandexFleetApi {
 
 }
 
-module.exports = new YandexFleetApi();
+const yandexFleetApi = new YandexFleetApi();
+module.exports = yandexFleetApi;
+module.exports.YandexFleetApi = YandexFleetApi;

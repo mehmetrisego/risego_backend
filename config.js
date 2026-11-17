@@ -1,5 +1,5 @@
 // Ortam değişkenlerini yükle (.env dosyasından)
-require('dotenv').config();
+require('dotenv').config({ quiet: true });
 
 const DEFAULT_YANDEX_BASE = 'https://fleet-api.yandexcom.net';
 
@@ -131,6 +131,11 @@ function findYandexParkByPartnerId(partnerId) {
 // Hassas değerler .env dosyasından okunur - asla buraya yazmayın!
 const config = {
     yandexFleet: primaryYandex,
+    yandexTransactions: {
+        apiVersion: String(process.env.YANDEX_TRANSACTION_API_VERSION || 'v2').toLowerCase(),
+        statusPollIntervalMs: Math.max(500, Number(process.env.YANDEX_TRANSACTION_POLL_INTERVAL_MS || 1500)),
+        statusPollMaxAttempts: Math.max(1, Number(process.env.YANDEX_TRANSACTION_POLL_MAX_ATTEMPTS || 20))
+    },
     normalizeCityKey,
     findYandexParkByCity,
     findYandexParkByPartnerId,
@@ -150,6 +155,12 @@ const config = {
         username: process.env.NETGSM_USERNAME,
         usercode: process.env.NETGSM_USERCODE,
         msgheader: process.env.NETGSM_MSGHEADER || 'RISE LTD'
+    },
+    alerts: {
+        phone: process.env.ALERT_PHONE || '05061283492',
+        stuckMaxAttempts: Math.max(3, Number(process.env.YANDEX_STUCK_MAX_ATTEMPTS || 20)),
+        stuckMaxAgeMs: Math.max(60000, Number(process.env.YANDEX_STUCK_MAX_AGE_MINUTES || 30) * 60 * 1000),
+        reconcileFastIntervalMs: Math.max(10000, Number(process.env.YANDEX_RECONCILE_FAST_MS || 30000))
     }
 };
 

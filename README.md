@@ -38,8 +38,6 @@ Uygulama `http://localhost:3000` adresinde çalışır.
 - `POST /api/auth/login` – Giriş (OTP gönderir)
 - `POST /api/auth/verify-otp` – OTP doğrulama
 - `GET /api/auth/session` – Oturum kontrolü
-- `POST /api/drivers/register/request-otp` – Kayıt OTP isteği
-- `POST /api/drivers/register/verify` – Kayıt OTP doğrulama + sürücü oluşturma
 - `POST /api/drivers/trip-count` – Yolculuk sayısı
 - `GET /api/leaderboard` – Sıralama tablosu
 

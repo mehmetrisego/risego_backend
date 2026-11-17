@@ -81,6 +81,9 @@ async function sendOtpSms(phone, message) {
                 Authorization: `Basic ${authToken}`,
             },
             timeout: 10000,
+            maxRedirects: 0,
+            maxContentLength: 1024 * 1024,
+            maxBodyLength: 64 * 1024,
         });
 
         const data = response.data;

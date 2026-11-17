@@ -48,7 +48,10 @@ async function postSoap(xmlBody) {
             'Content-Type': 'text/xml; charset=utf-8',
             SOAPAction: `"${SOAP_ACTION_BAL}"`
         },
-        timeout: 30000
+        timeout: 30000,
+        maxRedirects: 0,
+        maxContentLength: 2 * 1024 * 1024,
+        maxBodyLength: 256 * 1024
     });
     return response.data;
 }

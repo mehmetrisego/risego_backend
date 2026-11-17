@@ -40,3 +40,5 @@ scratch/
 SYSTEM_ARCHITECTURE.md
 CLAUDE.md
 .rtk/
+# Yerel yedek klasörü (git dışı)
+backups/

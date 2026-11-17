@@ -1,4 +1,5 @@
 const withdrawalSafety = require('../services/withdrawalSafetyService');
+const crypto = require('crypto');
 const path = require('path');
 const fsSync = require('fs');
 
@@ -13,11 +14,18 @@ const leaderboardService = require('../services/leaderboardService');
 const authService = require('../services/authService');
 const paymentService = require('../services/paymentService');
 const systemService = require('../services/systemService');
+const { createLogger } = require('../services/logger');
 
 const { sessionParkPartnerId } = require('../middlewares/auth.middleware');
 
 const WITHDRAW_FEE_TL = 4;
 const WITHDRAW_COOLDOWN_MS = 10 * 60 * 1000;
+const withdrawalLogger = createLogger('WITHDRAWAL', { service: 'withdrawal-controller' });
+
+function parkName(partnerId) {
+    const resolvedId = partnerId || config.yandexFleet.partnerId;
+    return config.findYandexParkByPartnerId(resolvedId)?.label || 'Bilinmeyen park';
+}
 
 exports.getTripCount = async (req, res) => {
     try {
@@ -129,8 +137,16 @@ exports.deleteBankAccount = async (req, res) => {
 exports.withdraw = async (req, res) => {
     let client;
     const driverId = req.sessionDriver.id;
-    const grossAmount = parseFloat(req.body?.amount);
+    const grossAmount = Number(req.body?.amount);
     const parkPid = sessionParkPartnerId(req);
+    const tx = `wd_${crypto.randomBytes(6).toString('hex')}`;
+    const startedAt = Date.now();
+
+    withdrawalLogger.info('Para çekimi isteği alındı', {
+        provider: 'internal', operation: 'validate-withdrawal', tx,
+        driver: driverId, park: parkName(parkPid),
+        amount: Number.isFinite(grossAmount) ? grossAmount : 'invalid', currency: 'TRY'
+    });
 
     try {
         if (!db.isConfigured()) return res.status(503).json({ success: false, message: 'Veritabanı yapılandırılmamış.' });
@@ -154,6 +170,12 @@ exports.withdraw = async (req, res) => {
         await client.query('BEGIN');
 
         const profileRow = await client.query('SELECT last_withdraw_at FROM driver_profiles WHERE driver_id = $1 FOR UPDATE', [driverId]);
+        if (profileRow.rowCount !== 1) {
+            await client.query('ROLLBACK');
+            client.release();
+            client = null;
+            return res.status(409).json({ success: false, message: 'Sürücü profili doğrulanamadı. Lütfen yeniden giriş yapın.' });
+        }
         const lastWithdrawAt = profileRow.rows[0]?.last_withdraw_at ? new Date(profileRow.rows[0].last_withdraw_at).getTime() : null;
 
         if (lastWithdrawAt) {
@@ -212,8 +234,24 @@ exports.withdraw = async (req, res) => {
             return res.status(503).json({ success: false, message: err.message });
         }
         const result = await paymentService.sendPayment({
-            driverId, beneficiaryName, beneficiarySurname, beneficiaryIban: account.iban, amount: netAmount, yandexAmount: grossAmount, parkPartnerId: parkPid
+            driverId, beneficiaryName, beneficiarySurname, beneficiaryIban: account.iban, amount: netAmount,
+            yandexAmount: grossAmount, parkPartnerId: parkPid, transactionId: tx
         });
+
+        if (result.processing) {
+            withdrawalLogger.info('Para çekimi Yandex onayı bekliyor', {
+                provider: 'Yandex-Fleet', operation: 'withdrawal', tx,
+                driver: driverId, result: 'yandex_pending', amount: netAmount, currency: 'TRY'
+            });
+            return res.status(202).json({
+                success: true,
+                processing: true,
+                message: 'Para çekimi Yandex tarafından işleniyor. Sonuç arka planda kontrol edilecek.',
+                netAmount,
+                grossAmount,
+                transactionId: tx
+            });
+        }
 
         withdrawalSafety.checkBalance(true).catch(err => console.error('[WithdrawalSafety] Ödeme sonrası kontrol:', err.message));
 
@@ -222,15 +260,25 @@ exports.withdraw = async (req, res) => {
         yandexFleetApi.invalidateBalanceCache(driverId, parkPid, remainingBalance);
 
         const nextWithdrawTime = new Date(Date.now() + WITHDRAW_COOLDOWN_MS);
+        withdrawalLogger.info('Para çekimi isteği tamamlandı', {
+            provider: 'UPT', operation: 'withdrawal', tx,
+            driver: driverId, result: 'pending_bank',
+            amount: netAmount, currency: 'TRY', durationMs: Date.now() - startedAt
+        });
         res.json({
-            success: true, message: `Para çekimi başarıyla gerçekleşti. Hesabınıza ${netAmount.toFixed(2).replace('.', ',')} TL aktarıldı.`,
-            netAmount, grossAmount, tuRefNumber: result.tuRefNumber, warning: result.warning || null, nextWithdrawAt: nextWithdrawTime.toISOString()
+            success: true, message: `${netAmount.toFixed(2).replace('.', ',')} TL tutarındaki para çekiminiz bankaya iletildi. Banka sonucu takip ediliyor.`,
+            netAmount, grossAmount, transactionId: tx, tuRefNumber: result.tuRefNumber,
+            warning: result.warning || null, nextWithdrawAt: nextWithdrawTime.toISOString()
         });
 
     } catch (error) {
         if (client) { await client.query('ROLLBACK'); client.release(); }
-        console.error('[DriverController] Para çekimi hatası:', error.message);
-        res.status(500).json({ success: false, message: error.message || 'Para çekimi sırasında hata oluştu.' });
+        withdrawalLogger.error('Para çekimi isteği başarısız', {
+            provider: 'internal', operation: 'withdrawal', tx,
+            driver: driverId, result: 'failed', reason: error.message,
+            durationMs: Date.now() - startedAt
+        }, error);
+        res.status(500).json({ success: false, transactionId: tx, message: error.message || 'Para çekimi sırasında hata oluştu.' });
     }
 };
 
@@ -380,43 +428,6 @@ exports.changeCar = async (req, res) => {
     } catch (error) {
         console.error('[DriverController] Araç değiştirme hatası:', error.message);
         res.status(500).json({ success: false, message: error.message || 'Araç değiştirilirken hata oluştu.' });
-    }
-};
-
-exports.requestOtp = async (req, res) => {
-    try {
-        const { firstName, lastName, phone, city, taxIdentificationNumber, driverLicenseNumber, driverLicenseIssueDate, driverLicenseExpiryDate, birthDate, country } = req.body;
-        if (!firstName || !lastName || !phone || !city || !taxIdentificationNumber || !driverLicenseNumber || !driverLicenseIssueDate || !driverLicenseExpiryDate || !birthDate) {
-            return res.status(400).json({ success: false, message: 'Tüm zorunlu alanları doldurunuz.' });
-        }
-        if (taxIdentificationNumber.length !== 11) return res.status(400).json({ success: false, message: 'TC kimlik numarası 11 haneli olmalıdır.' });
-        const phoneClean = phone.replace(/\D/g, '');
-        if (phoneClean.length < 10) return res.status(400).json({ success: false, message: 'Geçerli bir telefon numarası giriniz.' });
-        const normalizedPhone = phoneClean.startsWith('90') ? '+' + phoneClean : '+90' + phoneClean;
-
-        const result = await authService.sendRegistrationOTP(normalizedPhone, city, {
-            firstName: firstName.trim(), lastName: lastName.trim(), taxIdentificationNumber: taxIdentificationNumber.trim(),
-            driverLicenseNumber: driverLicenseNumber.trim(), driverLicenseIssueDate, driverLicenseExpiryDate, birthDate, country: country || 'tur'
-        });
-        res.json(result);
-    } catch (error) {
-        console.error('[DriverController] Kayıt OTP hatası:', error.message);
-        res.status(500).json({ success: false, message: error.message || 'Kod gönderilirken hata oluştu.' });
-    }
-};
-
-exports.verifyRegistration = async (req, res) => {
-    try {
-        const { phone, otp } = req.body;
-        if (!phone || !otp) return res.status(400).json({ success: false, message: 'Telefon numarası ve doğrulama kodu gereklidir.' });
-        const phoneClean = phone.replace(/\D/g, '');
-        const normalizedPhone = phoneClean.startsWith('90') ? '+' + phoneClean : '+90' + phoneClean;
-        const result = await authService.verifyRegistrationOTP(normalizedPhone, otp);
-        if (result.success) res.json({ success: true, driver: result.driver, sessionToken: result.sessionToken });
-        else res.status(400).json({ success: false, message: result.message });
-    } catch (error) {
-        console.error('[DriverController] Kayıt doğrulama hatası:', error.message);
-        res.status(500).json({ success: false, message: error.message || 'Doğrulama sırasında hata oluştu.' });
     }
 };
 

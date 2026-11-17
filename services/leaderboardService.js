@@ -34,6 +34,9 @@ const httpsAgent = new https.Agent(keepAliveAgentOptions);
 // ─── Sabitler ──────────────────────────────────────────────────────────
 const PAGE_LIMIT       = 500;              // Her sayfada max sipariş (Yandex max 1000, 500 güvenli)
 const THROTTLE_MS      = 2000;          // Sayfalar arası bekleme 2 saniye (gece sync hızlandırması için)
+// Parklar arası gecikme — eski sabit 5 dk kaldırıldı; global hız sınırlayıcı zaten
+// toplam hızı koruyor. Küçük bir nezaket boşluğu yeterli (env ile ayarlanabilir).
+const INTER_PARK_DELAY_MS = Math.max(0, Number(process.env.YANDEX_INTER_PARK_DELAY_MS || 1500));
 const MAX_RETRIES      = 5;               // Hata durumunda max yeniden deneme
 const REQUEST_TIMEOUT  = 30_000;          // 30 saniye HTTP timeout
 // DELTA_INTERVAL kaldırıldı — artık gece 06:00–07:00 bakım penceresi kullanılıyor (cronManager.js)
@@ -47,13 +50,58 @@ const COMPLETED_ORDER_STATUSES = ['complete'];
 const MONTHS = ['Ocak','Şubat','Mart','Nisan','Mayıs','Haziran',
                  'Temmuz','Ağustos','Eylül','Ekim','Kasım','Aralık'];
 
+// ─── Global hız sınırlayıcı (tüm parklar arası paylaşılan) ───────────────
+// 429'u BAŞTAN önler: toplam istek hızını Yandex limitinin altında tutar.
+// İki eksen: ardışık istek başlangıçları arası min boşluk + aynı anda uçan max istek.
+// Tüm park axios client'larına interceptor ile uygulanır (orders + profiles dahil).
+const RL_MIN_INTERVAL_MS = Math.max(0, Number(process.env.YANDEX_RL_MIN_INTERVAL_MS || 350));
+const RL_MAX_CONCURRENT  = Math.max(1, Number(process.env.YANDEX_RL_MAX_CONCURRENT || 2));
+
+let _rlActive = 0;
+let _rlLastStart = 0;
+let _rlTimer = null;
+const _rlQueue = [];
+
+function _rlPump() {
+    _rlTimer = null;
+    while (_rlQueue.length > 0 && _rlActive < RL_MAX_CONCURRENT) {
+        const gap = _rlLastStart + RL_MIN_INTERVAL_MS - Date.now();
+        if (gap > 0) {
+            if (!_rlTimer) _rlTimer = setTimeout(_rlPump, gap);
+            return;
+        }
+        _rlLastStart = Date.now();
+        _rlActive++;
+        const resolve = _rlQueue.shift();
+        resolve();
+    }
+}
+
+function _rlAcquire() {
+    return new Promise(resolve => { _rlQueue.push(resolve); _rlPump(); });
+}
+
+function _rlRelease() {
+    _rlActive = Math.max(0, _rlActive - 1);
+    _rlPump();
+}
+
+/** Bir axios client'ına global hız sınırlayıcıyı interceptor olarak bağlar */
+function _attachRateLimiter(client) {
+    client.interceptors.request.use(async (cfg) => { await _rlAcquire(); return cfg; });
+    client.interceptors.response.use(
+        (resp) => { _rlRelease(); return resp; },
+        (err) => { _rlRelease(); return Promise.reject(err); }
+    );
+}
+
 /** Park başına axios (çoklu şehir API anahtarı) */
 const parkHttpClients = new Map();
 
 function getAxiosForPark(parkSource) {
     const pid = parkSource.partnerId;
     if (!parkHttpClients.has(pid)) {
-        parkHttpClients.set(pid, axios.create({
+        const client = axios.create({
             baseURL: parkSource.baseUrl || config.yandexFleet.baseUrl,
             timeout: REQUEST_TIMEOUT,
             httpAgent,
@@ -64,7 +112,9 @@ function getAxiosForPark(parkSource) {
                 'Content-Type': 'application/json',
                 'Accept-Language': 'tr'
             }
-        }));
+        });
+        _attachRateLimiter(client);
+        parkHttpClients.set(pid, client);
     }
     return parkHttpClients.get(pid);
 }
@@ -73,6 +123,33 @@ function getAxiosForPark(parkSource) {
 
 /** Milisaniye bekler */
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// ─── Akıllı 429/5xx backoff ─────────────────────────────────────────────
+// Öncelik: sunucunun 'Retry-After' header'ı (saniye ya da HTTP-date).
+// Yoksa: üstel backoff (2,4,8,16,32s) + ±%20 jitter, 60s tavan.
+// Sabit 5 dk bekleme yerine — gece bakım penceresinin bütçesini korur.
+const BACKOFF_BASE_MS    = 2000;
+const BACKOFF_MAX_MS     = 60_000;
+const RETRY_AFTER_CAP_MS = 120_000; // Retry-After aşırı büyük gelirse pencereyi koru
+
+function _parseRetryAfterMs(headers) {
+    if (!headers) return null;
+    const raw = headers['retry-after'] ?? headers['Retry-After'];
+    if (raw == null) return null;
+    const asNum = Number(raw);
+    if (Number.isFinite(asNum)) return Math.max(0, asNum * 1000);
+    const asDate = Date.parse(raw);
+    if (!Number.isNaN(asDate)) return Math.max(0, asDate - Date.now());
+    return null;
+}
+
+function _computeBackoffMs(headers, attempt) {
+    const retryAfter = _parseRetryAfterMs(headers);
+    if (retryAfter != null) return Math.min(retryAfter, RETRY_AFTER_CAP_MS);
+    const expo = Math.min(BACKOFF_BASE_MS * Math.pow(2, attempt - 1), BACKOFF_MAX_MS);
+    const jitter = expo * (0.8 + Math.random() * 0.4); // ±%20
+    return Math.round(jitter);
+}
 
 /**
  * Date → Türkiye saatli ISO string (UTC+3)
@@ -216,8 +293,8 @@ class LeaderboardService {
 
                 if ((status === 429 || (status >= 500 && status < 600)) && retries < MAX_RETRIES) {
                     retries++;
-                    // KULLANICI TALEBİ: 429 alındığında 6s, 13s, 60s gibi kısa beklemeler yerine her zaman 5 dakika beklenmesi istendi.
-                    const wait = 300000; // Sabit 5 dakika
+                    // Akıllı backoff: Retry-After header'ı varsa ona uy; yoksa üstel backoff + jitter.
+                    const wait = _computeBackoffMs(err.response?.headers, retries);
                     console.warn(`[LeaderboardService] HTTP ${status} → ${Math.round(wait/1000)}s bekleniyor (${retries}/${MAX_RETRIES})`);
                     await sleep(wait);
                     continue; // aynı cursor ile yeniden dene
@@ -438,8 +515,8 @@ class LeaderboardService {
                     memoryAccum.push(...uniqueOrders);
                 }
                 
-                // Şehirler arası mola (Kullanıcı talebi - 5 dakika)
-                await sleep(300000); 
+                // Şehirler arası kısa gecikme (global hız sınırlayıcı asıl korumayı sağlar)
+                await sleep(INTER_PARK_DELAY_MS); 
             }
 
             if (db.isConfigured()) {
@@ -524,8 +601,8 @@ class LeaderboardService {
                     this._orders = Array.from(map.values());
                 }
 
-                // Şehirler arası mola (Kullanıcı talebi - 5 dakika)
-                await sleep(300000);
+                // Şehirler arası kısa gecikme (global hız sınırlayıcı asıl korumayı sağlar)
+                await sleep(INTER_PARK_DELAY_MS);
             }
 
             if (db.isConfigured()) {

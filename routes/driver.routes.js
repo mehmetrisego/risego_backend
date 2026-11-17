@@ -29,10 +29,6 @@ router.get('/drivers/withdraw-history', requireAuth, driverController.getWithdra
 router.post('/drivers/check-plate', requireAuth, driverController.checkPlate);
 router.post('/drivers/change-car', requireAuth, driverController.changeCar);
 
-// Registration (Public but limited by authLimiter in app.js)
-router.post('/drivers/register/request-otp', driverController.requestOtp);
-router.post('/drivers/register/verify', driverController.verifyRegistration);
-
 router.get('/drivers/car-brands', driverController.getCarBrands);
 
 // ============================================

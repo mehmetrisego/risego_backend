@@ -1,11 +1,10 @@
 module.exports = {
   apps: [{
     name: 'risego-backend',
-    script: 'npm',
-    args: 'start',
+    script: 'server.js',
 
     // ─── Log Ayarları ────────────────────────────────────────
-    log_date_format: 'YYYY-MM-DD HH:mm:ss', // Her log satırına tarih-saat damgası
+    time: false, // Zaman damgasını merkezi logger ekler; çift tarih oluşmasını önler
     error_file: '~/.pm2/logs/risego-backend-error.log',
     out_file: '~/.pm2/logs/risego-backend-out.log',
     merge_logs: true,
@@ -18,7 +17,12 @@ module.exports = {
     // ─── Ortam Değişkenleri ───────────────────────────────────
     env: {
       NODE_ENV: 'production',
-      TZ: 'Europe/Istanbul'
+      DEVMODE: 'disable',
+      ADMIN_SESSION_TTL_MS: '43200000',
+      TZ: 'Europe/Istanbul',
+      LOG_LEVEL: 'info',
+      LOG_STACK: 'true',
+      LOG_DEDUPE_WINDOW_MS: '60000'
     }
   }]
 };

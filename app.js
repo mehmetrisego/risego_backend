@@ -34,22 +34,35 @@ app.use(cors({
     credentials: true
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: '32kb' }));
 
-// Railway, Heroku gibi ortamlarda (Reverse Proxy arkasında) IP adresini doğru almak için:
-app.set('trust proxy', 1);
+// Uygulama bu sunucuda yalnızca yerel Nginx proxy'sine güvenir.
+// Nginx, X-Forwarded-For ile gerçek istemci IP'sini ilettiğinde rate limiter
+// tüm kullanıcıları 127.0.0.1 olarak değil ayrı ayrı değerlendirir.
+app.set('trust proxy', 'loopback');
 
 // Güvenlik Katmanı 3: Rate Limiting - SMS Brute Force engellemek için
 const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 10,
+    standardHeaders: 'draft-8',
+    legacyHeaders: false,
     message: { success: false, message: 'Çok fazla giriş denemesi yaptınız, lütfen daha sonra tekrar deneyin.' }
+});
+
+const otpVerifyLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 20,
+    standardHeaders: 'draft-8',
+    legacyHeaders: false,
+    message: { success: false, message: 'Çok fazla doğrulama denemesi yaptınız. Lütfen daha sonra tekrar deneyin.' }
 });
 
 // Login, OTP ve Admin limitlerini bağla
 app.use('/api/auth/login', authLimiter);
-app.use('/api/drivers/register/request-otp', authLimiter);
 app.use('/api/admin/auth/login', authLimiter);
+app.use('/api/auth/verify-otp', otpVerifyLimiter);
+app.use('/api/admin/auth/verify-otp', otpVerifyLimiter);
 
 // ─── API Routes ───
 const apiRoutes = require('./routes/index');

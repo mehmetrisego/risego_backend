@@ -12,13 +12,27 @@
  */
 
 const axios = require('axios');
+const crypto = require('crypto');
+const config = require('../config');
 const db = require('../db');
 const { deductYandexBalance } = require('./paymentService');
+const { createLogger, maskId } = require('./logger');
+
+const statusLogger = createLogger('WITHDRAWAL', { service: 'upt-status-service' });
+
+function parkName(partnerId) {
+    const resolvedId = partnerId || config.yandexFleet.partnerId;
+    return config.findYandexParkByPartnerId(resolvedId)?.label || 'Bilinmeyen park';
+}
 
 const ENDPOINT = process.env.UPTION_ENDPOINT
     || 'https://upt.aktifbank.com.tr/ISV/TU/WebServices/V1_6/CorpService.asmx';
 const USERNAME = process.env.UPTION_USERNAME;
 const PASSWORD = process.env.UPTION_PASSWORD;
+
+function stableRefundToken(transactionId) {
+    return crypto.createHash('sha256').update(`bank-return-refund:${transactionId}`).digest('hex');
+}
 
 /** Kaç dakika geçtikten sonra sorgulanmaya başlasın (EFT genellikle 5-30 dk) */
 const MIN_AGE_MINUTES = 10;
@@ -85,6 +99,9 @@ async function postSoap(soapAction, xml) {
             'SOAPAction': `"${soapAction}"`
         },
         timeout: 30000,
+        maxRedirects: 0,
+        maxContentLength: 2 * 1024 * 1024,
+        maxBodyLength: 256 * 1024,
         responseType: 'text',
         transformResponse: [d => d]
     });
@@ -154,13 +171,20 @@ async function queryRefundReason(tuRefNumber) {
  */
 async function processSinglePayment(row) {
     const { id, driver_id, tu_ref_number, gross_amount, park_partner_id } = row;
+    const tx = row.transaction_id || `wd-db-${id}`;
+    const common = {
+        tx, driver: driver_id, park: parkName(park_partner_id),
+        bankRef: maskId(tu_ref_number, 8)
+    };
 
     // ── 1. Banka durumunu sorgula
     let found, statusCode;
     try {
         ({ found, statusCode } = await queryTransferStatus(tu_ref_number));
     } catch (err) {
-        console.error(`[UptStatus] Ref ${tu_ref_number} sorgulanamadı:`, err.message);
+        statusLogger.error('Banka transfer durumu sorgulanamadı', {
+            ...common, provider: 'UPT', operation: 'query-transfer-status', reason: err.message
+        }, err);
         return;
     }
 
@@ -173,7 +197,9 @@ async function processSinglePayment(row) {
     );
 
     if (!found) {
-        console.warn(`[UptStatus] Ref ${tu_ref_number} banka sisteminde bulunamadı.`);
+        statusLogger.warn('Transfer banka sisteminde bulunamadı', {
+            ...common, provider: 'UPT', operation: 'query-transfer-status', result: 'not_found'
+        });
         return;
     }
 
@@ -185,7 +211,10 @@ async function processSinglePayment(row) {
              WHERE id = $2`,
             [statusCode, id]
         );
-        console.log(`[UptStatus] ✅ Ref ${tu_ref_number} başarıyla tamamlandı. Kod: ${statusCode}`);
+        statusLogger.info('Para çekimi banka tarafından tamamlandı', {
+            ...common, provider: 'UPT', operation: 'query-transfer-status',
+            result: 'success', bankStatus: statusCode, amount: Number(gross_amount), currency: 'TRY'
+        });
         return;
     }
 
@@ -196,29 +225,43 @@ async function processSinglePayment(row) {
         try {
             returnReasonCode = await queryRefundReason(tu_ref_number);
         } catch (err) {
-            console.warn(`[UptStatus] İade nedeni alınamadı (${tu_ref_number}):`, err.message);
+            statusLogger.warn('Banka iade nedeni alınamadı', {
+                ...common, provider: 'UPT', operation: 'query-refund-reason', reason: err.message
+            });
         }
 
         const returnReasonText = getReturnReasonText(returnReasonCode);
         const errorMessage = `Banka iadesi — ${returnReasonText}`;
 
-        console.log(`[UptStatus] ❌ Ref ${tu_ref_number} iade edildi: ${errorMessage}`);
+        statusLogger.warn('Banka transferi iade edildi', {
+            ...common, provider: 'UPT', operation: 'query-transfer-status',
+            result: 'bank_returned', bankStatus: statusCode, reason: returnReasonText
+        }, { dedupe: false });
 
         // Yandex'e geri yükle (pozitif tutar = iade)
         let yandexRefundSuccess = false;
+        // Aynı banka iadesi servis restartı/crash sonrasında yeniden görülse bile
+        // Yandex'e aynı idempotency token gönderilir; çift bakiye iadesi oluşmaz.
+        const refundIdempotencyToken = stableRefundToken(tx);
         for (let attempt = 1; attempt <= 3; attempt++) {
             try {
                 await deductYandexBalance(
                     driver_id,
                     parseFloat(gross_amount), // Pozitif = para geri ekleme
                     park_partner_id,
-                    `İADE: ${returnReasonText}`
+                    `İADE: ${returnReasonText}`,
+                    { tx, idempotencyToken: refundIdempotencyToken }
                 );
                 yandexRefundSuccess = true;
-                console.log(`[UptStatus] 🔄 Yandex iadesi başarılı (Deneme ${attempt}). Sürücü: ${driver_id}`);
+                statusLogger.info('Banka iadesi Yandex bakiyesine yüklendi', {
+                    ...common, provider: 'Yandex-Fleet', operation: 'refund-balance', result: 'success', attempt
+                });
                 break;
             } catch (refundErr) {
-                console.error(`[UptStatus] ⚠️ Yandex iadesi denemesi ${attempt}/3 başarısız:`, refundErr.message);
+                statusLogger.error('Banka iadesi Yandex bakiyesine yüklenemedi', {
+                    ...common, provider: 'Yandex-Fleet', operation: 'refund-balance',
+                    result: 'failed', attempt: `${attempt}/3`, reason: refundErr.message
+                }, refundErr);
                 if (attempt < 3) await new Promise(r => setTimeout(r, 3000));
             }
         }
@@ -228,16 +271,18 @@ async function processSinglePayment(row) {
             ? errorMessage
             : `KRİTİK — YANDEX İADESİ BAŞARISIZ — ${errorMessage}`;
 
+        const finalStatus = yandexRefundSuccess ? 'bank_returned' : 'bank_returned_refund_pending';
         await db.query(`
             UPDATE payment_logs
-            SET status                 = 'bank_returned',
-                return_reason_code     = $1,
-                error_message          = $2,
-                bank_status_code       = $3,
+            SET status                 = $1,
+                return_reason_code     = $2,
+                error_message          = $3,
+                bank_status_code       = $4,
                 bank_status_checked_at = NOW(),
-                yandex_refund_at       = $4
-            WHERE id = $5
+                yandex_refund_at       = $5
+            WHERE id = $6
         `, [
+            finalStatus,
             returnReasonCode,
             finalErrorMsg,
             statusCode,
@@ -246,13 +291,18 @@ async function processSinglePayment(row) {
         ]);
 
         if (!yandexRefundSuccess) {
-            console.error(`[UptStatus] 🚨 KRİTİK: id=${id} için Yandex iadesi 3 denemede de başarısız oldu! Manuel müdahale gerekiyor.`);
+            statusLogger.error('KRİTİK: Banka iadesi Yandex bakiyesine yüklenemedi', {
+                ...common, provider: 'Yandex-Fleet', operation: 'refund-balance',
+                result: 'manual_action_required', attempts: 3
+            }, null, { dedupe: false });
         }
         return;
     }
 
     // ── 4. Hâlâ işlemde (TR000, TR001, TR004, TR008 vb.) → bekle
-    console.log(`[UptStatus] ⏳ Ref ${tu_ref_number} hâlâ işlemde. Kod: ${statusCode}`);
+    statusLogger.debug('Banka transferi hâlâ işlemde', {
+        ...common, provider: 'UPT', operation: 'query-transfer-status', result: 'pending', bankStatus: statusCode
+    });
 }
 
 // ─── Ana Fonksiyon: Tüm Bekleyenleri Kontrol Et ──────────────────────────────
@@ -269,7 +319,7 @@ async function checkPendingPayments() {
         const result = await db.query(`
             SELECT id, driver_id, tu_ref_number, gross_amount, park_partner_id, created_at
             FROM payment_logs
-            WHERE status = 'pending_bank'
+            WHERE status IN ('pending_bank', 'bank_unknown', 'bank_returned_refund_pending')
               AND tu_ref_number IS NOT NULL
               AND created_at < NOW() - INTERVAL '${MIN_AGE_MINUTES} minutes'
             ORDER BY created_at ASC
@@ -277,16 +327,23 @@ async function checkPendingPayments() {
         `);
         rows = result.rows;
     } catch (err) {
-        console.error('[UptStatus] Bekleyen kayıtlar sorgulanamadı:', err.message);
+        statusLogger.error('Bekleyen para çekimleri veritabanından okunamadı', {
+            provider: 'Railway-PostgreSQL', operation: 'list-pending-withdrawals', reason: err.message
+        }, err);
         return;
     }
 
     if (rows.length === 0) {
-        console.log('[UptStatus] Kontrol edilecek bekleyen işlem yok.');
+        statusLogger.debug('Kontrol edilecek bekleyen para çekimi yok', {
+            provider: 'Railway-PostgreSQL', operation: 'list-pending-withdrawals', count: 0
+        });
         return;
     }
 
-    console.log(`[UptStatus] ${rows.length} bekleyen işlem kontrol ediliyor...`);
+    const batchStartedAt = Date.now();
+    statusLogger.info('Bekleyen para çekimleri kontrol ediliyor', {
+        provider: 'UPT', operation: 'check-pending-withdrawals', count: rows.length
+    });
 
     for (const row of rows) {
         try {
@@ -294,11 +351,17 @@ async function checkPendingPayments() {
             // Rate limiting — Uption API'ye çok hızlı istek atmamak için
             await new Promise(r => setTimeout(r, 500));
         } catch (err) {
-            console.error(`[UptStatus] İşlem hatası (id=${row.id}):`, err.message);
+            statusLogger.error('Bekleyen para çekimi kontrol edilemedi', {
+                provider: 'UPT', operation: 'check-pending-withdrawal',
+                tx: `wd-db-${row.id}`, reason: err.message
+            }, err);
         }
     }
 
-    console.log('[UptStatus] Kontrol tamamlandı.');
+    statusLogger.info('Bekleyen para çekimi kontrolü tamamlandı', {
+        provider: 'UPT', operation: 'check-pending-withdrawals',
+        count: rows.length, durationMs: Date.now() - batchStartedAt
+    });
 }
 
 /**
@@ -371,13 +434,16 @@ async function syncRefundsFromBank() {
                     const finalErrorMsg = `Banka iadesi: ${returnReasonText}`;
                     
                     let yandexRefundSuccess = false;
+                    const refundTx = fakeRow.transaction_id || `wd-db-${fakeRow.id}`;
+                    const refundIdempotencyToken = stableRefundToken(refundTx);
                     for (let attempt = 1; attempt <= 3; attempt++) {
                         try {
                             await deductYandexBalance(
                                 fakeRow.driver_id,
                                 parseFloat(fakeRow.gross_amount), 
                                 fakeRow.park_partner_id,
-                                `İADE: ${returnReasonText}`
+                                `İADE: ${returnReasonText}`,
+                                { tx: refundTx, idempotencyToken: refundIdempotencyToken }
                             );
                             console.log(`[UptStatus] 🔄 Gecikmeli iade (Ref ${tuRefNumber}): Bakiye başarıyla geri yüklendi.`);
                             yandexRefundSuccess = true;
@@ -388,16 +454,18 @@ async function syncRefundsFromBank() {
                         }
                     }
                     
+                    const finalStatus = yandexRefundSuccess ? 'bank_returned' : 'bank_returned_refund_pending';
                     await db.query(`
                         UPDATE payment_logs 
-                        SET status = 'bank_returned',
-                            return_reason_code = $1,
-                            error_message = $2,
+                        SET status = $1,
+                            return_reason_code = $2,
+                            error_message = $3,
                             bank_status_code = 'TR005C',
-                            yandex_refund_at = $3,
+                            yandex_refund_at = $4,
                             updated_at = NOW()
-                        WHERE id = $4
+                        WHERE id = $5
                     `, [
+                        finalStatus,
                         returnReasonCode,
                         finalErrorMsg,
                         yandexRefundSuccess ? new Date() : null,
@@ -421,5 +489,6 @@ module.exports = {
     getReturnReasonText,
     RETURN_REASON_MAP,
     FINAL_SUCCESS_CODES,
-    FINAL_CANCEL_CODES
+    FINAL_CANCEL_CODES,
+    _test: { stableRefundToken }
 };

@@ -15,6 +15,12 @@ exports.login = async (req, res) => {
         res.json(result);
     } catch (error) {
         console.error('[AuthController] Login hatası:', error.message);
+        if (error.code === 'DATABASE_UNAVAILABLE' || error.statusCode === 503) {
+            return res.status(error.statusCode || 503).json({
+                success: false,
+                message: error.message
+            });
+        }
         res.status(500).json({ success: false, message: 'Sunucu hatası oluştu. Lütfen tekrar deneyin.' });
     }
 };
@@ -50,6 +56,12 @@ exports.getSession = async (req, res) => {
         }
     } catch (error) {
         console.error('[AuthController] Session doğrulama hatası:', error.message);
+        if (error.code === 'DATABASE_UNAVAILABLE' || error.statusCode === 503) {
+            return res.status(error.statusCode || 503).json({
+                success: false,
+                message: error.message
+            });
+        }
         res.json({ success: false });
     }
 };

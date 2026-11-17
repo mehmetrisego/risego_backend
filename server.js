@@ -1,7 +1,10 @@
 // Sunucunun saat dilimini Türkiye (İstanbul) olarak ayarla
 process.env.TZ = 'Europe/Istanbul';
 
-require('dotenv').config();
+require('dotenv').config({ quiet: true });
+const { installConsoleBridge, createLogger } = require('./services/logger');
+installConsoleBridge();
+const serverLogger = createLogger('SERVER', { service: 'api-server', provider: 'internal' });
 // Express setup moved to app.js
 const config = require('./config');
 const yandexFleetApi      = require('./services/yandexFleetApi');
@@ -32,19 +35,24 @@ const cronManager = require('./jobs/cronManager');
 // 1. Beklenmedik hata yakalayıcılar (Unhandled Rejections / Uncaught Exceptions)
 // Sunucunun herhangi bir asenkron hata yüzünden aniden kapanmasını engeller.
 process.on('unhandledRejection', (reason, promise) => {
-    console.error('[CRITICAL] Yakalanamayan Asenkron Hata (Unhandled Rejection):', reason);
+    serverLogger.error('Yakalanamayan asenkron hata', { operation: 'unhandled-rejection', reason: reason?.message || String(reason) }, reason instanceof Error ? reason : null);
+    // Bilinmeyen durumda çalışmaya devam etmek finansal süreçlerde güvenli değildir.
+    // PM2 temiz bir process başlatır; kalıcı işler DB durumundan devam eder.
+    setImmediate(() => process.exit(1));
 });
 
 process.on('uncaughtException', (error) => {
-    console.error('[CRITICAL] Yakalanamayan İstisna (Uncaught Exception):', error);
-    // Ciddi hatalarda sunucuyu kapatıp PM2/Railway gibi araçların restart atmasını sağlamak gerekebilir.
-    // Ancak basit hatalarda sistemi ayakta tutmak için sadece logluyoruz.
+    serverLogger.error('Yakalanamayan istisna', { operation: 'uncaught-exception', reason: error.message }, error);
+    setImmediate(() => process.exit(1));
 });
 
 // 2. Nazik Kapanış (Graceful Shutdown)
 // Sunucu kapatılırken (deployment veya manuel stop) DB bağlantılarını ve cronları kapatır.
+let shutdownStarted = false;
 async function gracefulShutdown(signal) {
-    console.log(`\n[Server] ${signal} sinyali alındı. Sunucu kapatılıyor...`);
+    if (shutdownStarted) return;
+    shutdownStarted = true;
+    serverLogger.info('Sunucu kapatılıyor', { operation: 'shutdown', signal });
     
     // Cron görevlerini durdur
     cronManager.stopAllCrons();
@@ -54,7 +62,7 @@ async function gracefulShutdown(signal) {
         await db.closePool();
     }
 
-    console.log('[Server] Güvenli bir şekilde kapatıldı. Hoşça kalın!');
+    serverLogger.info('Sunucu güvenli şekilde kapatıldı', { operation: 'shutdown' });
     process.exit(0);
 }
 
@@ -210,21 +218,11 @@ async function startServer() {
     }
 
     app.listen(PORT, '0.0.0.0', () => {
-        console.log('='.repeat(50));
-        console.log(`  RiseGo Backend - Yandex Fleet Sürücü Sistemi`);
-        console.log(`  Sunucu http://0.0.0.0:${PORT} adresinde çalışıyor`);
-        console.log(`  Yerel ağ erişimi: http://192.168.1.102:${PORT}/api`);
-        console.log(`  Veritabanı: ${db.isConfigured() ? 'PostgreSQL (aktif)' : 'Bellek (fallback)'}`);
-        console.log('='.repeat(50));
-        console.log('\nKullanılabilir endpointler:');
-        console.log(`  GET  http://localhost:${PORT}/                    - API bilgisi`);
-        console.log(`  GET  http://localhost:${PORT}/api/health          - Sunucu durumu`);
-        console.log(`  POST http://localhost:${PORT}/api/auth/login      - Giriş (telefon + şehir)`);
-        console.log(`  POST http://localhost:${PORT}/api/auth/verify-otp - OTP doğrulama`);
-        console.log(`  POST http://localhost:${PORT}/api/drivers/trip-count - Dönem bazlı yolculuk sayısı`);
-        console.log(`  GET  http://localhost:${PORT}/api/drivers         - Detaylı sürücü bilgileri`);
-        console.log(`  GET  http://localhost:${PORT}/api/drivers/fetch   - Hızlı sürücü profilleri`);
-        console.log('');
+        serverLogger.info('Uygulama hazır', {
+            operation: 'listen', port: PORT,
+            database: db.isConfigured() ? 'postgresql' : 'memory-fallback',
+            logLevel: process.env.LOG_LEVEL || 'info'
+        });
 
         cronManager.startAllCrons();
     });
