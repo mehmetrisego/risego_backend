@@ -8,7 +8,10 @@ const BATCH_SIZE = 50;
 // 0 = başarı gelene kadar sınırsız deneme. Tek seferlik bakım scriptinde
 // varsayılan budur; pozitif SYNC_MAX_ATTEMPTS ile sınırlandırılabilir.
 const configuredMaxAttempts = Number(process.env.SYNC_MAX_ATTEMPTS || 0);
-const MAX_ATTEMPTS = configuredMaxAttempts > 0 ? Math.floor(configuredMaxAttempts) : Infinity;
+// Park seviyesi tekrar sayısı: genuine hata için sonlu (eskiden Infinity idi → sonsuz döngü riski).
+const MAX_ATTEMPTS = configuredMaxAttempts > 0 ? Math.floor(configuredMaxAttempts) : 4;
+// Tek sayfa (offset) için azami 429 denemesi; limit dolunca o sayfa atlanır, sonraki parka geçilir.
+const PAGE_MAX_ATTEMPTS = Math.max(1, Number(process.env.SYNC_PAGE_MAX_ATTEMPTS || 8));
 const RATE_LIMIT_DELAY_MS = Math.max(
     60 * 1000,
     Number(process.env.SYNC_RATE_LIMIT_DELAY_MS || 5 * 60 * 1000)
@@ -33,7 +36,7 @@ function retryDelayMs(error, attempt) {
     return Math.min(30_000 * (2 ** (attempt - 1)), RATE_LIMIT_DELAY_MS);
 }
 
-async function fetchProfilesWithRetry(park, onPageComplete) {
+async function fetchProfilesWithRetry(park, onPageComplete, onPageSkip) {
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         try {
             return await yandexFleetApi.fetchDriverProfilesForParkSource(park, {
@@ -42,7 +45,7 @@ async function fetchProfilesWithRetry(park, onPageComplete) {
                 // silinmediği için geçmiş kullanıcı verileri korunur.
                 workStatuses: ['working'],
                 pageRetryDelayMs: RATE_LIMIT_DELAY_MS,
-                maxPageAttempts: Infinity,
+                maxPageAttempts: PAGE_MAX_ATTEMPTS,
                 onPageComplete: async page => {
                     console.log(
                         `[DriverProfileSync] ${park.label}: sayfa tamamlandı ` +
@@ -55,6 +58,9 @@ async function fetchProfilesWithRetry(park, onPageComplete) {
                         `[DriverProfileSync] ${park.label}: offset=${offset} sayfası 429 aldı ` +
                         `(deneme ${pageAttempt}); ${Math.ceil(delayMs / 1000)} saniye sonra yalnızca bu sayfa yeniden denenecek.`
                     );
+                },
+                onPageSkip: info => {
+                    if (typeof onPageSkip === 'function') onPageSkip(info);
                 }
             });
         } catch (error) {
@@ -127,6 +133,8 @@ async function syncPark(park) {
     let profileCount = 0;
     let upserted = 0;
     let skipped = 0;
+    let skippedPages = 0;
+    const skippedOffsets = [];
 
     await fetchProfilesWithRetry(park, async ({ profiles, offset }) => {
         profileCount += profiles.length;
@@ -145,6 +153,13 @@ async function syncPark(park) {
             `[DriverProfileSync] ${park.label}: offset=${offset} Railway'e yazıldı ` +
             `(toplam yazılan=${upserted}, atlanan=${skipped})`
         );
+    }, ({ offset, attempts }) => {
+        skippedPages++;
+        skippedOffsets.push(offset);
+        console.warn(
+            `[DriverProfileSync] ${park.label}: offset=${offset} ${attempts} denemede alınamadı ` +
+            `— SAYFA ATLANDI (sonraki tura bırakıldı).`
+        );
     });
 
     const countResult = await db.query(
@@ -153,9 +168,10 @@ async function syncPark(park) {
     );
     console.log(
         `[DriverProfileSync] ${park.label}: Yandex=${profileCount}, ` +
-        `yazılan=${upserted}, atlanan=${skipped}, DB=${countResult.rows[0].count}`
+        `yazılan=${upserted}, atlanan=${skipped}, atlanan_sayfa=${skippedPages}` +
+        `${skippedPages ? ` (offsetler: ${skippedOffsets.join(', ')})` : ''}, DB=${countResult.rows[0].count}`
     );
-    return { profiles: profileCount, upserted, skipped };
+    return { profiles: profileCount, upserted, skipped, skippedPages };
 }
 
 async function main() {
@@ -173,7 +189,7 @@ async function main() {
     if (requestedParkIds.length && parks.length !== requestedParkIds.length) {
         throw new Error('SYNC_PARK_IDS içinde bilinmeyen park kimliği var.');
     }
-    const totals = { profiles: 0, upserted: 0, skipped: 0, failedParks: 0 };
+    const totals = { profiles: 0, upserted: 0, skipped: 0, skippedPages: 0, failedParks: 0 };
     console.log(`[DriverProfileSync] ${parks.length} park için tam senkronizasyon başlıyor.`);
 
     for (const park of parks) {
@@ -182,6 +198,7 @@ async function main() {
             totals.profiles += result.profiles;
             totals.upserted += result.upserted;
             totals.skipped += result.skipped;
+            totals.skippedPages += result.skippedPages || 0;
         } catch (error) {
             totals.failedParks++;
             console.error(

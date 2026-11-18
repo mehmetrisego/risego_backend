@@ -16,6 +16,26 @@ const httpsAgent = new https.Agent(keepAliveAgentOptions);
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+// ─── Akıllı 429 backoff (profil sayfalama denetimi) ────────────────────
+// Retry-After header'ı varsa ona uyar; yoksa üstel backoff + jitter (2,4,8,16,32s, 60s tavan).
+// Eski sabit 5 dk bekleme yerine — gece bakım penceresinin (06:00-06:58) bütçesini korur.
+function _parseRetryAfterMs(headers) {
+    if (!headers) return null;
+    const raw = headers['retry-after'] ?? headers['Retry-After'];
+    if (raw == null) return null;
+    const n = Number(raw);
+    if (Number.isFinite(n)) return Math.max(0, n * 1000);
+    const d = Date.parse(raw);
+    if (!Number.isNaN(d)) return Math.max(0, d - Date.now());
+    return null;
+}
+function _computeProfileBackoffMs(error, attempt) {
+    const ra = _parseRetryAfterMs(error && error.response && error.response.headers);
+    if (ra != null) return Math.min(ra, 120000);
+    const expo = Math.min(2000 * Math.pow(2, attempt - 1), 60000);
+    return Math.round(expo * (0.8 + Math.random() * 0.4));
+}
+
 // Rusça renk isimlerini Türkçe'ye çevir
 const COLOR_MAP = {
     'Желтый': 'Sarı',
@@ -154,6 +174,7 @@ class YandexFleetApi {
         const limit = 1000;
         let hasMore = true;
         let pagesProcessed = 0;
+        let lastKnownTotal = 0;
         const maxPages = options.maxPages === Infinity
             ? Infinity
             : Math.max(1, Number(options.maxPages || Infinity));
@@ -182,8 +203,9 @@ class YandexFleetApi {
                 await sleep(1500); // 1.5s delay between pages to prevent 429
             }
             let response;
+            let pageSkipped = false;
             let pageAttempt = 0;
-            while (!response) {
+            while (!response && !pageSkipped) {
                 pageAttempt++;
                 try {
                     // Global throttle üzerinden geçir
@@ -202,16 +224,38 @@ class YandexFleetApi {
                     ));
                 } catch (error) {
                     const isRateLimit = error.response?.status === 429 || String(error.message).includes('429');
-                    if (!isRateLimit || pageRetryDelayMs <= 0 || pageAttempt >= maxPageAttempts) throw error;
-                    if (options.deadlineAt && Date.now() + pageRetryDelayMs >= options.deadlineAt) throw error;
-                    if (typeof options.onPageRetry === 'function') {
-                        options.onPageRetry({ offset, limit, attempt: pageAttempt, delayMs: pageRetryDelayMs, error });
+                    // Gerçek hata veya retry kapalı → yukarı fırlat (park yeniden denenir).
+                    if (!isRateLimit || pageRetryDelayMs <= 0) throw error;
+                    // Sayfa deneme limiti doldu → SADECE bu sayfayı atla, sonraki sayfaya geç
+                    // (tüm park tıkanmasın; atlanan sayfa bir sonraki turda toplanır).
+                    if (pageAttempt >= maxPageAttempts) {
+                        pageSkipped = true;
+                        if (typeof options.onPageSkip === 'function') {
+                            options.onPageSkip({ offset, limit, attempts: pageAttempt, error });
+                        }
+                        break;
                     }
-                    await sleep(pageRetryDelayMs);
+                    // Akıllı backoff: Retry-After'a uyar, yoksa üstel (sabit 5 dk kaldırıldı).
+                    const waitMs = _computeProfileBackoffMs(error, pageAttempt);
+                    if (options.deadlineAt && Date.now() + waitMs >= options.deadlineAt) throw error;
+                    if (typeof options.onPageRetry === 'function') {
+                        options.onPageRetry({ offset, limit, attempt: pageAttempt, delayMs: waitMs, error });
+                    }
+                    await sleep(waitMs);
                 }
             }
 
+            if (pageSkipped) {
+                if (lastKnownTotal && offset + limit >= lastKnownTotal) {
+                    hasMore = false;
+                } else {
+                    offset += limit;
+                }
+                continue;
+            }
+
             const data = response.data;
+            lastKnownTotal = data.total || lastKnownTotal;
             const drivers = data.driver_profiles || [];
             allDrivers.push(...drivers);
             pagesProcessed++;
