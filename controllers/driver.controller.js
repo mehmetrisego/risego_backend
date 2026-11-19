@@ -233,6 +233,12 @@ exports.withdraw = async (req, res) => {
             await db.query('UPDATE driver_profiles SET last_withdraw_at = $1 WHERE driver_id = $2', [profileRow.rows[0]?.last_withdraw_at || null, driverId]);
             return res.status(503).json({ success: false, message: err.message });
         }
+        // Havuz (Uption) bakiyesi islem tutarini karsiliyor mu? Karsilamiyorsa hic istek atma (TR000 olusmasin).
+        try { await withdrawalSafety.assertSufficientBalance(netAmount); }
+        catch (err) {
+            await db.query('UPDATE driver_profiles SET last_withdraw_at = $1 WHERE driver_id = $2', [profileRow.rows[0]?.last_withdraw_at || null, driverId]);
+            return res.status(err.status || 503).json({ success: false, message: err.message });
+        }
         const result = await paymentService.sendPayment({
             driverId, beneficiaryName, beneficiarySurname, beneficiaryIban: account.iban, amount: netAmount,
             yandexAmount: grossAmount, parkPartnerId: parkPid, transactionId: tx
