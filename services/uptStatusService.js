@@ -36,6 +36,12 @@ function stableRefundToken(transactionId) {
 
 /** Kaç dakika geçtikten sonra sorgulanmaya başlasın (EFT genellikle 5-30 dk) */
 const MIN_AGE_MINUTES = 10;
+// Bankada HIC bulunmayan (timeout dogrulanan) kayitlar icin otomatik iade yas kapisi.
+// Gecici sorgu/propagasyon hatasina karsi: kayit en az bu kadar eski DEGILSE iade edilmez.
+const REFUND_NOT_FOUND_AGE_MINUTES = Math.max(30, Number(process.env.UPT_UNKNOWN_REFUND_AGE_MIN || 120));
+// KESIM TARIHI: bu otomatik kurtarma/iade mantigi YALNIZCA bu andan SONRA olusan islemlere uygulanir.
+// Mevcut (eski) bank_unknown backlog'u otomasyona GIRMEZ; onlar manuel/Uption yazismasiyla yonetilir.
+const RECOVER_SINCE_ISO = process.env.UPT_RECOVER_SINCE || '2026-11-19T13:44:00Z';
 
 // ─── Uption Durum Kodu Kümeleri ──────────────────────────────────────────────
 
@@ -137,6 +143,33 @@ async function queryTransferStatus(tuRefNumber) {
 
     const statusCode = extractTag(responseText, 'STATUS');
     return { found: true, statusCode };
+}
+
+// ─── Uption: CORRESPONDENT_REF ile sorgula (UPTREF kurtarma) ─────────────────
+// Timeout aninda UPTREF'i alamadigimiz kayitlar icin bizim referansimizla (wd_...) sorar.
+async function queryByCorrespondentRef(corrRef) {
+    const xml = `<?xml version="1.0" encoding="utf-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:tem="http://tempuri.org/">
+  <soapenv:Header>
+    <tem:WsSystemUserInfo>
+      <tem:Username>${USERNAME}</tem:Username>
+      <tem:Password>${PASSWORD}</tem:Password>
+    </tem:WsSystemUserInfo>
+  </soapenv:Header>
+  <soapenv:Body>
+    <tem:GetTransferList>
+      <tem:obj>
+        <tem:CORRESPONDENT_REF>${corrRef}</tem:CORRESPONDENT_REF>
+      </tem:obj>
+    </tem:GetTransferList>
+  </soapenv:Body>
+</soapenv:Envelope>`;
+    const responseText = await postSoap('http://tempuri.org/GetTransferList', xml);
+    const response = extractTag(responseText, 'RESPONSE');
+    const uptref = extractTag(responseText, 'UPTREF');
+    if (response !== 'Success' || !uptref) return { found: false, uptref: null, statusCode: null };
+    const statusCode = extractTag(responseText, 'STATUS');
+    return { found: true, uptref, statusCode };
 }
 
 // ─── Uption: İade Nedeni Sorgula ─────────────────────────────────────────────
@@ -311,8 +344,120 @@ async function processSinglePayment(row) {
  * DB'deki 'pending_bank' kayıtlarını toplu kontrol eder.
  * Her 15 dakikada bir çağrılmak üzere tasarlanmıştır.
  */
+// ─── tu_ref_number'i BOS (timeout) bank_unknown kayitlarini kurtar ───────────
+// Mevcut reconciliation yalnizca tu_ref_number dolu kayitlari yokluyordu; timeout
+// vakalari UPTREF'siz kaldigi icin hic islenmiyordu. Burada CORRESPONDENT_REF ile
+// UPTREF kurtarilir (bulunursa banka takibine alinir); bankada yoksa yas kapisi
+// gecildiyse Yandex iadesi yapilir.
+async function recoverUnreferencedUnknowns() {
+    if (!db.isConfigured()) return;
+    let rows;
+    try {
+        const result = await db.query(`
+            SELECT id, driver_id, transaction_id, gross_amount, park_partner_id, created_at
+            FROM payment_logs
+            WHERE status = 'bank_unknown'
+              AND tu_ref_number IS NULL
+              AND transaction_id IS NOT NULL
+              AND created_at >= '${RECOVER_SINCE_ISO}'::timestamptz
+              AND created_at < NOW() - INTERVAL '${MIN_AGE_MINUTES} minutes'
+            ORDER BY created_at ASC
+            LIMIT 50
+        `);
+        rows = result.rows;
+    } catch (err) {
+        statusLogger.error('tu_ref_number siz bank_unknown kayitlari okunamadi', {
+            provider: 'Railway-PostgreSQL', operation: 'list-unreferenced-unknowns', reason: err.message
+        }, err);
+        return;
+    }
+    if (!rows.length) return;
+    statusLogger.info('UPTREF kurtarma taramasi basladi', {
+        provider: 'UPT', operation: 'recover-unreferenced', count: rows.length
+    });
+
+    for (const row of rows) {
+        try {
+            const q = await queryByCorrespondentRef(row.transaction_id);
+            if (q.found) {
+                // Bankada VAR → UPTREF'i yaz, pending_bank'e al. Ana dongu bu dongude devralir.
+                await db.query(
+                    `UPDATE payment_logs SET tu_ref_number = $1, bank_status_code = $2,
+                       status = 'pending_bank', bank_status_checked_at = NOW(), updated_at = NOW()
+                     WHERE id = $3 AND tu_ref_number IS NULL`,
+                    [q.uptref, q.statusCode || null, row.id]
+                );
+                statusLogger.info('UPTREF kurtarildi; kayit banka takibine alindi', {
+                    provider: 'UPT', operation: 'recover-uptref', tx: row.transaction_id,
+                    bankRef: maskId(q.uptref, 8), result: q.statusCode || 'unknown'
+                });
+            } else {
+                // Bankada YOK. Yas kapisi gecildiyse (ve 2. teyit de yoksa) Yandex iadesi yap.
+                const ageMin = (Date.now() - new Date(row.created_at).getTime()) / 60000;
+                if (ageMin < REFUND_NOT_FOUND_AGE_MINUTES) {
+                    statusLogger.debug('Bankada yok ama yas kapisi gecilmedi; bekleniyor', {
+                        provider: 'UPT', operation: 'recover-unreferenced', tx: row.transaction_id, ageMin: Math.round(ageMin)
+                    });
+                    await new Promise(r => setTimeout(r, 500));
+                    continue;
+                }
+                // Ikinci teyit: gecici sorgu hatasina karsi bir kez daha sor.
+                const q2 = await queryByCorrespondentRef(row.transaction_id);
+                if (q2.found) {
+                    await db.query(
+                        `UPDATE payment_logs SET tu_ref_number = $1, bank_status_code = $2,
+                           status = 'pending_bank', bank_status_checked_at = NOW(), updated_at = NOW()
+                         WHERE id = $3 AND tu_ref_number IS NULL`,
+                        [q2.uptref, q2.statusCode || null, row.id]
+                    );
+                    statusLogger.info('UPTREF 2. teyitte kurtarildi', {
+                        provider: 'UPT', operation: 'recover-uptref', tx: row.transaction_id, bankRef: maskId(q2.uptref, 8)
+                    });
+                    await new Promise(r => setTimeout(r, 500));
+                    continue;
+                }
+                // Iki teyitte de bankada yok → transfer olusmamis → Yandex iadesi (idempotent token).
+                const refundToken = stableRefundToken(row.transaction_id);
+                try {
+                    await deductYandexBalance(
+                        row.driver_id,
+                        parseFloat(row.gross_amount),
+                        row.park_partner_id,
+                        'IADE: Banka transferi olusmadi (timeout; bankada kayit yok)',
+                        { tx: row.transaction_id, idempotencyToken: refundToken }
+                    );
+                    await db.query(
+                        `UPDATE payment_logs SET status = 'refunded', yandex_refund_at = NOW(), updated_at = NOW(),
+                           error_message = COALESCE(error_message, '') || ' | OTO-IADE: bankada kayit yok, Yandex iade edildi'
+                         WHERE id = $1 AND status = 'bank_unknown'`,
+                        [row.id]
+                    );
+                    statusLogger.info('Bankada olmayan islem icin Yandex iadesi yapildi', {
+                        provider: 'Yandex-Fleet', operation: 'refund-balance', tx: row.transaction_id,
+                        result: 'success', amount: parseFloat(row.gross_amount)
+                    });
+                } catch (refundErr) {
+                    statusLogger.error('Bankada olmayan islem iadesi basarisiz; manuel', {
+                        provider: 'Yandex-Fleet', operation: 'refund-balance', tx: row.transaction_id,
+                        result: 'manual_action_required', reason: refundErr.message
+                    }, refundErr, { dedupe: false });
+                }
+            }
+            await new Promise(r => setTimeout(r, 500));
+        } catch (err) {
+            statusLogger.error('UPTREF kurtarma kaydi islenemedi', {
+                provider: 'UPT', operation: 'recover-unreferenced', tx: row.transaction_id, reason: err.message
+            }, err);
+        }
+    }
+}
+
 async function checkPendingPayments() {
     if (!db.isConfigured()) return;
+
+    // Once timeout kaynakli (tu_ref_number bos) bank_unknown kayitlarini kurtar/iade et.
+    try { await recoverUnreferencedUnknowns(); }
+    catch (err) { statusLogger.error('UPTREF kurtarma taramasi hata', { provider: 'UPT', operation: 'recover-unreferenced', reason: err.message }, err); }
 
     let rows;
     try {
@@ -484,6 +629,8 @@ async function syncRefundsFromBank() {
 
 module.exports = {
     checkPendingPayments,
+    recoverUnreferencedUnknowns,
+    queryByCorrespondentRef,
     processSinglePayment,
     syncRefundsFromBank,
     getReturnReasonText,
