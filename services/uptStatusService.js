@@ -467,7 +467,9 @@ async function checkPendingPayments() {
             WHERE status IN ('pending_bank', 'bank_unknown', 'bank_returned_refund_pending')
               AND tu_ref_number IS NOT NULL
               AND created_at < NOW() - INTERVAL '${MIN_AGE_MINUTES} minutes'
-            ORDER BY created_at ASC
+            -- Hic kontrol edilmeyen once, sonra en uzun suredir kontrol edilmeyen:
+            -- askida kalan (TR000) eski kayitlar yeni islemlerin onunu tikamasin.
+            ORDER BY bank_status_checked_at ASC NULLS FIRST, created_at ASC
             LIMIT 50
         `);
         rows = result.rows;
