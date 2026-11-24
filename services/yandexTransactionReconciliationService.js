@@ -167,7 +167,9 @@ async function reconcilePendingTransactions() {
                 // Hâlâ in_progress/unknown → takılma eşiği kontrolü
                 const attempts = (Number(row.yandex_attempt_count) || 0) + 1; // saveStatus +1 artırdı
                 const freshAge = Date.now() - new Date(row.created_at).getTime();
-                if (attempts >= STUCK_MAX_ATTEMPTS || freshAge >= STUCK_MAX_AGE_MS) {
+                // Yalnizca yasa bak: yandex_attempt_count istek sirasindaki durum sorgularini da
+                // sayiyor; deneme sayisina gore eskalasyon islemi ~40 sn'de yanlislikla kenara aliyordu.
+                if (freshAge >= STUCK_MAX_AGE_MS) {
                     if (await escalateStuck(row, state.status, attempts, freshAge)) {
                         stuck.push({ tx: row.transaction_id, amount: Number(row.gross_amount) });
                     }
