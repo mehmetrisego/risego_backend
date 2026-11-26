@@ -13,7 +13,7 @@ let running = false;
 // ─── Takılma (stuck) eşikleri ────────────────────────────────────────────────
 // Bir Yandex işlemi bu kadar denemeye RAĞMEN hâlâ terminal duruma (success/fail)
 // ulaşmadıysa veya bu yaştan daha eskiyse, otomatik karar VERİLMEZ; kayıt
-// 'yandex_stuck_review' olarak manuel incelemeye alınır ve SMS alarmı gönderilir.
+// kayıt TAKİPTE KALIR ve bir kez SMS alarmı gönderilir; Yandex sonuçlandırınca akış otomatik devam eder.
 const STUCK_MAX_ATTEMPTS = config.alerts?.stuckMaxAttempts || 20;
 const STUCK_MAX_AGE_MS = config.alerts?.stuckMaxAgeMs || 30 * 60 * 1000;
 const ALERT_PHONE = config.alerts?.phone || '';
@@ -85,26 +85,26 @@ async function continueWithBank(row) {
 }
 
 // ─── Takılan işlemi manuel incelemeye al ─────────────────────────────────────
-// status'ü 'yandex_stuck_review' yapar → reconcile sorgusu artık bu kaydı
-// SEÇMEZ (sonsuz sessiz döngü biter). Para güvenliği: otomatik success/fail
-// kararı verilmez; idempotency token korunur, insan uzlaştırır.
+// Kaydın status'ü DEĞİŞMEZ (yandex_pending kalır, takip sürer). Yalnızca bir kez
+// alarm üretilir; işaret error_message'a yazılır (saveStatus bu alanı ezmez).
+// Kenara almak işlemi takipten çıkarıyordu: Yandex sonradan success deyince
+// bakiye düşülüp banka transferi hiç başlamıyordu.
 async function escalateStuck(row, lastStatus, attempts, ageMs) {
     const ageMin = Math.round(ageMs / 60000);
     const res = await db.query(
         `UPDATE payment_logs
-            SET status = 'yandex_stuck_review',
-                yandex_reconciliation_required = FALSE,
-                yandex_status_description = $2,
+            SET error_message = COALESCE(error_message, '') || $2,
                 updated_at = NOW()
-          WHERE id = $1 AND status = 'yandex_pending'`,
-        [row.id, `TAKILDI: Yandex=${lastStatus}, ${attempts} deneme, ${ageMin} dk. Manuel inceleme gerekli.`]
+          WHERE id = $1 AND status = 'yandex_pending'
+            AND COALESCE(error_message, '') NOT LIKE '%TAKILDI-ALARM%'`,
+        [row.id, ` | TAKILDI-ALARM: Yandex=${lastStatus}, ${ageMin} dk; takipte, sonuçlanınca otomatik devam eder.`]
     );
     const changed = res.rowCount > 0;
     if (changed) {
-        logger.error('Yandex işlemi takıldı; manuel incelemeye alındı', {
-            provider: 'Yandex-Fleet', operation: 'stuck-review',
+        logger.error('Yandex işlemi 30 dk içinde sonuçlanmadı; takipte, alarm gönderildi', {
+            provider: 'Yandex-Fleet', operation: 'stuck-alert',
             tx: row.transaction_id, driver: row.driver_id,
-            result: 'manual_review_required', lastStatus, attempts, ageMinutes: ageMin,
+            result: 'alert_still_tracking', lastStatus, attempts, ageMinutes: ageMin,
             amount: Number(row.gross_amount), currency: 'TRY'
         }, undefined, { dedupe: false });
     }
@@ -148,7 +148,8 @@ async function reconcilePendingTransactions() {
              WHERE status = 'yandex_pending'
                AND yandex_status IN ('in_progress', 'unknown', 'success')
                AND yandex_idempotency_token IS NOT NULL
-             ORDER BY created_at ASC
+             -- En uzun süredir sorgulanmayan önce: sonuçlanmayan kayıtlar yenilerin önünü tıkamasın.
+             ORDER BY yandex_status_checked_at ASC NULLS FIRST, created_at ASC
              LIMIT 25`
         );
         for (const row of result.rows) {
@@ -175,7 +176,9 @@ async function reconcilePendingTransactions() {
                     }
                 }
             } catch (error) {
-                // Sorgu başarısız olsa bile yaşa göre eskalasyon (sonsuz sessiz döngüyü önler)
+                // Sorgu hata verse de sıranın sonuna geçsin (hep başta kalıp kuyruğu tıkamasın).
+                await db.query('UPDATE payment_logs SET yandex_status_checked_at = NOW() WHERE id = $1', [row.id]).catch(() => {});
+                // Sorgu başarısız olsa bile yaşa göre alarm (sonsuz sessiz döngüyü önler)
                 if (ageMs >= STUCK_MAX_AGE_MS) {
                     try {
                         if (await escalateStuck(row, 'sorgu_hatasi', Number(row.yandex_attempt_count) || 0, ageMs)) {
