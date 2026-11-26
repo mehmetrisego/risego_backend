@@ -21,6 +21,7 @@ async function getDriverPaymentLogs(driverId, limit = 50) {
                 status, 
                 error_message, 
                 bank_status_code,
+                admin_decision,
                 created_at,
                 updated_at,
                 yandex_refund_at

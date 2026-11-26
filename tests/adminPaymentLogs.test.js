@@ -51,7 +51,9 @@ test('status groups map to fixed SQL conditions and never bind user input', () =
     }
     assert.match(build({ status: 'grp_delayed' }).text, /yandex_pending' AND created_at < NOW\(\) - INTERVAL '30 minutes'/);
     assert.match(build({ status: 'grp_delayed' }).text, /COALESCE\(bank_started_at, created_at\) < NOW\(\) - INTERVAL '120 minutes'/);
-    assert.match(build({ status: 'grp_processing' }).text, /AND NOT \(status = 'bank_unknown'/);
+    assert.match(build({ status: 'grp_processing' }).text, /AND NOT \(\(status = 'yandex_pending'/);
+    assert.match(build({ status: 'grp_processing' }).text, /'bank_unknown', 'admin_processing'/);
+    assert.match(build({ status: 'grp_action' }).text, /'admin_review'/);
     const single = build({ status: 'yandex_failed' });
     assert.deepEqual(single.values, ['yandex_failed', 51]);
     assert.match(single.text, /status = \$1/);

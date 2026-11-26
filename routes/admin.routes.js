@@ -30,6 +30,8 @@ router.post('/leaderboard/resync', adminController.resyncLeaderboard);
 router.get('/leaderboard/status', adminController.getLeaderboardStatus);
 
 router.get('/payment-logs', adminController.getPaymentLogs);
+router.get('/payment-logs/:id/decision', adminController.getPaymentDecision);
+router.post('/payment-logs/:id/decision', express.json(), adminController.decidePayment);
 
 // Sürücü Banka Hesapları
 router.get('/drivers/:driverId/bank-accounts', adminController.getDriverBankAccounts);

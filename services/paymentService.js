@@ -681,8 +681,31 @@ async function sendPayment({
     }
 }
 
+/**
+ * Admin karari icin yeni banka transferi: CorpSendRequest + CorpSendRequestConfirm.
+ * Iki cagri da tek deneme yapar (kor tekrar ikinci transfer uretebilir). Cagiran, ayni
+ * correspondentRef ile once GetTransferList'e bakmali; varsa yeniden olusturmamali.
+ */
+async function createBankTransfer({ beneficiaryName, beneficiarySurname, beneficiaryIban, amount, correspondentRef }) {
+    const iban = String(beneficiaryIban || '').replace(/\s/g, '').toUpperCase();
+    if (!/^TR\d{24}$/.test(iban)) throw new Error('Geçerli bir TR IBAN bulunamadı.');
+    const numAmount = Number(amount);
+    if (!Number.isFinite(numAmount) || numAmount <= 0) throw new Error('Geçerli bir tutar bulunamadı.');
+    const sendXml = buildSendRequestXml({ beneficiaryName, beneficiarySurname, beneficiaryIban: iban, amount: numAmount, transactionId: correspondentRef });
+    const sendResult = await postSoap(SOAP_ACTION_SEND, sendXml, { maxAttempts: 1 });
+    const tuRefNumber = extractTuRefNumber(sendResult.responseText);
+    if (!tuRefNumber) {
+        const parsed = parseResponse(sendResult.responseText);
+        throw new Error(parsed.responseData || parsed.response || 'TU referans numarası alınamadı.');
+    }
+    const confirmResult = await postSoap(SOAP_ACTION_CONFIRM, buildConfirmRequestXml(tuRefNumber), { maxAttempts: 1 });
+    const parsed = parseResponse(confirmResult.responseText);
+    return { tuRefNumber, confirmed: parsed.response === 'Success', message: parsed.responseData || parsed.response || '' };
+}
+
 module.exports = {
     sendPayment,
+    createBankTransfer,
     deductYandexBalance,
     claimBankTransfer,
     _test: { buildSendRequestXml, stableIdempotencyToken }

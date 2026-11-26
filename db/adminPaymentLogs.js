@@ -6,19 +6,20 @@ const SEARCH_EXPRESSION = `lower(translate(
     coalesce(tu_ref_number, '') || ' ' || coalesce(beneficiary_iban, ''), 'İIı', 'iii'))`;
 const STATUSES = new Set(['success', 'pending_bank', 'bank_returned', 'error', 'refunded',
     'yandex_failed', 'yandex_stuck_review', 'bank_unknown', 'yandex_pending', 'bank_starting',
-    'bank_returned_refund_pending', 'bank_tr000_error', 'pending', 'grp_action', 'grp_delayed', 'grp_processing']);
+    'bank_returned_refund_pending', 'bank_tr000_error', 'admin_review', 'admin_processing', 'admin_resolved',
+    'pending', 'grp_action', 'grp_delayed', 'grp_processing']);
 
 // Panel durum gruplari. Esikler panelle ortak; yanitta `thresholds` olarak doner.
 const THRESHOLDS = { yandexDelayMinutes: 30, bankStuckMinutes: 120 };
-const ACTION_SQL = `status IN ('bank_returned_refund_pending', 'error', 'yandex_stuck_review')`;
-const DELAYED_SQL = `(status = 'bank_unknown'
-    OR (status = 'yandex_pending' AND created_at < NOW() - INTERVAL '${THRESHOLDS.yandexDelayMinutes} minutes')
+const ACTION_SQL = `status IN ('bank_returned_refund_pending', 'error', 'yandex_stuck_review', 'admin_review')`;
+// bank_unknown artik "islemde": otomatik 3 deneme surer, gonderilemezse admin kararina (admin_review) duser.
+const DELAYED_SQL = `((status = 'yandex_pending' AND created_at < NOW() - INTERVAL '${THRESHOLDS.yandexDelayMinutes} minutes')
     OR (status = 'pending_bank' AND COALESCE(bank_started_at, created_at) < NOW() - INTERVAL '${THRESHOLDS.bankStuckMinutes} minutes'))`;
-const PROCESSING_SQL = `(status IN ('yandex_pending', 'bank_starting', 'pending_bank') AND NOT ${DELAYED_SQL})`;
+const PROCESSING_SQL = `(status IN ('yandex_pending', 'bank_starting', 'pending_bank', 'bank_unknown', 'admin_processing') AND NOT ${DELAYED_SQL})`;
 // 'pending' eski panel surumunun gonderdigi deger; geriye uyumluluk icin "islemde" grubuna eslenir.
 const GROUP_SQL = { grp_action: ACTION_SQL, grp_delayed: DELAYED_SQL, grp_processing: PROCESSING_SQL, pending: PROCESSING_SQL };
-const OPEN_STATUSES_SQL = `status IN ('bank_returned_refund_pending', 'error', 'yandex_stuck_review',
-    'bank_unknown', 'yandex_pending', 'bank_starting', 'pending_bank')`;
+const OPEN_STATUSES_SQL = `status IN ('bank_returned_refund_pending', 'error', 'yandex_stuck_review', 'admin_review',
+    'admin_processing', 'bank_unknown', 'yandex_pending', 'bank_starting', 'pending_bank')`;
 
 function invalid(message) {
     const error = new Error(message);
@@ -92,6 +93,8 @@ function buildPaymentLogsQuery(query = {}) {
         text: `SELECT id, driver_id, beneficiary_name, beneficiary_iban, amount, gross_amount,
             fee, tu_ref_number, status, error_message, park_partner_id, created_at,
             bank_status_code, bank_status_checked_at, return_reason_code, yandex_refund_at, bank_started_at,
+            bank_retry_count, bank_retry_last_result, admin_decision, admin_decision_result, admin_decision_note, admin_decided_at,
+            CASE WHEN admin_decided_by IS NULL THEN NULL ELSE '***' || RIGHT(admin_decided_by, 4) END AS admin_decided_by,
             to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_at
             FROM payment_logs ${conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''}
             ORDER BY created_at DESC, id DESC LIMIT ${param(limit + 1)}`,

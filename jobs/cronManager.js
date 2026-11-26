@@ -2,6 +2,7 @@ const config = require('../config');
 const withdrawalSafety = require('../services/withdrawalSafetyService');
 const leaderboardService = require('../services/leaderboardService');
 const uptStatusService   = require('../services/uptStatusService');
+const bankRetryService   = require('../services/bankRetryService');
 const systemService      = require('../services/systemService');
 const driverProfileSyncService = require('../services/driverProfileSyncService');
 const yandexTransactionReconciliationService = require('../services/yandexTransactionReconciliationService');
@@ -162,6 +163,12 @@ function startAllCrons() {
     global._reconcileFastCron = setInterval(() => {
         void _runFastReconcile();
     }, config.alerts?.reconcileFastIntervalMs || 30000);
+
+    // 2d. Banka adimi belirsiz kalan cekimler: 10 dk icinde 3 deneme, sonra admin karari (her 1 dk)
+    if (global._bankRetryCron) clearInterval(global._bankRetryCron);
+    global._bankRetryCron = setInterval(() => {
+        void bankRetryService.runBankRetries();
+    }, 60 * 1000);
 
     // 2c. Gündüz periyodik delta — eksik kalan yolculukları gün içinde telafi eder;
     // resumable (DB watermark'ından devam eder), bakım penceresinde atlanır.

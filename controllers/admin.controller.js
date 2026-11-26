@@ -343,3 +343,25 @@ exports.syncDrivers = async (req, res) => {
         res.status(500).json({ success: false, message: 'Senkronizasyon işlemi sırasında hata oluştu: ' + error.message });
     }
 };
+
+// ─── Admin kararı (otomatik denemelerle gönderilemeyen çekimler) ─────────────
+exports.getPaymentDecision = async (req, res) => {
+    try {
+        const data = await require('../services/adminDecisionService').preview(Number(req.params.id));
+        res.json({ success: true, ...data });
+    } catch (err) {
+        console.error('[AdminController] Karar bilgisi hatası:', err.message);
+        res.status(err.status || 500).json({ success: false, message: err.status ? err.message : 'Karar bilgisi alınamadı.' });
+    }
+};
+
+exports.decidePayment = async (req, res) => {
+    try {
+        const result = await require('../services/adminDecisionService')
+            .decide(Number(req.params.id), req.body || {}, req.adminSession && req.adminSession.phone);
+        res.json({ success: true, ...result });
+    } catch (err) {
+        console.error('[AdminController] Karar uygulama hatası:', err.message);
+        res.status(err.status || 502).json({ success: false, message: err.message || 'Karar uygulanamadı.' });
+    }
+};
