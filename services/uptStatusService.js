@@ -200,26 +200,6 @@ async function confirmTransfer(tuRefNumber) {
     return { ok: response === 'Success', response, message: extractTag(text, 'RESPONSE_DATA') || '' };
 }
 
-/** Salt-okunur: transfer iptal edilebilir mi? (CustomCancelCheck) */
-async function checkCancellable(uptRef, transactionType) {
-    const text = await postSoap('http://tempuri.org/CustomCancelCheck', soapEnvelope(
-        `<tem:CustomCancelCheck><tem:obj><tem:TU_REFERANS>${xmlEscape(uptRef)}</tem:TU_REFERANS>` +
-        `<tem:TRANSACTION_TYPE>${xmlEscape(transactionType)}</tem:TRANSACTION_TYPE></tem:obj></tem:CustomCancelCheck>`));
-    const raw = extractTag(text, 'IsCancellable');
-    return { cancellable: /^(true|1|e|evet|y|yes)$/i.test(String(raw || '').trim()), raw, response: extractTag(text, 'RESPONSE'), message: extractTag(text, 'RESPONSE_DATA') || '' };
-}
-
-/** Transferi iptal eder: CorpCancelRequest + CorpCancelConfirm. */
-async function cancelTransfer(uptRef, transactionType) {
-    const obj = `<tem:obj><tem:UPT_REF>${xmlEscape(uptRef)}</tem:UPT_REF><tem:TRANSACTION_TYPE>${xmlEscape(transactionType)}</tem:TRANSACTION_TYPE></tem:obj>`;
-    const reqText = await postSoap('http://tempuri.org/CorpCancelRequest', soapEnvelope(`<tem:CorpCancelRequest>${obj}</tem:CorpCancelRequest>`));
-    const request = { response: extractTag(reqText, 'RESPONSE'), message: extractTag(reqText, 'RESPONSE_DATA') || '' };
-    if (request.response !== 'Success') return { ok: false, step: 'request', ...request };
-    const cfmText = await postSoap('http://tempuri.org/CorpCancelConfirm', soapEnvelope(`<tem:CorpCancelConfirm>${obj}</tem:CorpCancelConfirm>`));
-    const confirm = { response: extractTag(cfmText, 'RESPONSE'), message: extractTag(cfmText, 'RESPONSE_DATA') || '' };
-    return { ok: confirm.response === 'Success', step: 'confirm', ...confirm };
-}
-
 // ─── Uption: İade Nedeni Sorgula ─────────────────────────────────────────────
 
 async function queryRefundReason(tuRefNumber) {
@@ -571,8 +551,6 @@ module.exports = {
     queryByCorrespondentRef,
     classifyBankState,
     confirmTransfer,
-    checkCancellable,
-    cancelTransfer,
     stableRefundToken,
     processSinglePayment,
     syncRefundsFromBank,

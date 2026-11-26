@@ -3,9 +3,10 @@
  * services/adminDecisionService.js
  *
  * Otomatik denemelerle gönderilemeyen çekimler için admin kararı:
- *   refund -> brüt tutar sürücünün Yandex bakiyesine iade (bankada bekleyen transfer varsa önce iptal)
- *   send   -> net tutar Uption ile gönderilir (bankada TR000 transfer varsa AYNI transfer onaylanır)
- *   none   -> işlem yapılmaz (not zorunlu)
+ *   send -> net tutar Uption ile gönderilir (bankada TR000 transfer varsa AYNI transfer onaylanır)
+ *   none -> işlem yapılmaz (not zorunlu)
+ * Yandex'e iade seçeneği yok: Uption "Hesaba Gönderim" transferlerini iptal etmiyor (26.11 canlı test),
+ * bekleyen transfer kapatılamadığı için iade çift ödeme riski taşır.
  * Her karardan önce banka ve Yandex durumu yeniden okunur; kayıt kilitlenir, karar bir kez uygulanır.
  */
 
@@ -19,38 +20,26 @@ const { createLogger, maskId } = require('./logger');
 const logger = createLogger('WITHDRAWAL', { service: 'admin-decision' });
 
 const ELIGIBLE_STATUSES = ['admin_review', 'bank_tr000_error', 'yandex_stuck_review'];
-const OPTIONS = ['refund', 'send', 'none'];
+const OPTIONS = ['send', 'none'];
 const LOCK_MINUTES = 5;
-// İptal servisi canlı testten geçene kadar kapalı: bankada bekleyen transfer varken iade engellenir.
-const cancelEnabled = () => process.env.UPT_CANCEL_ENABLED === 'true';
 
 const fmt = n => Number(n).toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const httpError = (status, message) => Object.assign(new Error(message), { status });
 
-const BANK_PAID_REASON = 'Banka bu transferi ödemiş; iade veya yeniden gönderim çift ödeme olur.';
-
 /** Hangi seçeneğin uygulanabileceğini belirler (saf fonksiyon). */
-function evaluateOptions({ yandexDeducted, bankState, cancelEnabled: canCancel, gross, net }) {
+function evaluateOptions({ yandexDeducted, bankState, net }) {
     const none = { allowed: true };
     if (bankState === 'paid') {
-        return { bankPaid: true, refund: { allowed: false, amount: gross, reason: BANK_PAID_REASON }, send: { allowed: false, amount: net, reason: BANK_PAID_REASON }, none };
+        return { bankPaid: true, send: { allowed: false, amount: net, reason: 'Banka bu transferi ödemiş; yeniden gönderim çift ödeme olur.' }, none };
     }
     if (!yandexDeducted) {
-        const reason = 'Sürücünün Yandex bakiyesinden kesinti yapılmamış ya da zaten iade edilmiş.';
-        return { refund: { allowed: false, amount: gross, reason }, send: { allowed: false, amount: net, reason }, none };
+        return { send: { allowed: false, amount: net, reason: 'Sürücünün Yandex bakiyesinden kesinti yapılmamış ya da tutar zaten iade edilmiş.' }, none };
     }
     if (bankState === 'in_progress') {
-        const reason = 'Banka işlemi sürüyor; sonuçlanmasını bekleyin.';
-        return { refund: { allowed: false, amount: gross, reason }, send: { allowed: false, amount: net, reason }, none };
+        return { send: { allowed: false, amount: net, reason: 'Banka işlemi sürüyor; sonuçlanmasını bekleyin.' }, none };
     }
-    const waiting = bankState === 'needs_confirm'; // bankada TR000 transfer var
-    const refund = waiting
-        ? (canCancel
-            ? { allowed: true, amount: gross, needsCancel: true }
-            : { allowed: false, amount: gross, reason: 'Bankada bekleyen transfer önce iptal edilmeli; iptal servisi henüz test edilmedi.' })
-        : { allowed: true, amount: gross, needsCancel: false };
-    const send = { allowed: true, amount: net, mode: waiting ? 'confirm' : 'create' };
-    return { refund, send, none };
+    // needs_confirm: bankada TR000 transfer var -> aynı transfer onaylanır; aksi halde yeni transfer.
+    return { send: { allowed: true, amount: net, mode: bankState === 'needs_confirm' ? 'confirm' : 'create' }, none };
 }
 
 function splitName(fullName) {
@@ -83,7 +72,7 @@ async function loadState(row) {
     }
     const gross = Number(row.gross_amount);
     const net = Number(row.amount);
-    return { bank, bankState, yandexDeducted, gross, net, options: evaluateOptions({ yandexDeducted, bankState, cancelEnabled: cancelEnabled(), gross, net }) };
+    return { bank, bankState, yandexDeducted, gross, net, options: evaluateOptions({ yandexDeducted, bankState, net }) };
 }
 
 async function preview(id) {
@@ -132,31 +121,6 @@ async function finalize(id, fields) {
           WHERE id = $1 AND status = 'admin_processing'`,
         values
     );
-}
-
-async function executeRefund(row, st, chosen) {
-    const extra = {};
-    if (chosen.needsCancel) {
-        const type = st.bank.transactionType || '024';
-        const check = await upt.checkCancellable(st.bank.uptref, type);
-        if (!check.cancellable) throw httpError(502, `Uption transferin iptal edilemeyeceğini bildirdi (${check.raw || check.message || 'yanıt yok'}).`);
-        const c = await upt.cancelTransfer(st.bank.uptref, type);
-        const after = await upt.queryByCorrespondentRef(row.transaction_id);
-        const afterState = upt.classifyBankState(after);
-        if (afterState === 'paid') throw httpError(409, BANK_PAID_REASON);
-        if (afterState !== 'returned') {
-            throw httpError(502, `İptal teyit edilemedi (${c.step}: ${c.message || c.response || '-'}; banka durumu ${after.statusCode || '-'}). İade yapılmadı.`);
-        }
-        extra.bank_status_code = after.statusCode;
-    }
-    // Bankanın otomatik iade akışıyla AYNI anahtar: aynı çekim için ikinci bir iade isteği
-    // (ör. iptal sonrası gecikmeli iade taraması) Yandex'te tekrar olarak tanınır, uygulanmaz.
-    await paymentService.deductYandexBalance(
-        row.driver_id, st.gross, row.park_partner_id,
-        'İADE: Admin kararı — banka transferi gerçekleşmedi',
-        { tx: row.transaction_id, idempotencyToken: upt.stableRefundToken(row.transaction_id) }
-    );
-    return { result: `${fmt(st.gross)} TL sürücünün Yandex bakiyesine yüklendi`, extra: { ...extra, yandex_refund_at: new Date() } };
 }
 
 async function executeSend(row, st, chosen) {
@@ -222,7 +186,6 @@ async function decide(id, body = {}, adminPhone = '') {
         }
         let outcome;
         if (option === 'none') outcome = { result: `İşlem yapılmadı · Not: ${note}`, extra: {} };
-        else if (option === 'refund') outcome = await executeRefund(row, st, chosen);
         else outcome = await executeSend(row, st, chosen);
 
         await finalize(id, {
