@@ -6,7 +6,7 @@ const SEARCH_EXPRESSION = `lower(translate(
     coalesce(tu_ref_number, '') || ' ' || coalesce(beneficiary_iban, ''), 'İIı', 'iii'))`;
 const STATUSES = new Set(['success', 'pending_bank', 'bank_returned', 'error', 'refunded',
     'yandex_failed', 'yandex_stuck_review', 'bank_unknown', 'yandex_pending', 'bank_starting',
-    'bank_returned_refund_pending', 'pending', 'grp_action', 'grp_delayed', 'grp_processing']);
+    'bank_returned_refund_pending', 'bank_tr000_error', 'pending', 'grp_action', 'grp_delayed', 'grp_processing']);
 
 // Panel durum gruplari. Esikler panelle ortak; yanitta `thresholds` olarak doner.
 const THRESHOLDS = { yandexDelayMinutes: 30, bankStuckMinutes: 120 };

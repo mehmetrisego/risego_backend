@@ -67,3 +67,9 @@ test('summary counts only open records and respects the city filter', () => {
     assert.match(city.text, /park_partner_id = \$1/);
     assert.throws(() => summary({ parkPartnerId: ['x'] }), { status: 400 });
 });
+
+test('TR000 error records are filterable but are not counted as open', () => {
+    const query = build({ status: 'bank_tr000_error' });
+    assert.deepEqual(query.values, ['bank_tr000_error', 51]);
+    assert.doesNotMatch(summary().text, /bank_tr000_error/);
+});
