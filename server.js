@@ -54,8 +54,14 @@ async function gracefulShutdown(signal) {
     shutdownStarted = true;
     serverLogger.info('Sunucu kapatılıyor', { operation: 'shutdown', signal });
     
-    // Cron görevlerini durdur
+    // Yeni çekim alma; cronları durdur; devam eden banka işlemlerinin bitmesini bekle
+    // (aksi halde banka transferi oluşup sonucu kaydedilemeden kayıt takılı kalır).
+    paymentService.stopAcceptingPayments();
     cronManager.stopAllCrons();
+    const pendingBankOps = await paymentService.waitForBankOps(45000);
+    if (pendingBankOps > 0) {
+        serverLogger.error('Kapanışta bitmemiş banka işlemi kaldı', { operation: 'shutdown', pendingBankOps });
+    }
 
     // Veritabanı bağlantı havuzunu kapat
     if (db && typeof db.closePool === 'function') {

@@ -468,6 +468,20 @@ async function deductYandexBalance(driverId, amount, parkPartnerId, description 
  * @param {string}  [opts.parkPartnerId]   - Yandex park UUID
  * @returns {Promise<{success:boolean, tuRefNumber?:string, message?:string}>}
  */
+// ─── Güvenli kapanış: devam eden banka işlemleri ─────────────────────────────
+// Banka transferi isteği gönderilip yanıtı kaydedilmeden süreç kapanırsa kayıt
+// "bank_starting"de takılı kalır. Kapanış bu sayacın sıfırlanmasını bekler.
+let activeBankOps = 0;
+let acceptingPayments = true;
+
+function stopAcceptingPayments() { acceptingPayments = false; }
+
+async function waitForBankOps(timeoutMs = 45000) {
+    const deadline = Date.now() + timeoutMs;
+    while (activeBankOps > 0 && Date.now() < deadline) await sleep(250);
+    return activeBankOps;
+}
+
 async function sendPayment({
     driverId, beneficiaryName, beneficiarySurname, beneficiaryIban, amount, yandexAmount,
     parkPartnerId, transactionId, skipYandex = false, idempotencyToken
@@ -482,6 +496,12 @@ async function sendPayment({
     const yandexDeductAmount = Number(yandexAmount ?? numAmount);
     if (!Number.isFinite(yandexDeductAmount) || yandexDeductAmount <= 0) {
         throw new Error('Geçerli bir Yandex kesinti tutarı giriniz.');
+    }
+    if (!acceptingPayments) {
+        // Yandex kesintisinden ÖNCE reddedilir; sürücünün bakiyesine dokunulmaz.
+        const error = new Error('Sistem birkaç saniyelik güncelleme yapıyor; lütfen biraz sonra tekrar deneyin.');
+        error.status = 503;
+        throw error;
     }
     const tx = transactionId || `wd_${crypto.randomBytes(6).toString('hex')}`;
     const yandexIdempotencyToken = idempotencyToken || crypto.randomBytes(16).toString('hex');
@@ -544,6 +564,7 @@ async function sendPayment({
         return { success: true, processing: true, duplicateSuppressed: true, transactionId: tx };
     }
 
+    activeBankOps++; // güvenli kapanış bu banka işleminin bitmesini bekler
     // ── 3. ADIM: CorpSendRequest (Uption) ───────────────────────────────
     let tuRefNumber = null;
     try {
@@ -678,6 +699,8 @@ async function sendPayment({
         });
 
         throw new Error('Ödeme sırasında banka hatası oluştu: ' + paymentErr.message);
+    } finally {
+        activeBankOps--;
     }
 }
 
@@ -706,6 +729,8 @@ async function createBankTransfer({ beneficiaryName, beneficiarySurname, benefic
 module.exports = {
     sendPayment,
     createBankTransfer,
+    stopAcceptingPayments,
+    waitForBankOps,
     deductYandexBalance,
     claimBankTransfer,
     _test: { buildSendRequestXml, stableIdempotencyToken }

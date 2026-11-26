@@ -12,7 +12,9 @@ module.exports = {
     // ─── Yeniden Başlatma Politikası ─────────────────────────
     restart_delay: 3000,  // Çökünce 3 saniye bekle (RAM'in nefes alması için)
     max_restarts: 10,     // 10 üst üste çökme sonrası durdur (sonsuz döngüyü önle)
-    min_uptime: '30s',    // 30 saniyeden kısa yaşayan çalıştırmalar "çökme" sayılır
+    min_uptime: '30s',
+    // Kapanışta devam eden banka işlemi en fazla 45 sn beklenir; PM2 bundan önce zorla kapatmasın.
+    kill_timeout: 50000,    // 30 saniyeden kısa yaşayan çalıştırmalar "çökme" sayılır
 
     // ─── Ortam Değişkenleri ───────────────────────────────────
     env: {

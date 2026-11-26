@@ -33,9 +33,13 @@ let running = false;
 const retryDueSql = `COALESCE(bank_started_at, created_at) + make_interval(mins => (CASE bank_retry_count
     WHEN 0 THEN ${RETRY_OFFSETS_MIN[0]} WHEN 1 THEN ${RETRY_OFFSETS_MIN[1]} ELSE ${RETRY_OFFSETS_MIN[2]} END)) <= NOW()`;
 
-// TR000'da (onay bekleyen) veya sonucu hiç bilinmeyen kayıtlar.
-const RETRYABLE_SQL = `status IN ('bank_unknown', 'pending_bank')
-    AND (status = 'bank_unknown' OR bank_status_code = 'TR000')
+// TR000'da (onay bekleyen), sonucu hiç bilinmeyen ya da banka adımı yarıda kalmış kayıtlar.
+// bank_starting: istek bankaya gitmiş ama sonuç kaydedilememiş (ör. sunucu yeniden başladı).
+// Devam eden bir çekimin üstüne gelmemek için en az 5 dk bekletilir.
+const ACTIVE_STATUSES = `('bank_unknown', 'pending_bank', 'bank_starting')`;
+const RETRYABLE_SQL = `status IN ${ACTIVE_STATUSES}
+    AND (status IN ('bank_unknown', 'bank_starting') OR bank_status_code = 'TR000')
+    AND (status <> 'bank_starting' OR COALESCE(bank_started_at, created_at) < NOW() - INTERVAL '5 minutes')
     AND created_at >= $1::timestamptz`;
 
 async function saveBankRef(id, q) {
@@ -44,7 +48,7 @@ async function saveBankRef(id, q) {
             SET tu_ref_number = COALESCE(tu_ref_number, $2),
                 bank_status_code = $3,
                 bank_status_checked_at = NOW(),
-                status = CASE WHEN status = 'bank_unknown' THEN 'pending_bank' ELSE status END,
+                status = CASE WHEN status IN ('bank_unknown', 'bank_starting') THEN 'pending_bank' ELSE status END,
                 updated_at = NOW()
           WHERE id = $1`,
         [id, q.uptref, q.statusCode || null]
@@ -54,7 +58,7 @@ async function saveBankRef(id, q) {
 async function markSuccess(id, statusCode) {
     await db.query(
         `UPDATE payment_logs SET status = 'success', bank_status_code = $2, bank_status_checked_at = NOW(), updated_at = NOW()
-          WHERE id = $1 AND status IN ('bank_unknown', 'pending_bank', 'admin_review')`,
+          WHERE id = $1 AND status IN ('bank_unknown', 'pending_bank', 'bank_starting', 'admin_review')`,
         [id, statusCode]
     );
 }
@@ -95,7 +99,7 @@ async function handleBankState(row, q, { allowConfirm }) {
 async function attempt(row) {
     const claimed = await db.query(
         `UPDATE payment_logs SET bank_retry_count = bank_retry_count + 1, bank_retry_last_at = NOW(), updated_at = NOW()
-          WHERE id = $1 AND bank_retry_count = $2 AND status IN ('bank_unknown', 'pending_bank')
+          WHERE id = $1 AND bank_retry_count = $2 AND status IN ${ACTIVE_STATUSES}
           RETURNING bank_retry_count`,
         [row.id, row.bank_retry_count]
     );
@@ -146,7 +150,7 @@ async function escalate() {
                 `UPDATE payment_logs
                     SET admin_previous_status = status, status = 'admin_review',
                         bank_retry_last_result = COALESCE(bank_retry_last_result, '') || $2, updated_at = NOW()
-                  WHERE id = $1 AND status IN ('bank_unknown', 'pending_bank')`,
+                  WHERE id = $1 AND status IN ${ACTIVE_STATUSES}`,
                 [row.id, ` → Admin kararına yönlendirildi (${text})`]
             );
             if (res.rowCount) {
