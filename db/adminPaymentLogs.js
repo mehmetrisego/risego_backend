@@ -94,7 +94,7 @@ function buildPaymentLogsQuery(query = {}) {
             fee, tu_ref_number, status, error_message, park_partner_id, created_at,
             bank_status_code, bank_status_checked_at, return_reason_code, yandex_refund_at, bank_started_at,
             bank_retry_count, bank_retry_last_result, admin_decision, admin_decision_result, admin_decision_note, admin_decided_at,
-            CASE WHEN admin_decided_by IS NULL THEN NULL ELSE '***' || RIGHT(admin_decided_by, 4) END AS admin_decided_by,
+            admin_decided_by, transaction_id, upt_correspondent_ref,
             to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_at
             FROM payment_logs ${conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''}
             ORDER BY created_at DESC, id DESC LIMIT ${param(limit + 1)}`,
